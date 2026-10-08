@@ -1,16 +1,49 @@
 # FSearch
 
-Whole-disk file search for macOS. Finds any file by name in about a
-millisecond, forgives typos, and searches inside files with an index. Use it
+Whole-disk file search for macOS. Finds files by name, forgives typos,
+and searches inside text files with an index. Use it
 as a CLI (with a small daemon) or as a Rust crate.
 
 ```
-cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
+cargo build --release --locked
+./target/release/fsearch install   # -> ~/.local/bin/fsearch
 fsearch fsearch main              # find files by name
 fsearch 'ext:rs grep:apply_dir'   # search inside files
 ```
 
+Rust 1.88 or later is required. The committed lockfile pins libc 0.2.189.
+
+## Local data and limits
+
+Cache loaders check lengths, IDs, paths, tree structure, and posting data before
+use. They load a private read-only memory snapshot, so later file changes cannot
+invalidate a checked slice. A binary cache is limited to 1 GiB and its manifest
+to 1 MiB. Invalid derived data is rejected and rebuilt by the index owner.
+The content format is now `FSCSEG04`; old content segments are rebuilt.
+
+Content search does not read common credential stores, including `.env` and its
+variants, `.ssh`, `.aws`, `.gnupg`, private key files, and package credential files.
+The same rule applies to resolved paths. File opens reject symbolic links at
+each resolved path component. Name search can still return these file names.
+These name rules cannot detect secrets saved under ordinary file names.
+Word and PDF text extraction is not supported by this CLI.
+
+State directories use mode `0700`; cache files, locks, logs, and the socket use
+`0600`. Extended ACL grants are removed from state directories and files.
+Unsafe owners, links, and parent write grants are rejected.
+
+The service accepts only peers with the same user ID. A request frame is limited
+to 16 KiB and a reply to 8 MiB. Result counts must be 1 through 200. Content
+matches per file must be 1 through 20, and the read budget must be 1 through
+1000 ms. The read budget is cooperative, not a hard request deadline. At most
+eight socket clients run at once; idle reads and writes time out after five
+seconds. `stdio` opens a new service connection for each request.
+
 ## Speed
+
+These published measurements predate the cache safety changes. Private cache
+snapshots use resident memory. Whole-disk memory and startup costs have not been
+measured again after those changes.
 
 M4 Max, 7.7M files and folders on disk.
 
@@ -23,6 +56,8 @@ M4 Max, 7.7M files and folders on disk.
 | daemon memory | 30-135 MB |
 
 ## vs fff
+
+This comparison also predates the cache safety changes.
 
 Chromium (509k files), same Mac, same queries. Video:
 [`demo/fsearch-vs-fff.mp4`](demo/fsearch-vs-fff.mp4), method:
@@ -56,10 +91,12 @@ Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
 
 ## Full Disk Access
 
-Started from a terminal with Full Disk Access, it indexes everything. As a
-login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
-grant in System Settings > Privacy & Security, again after each rebuild.
-Without access it skips the protected folders instead of popping a prompt.
+Without Full Disk Access, the engine skips protected folders. A CLI started
+from a terminal with Full Disk Access can read that terminal's permitted data.
+Same-user socket checks do not isolate applications with different disk access
+grants. Do not expose a privileged search engine through the shared service
+unless all clients of that user are trusted. A sandboxed Finder app should embed
+the engine and obtain explicit folder access instead.
 
 ## API
 
@@ -85,7 +122,7 @@ others follow along.
 
 - Crawls the disk once with `getattrlistbulk`, then stays current from
   FSEvents. A restart replays only what changed.
-- Names live in one mmap'd file, laid out folder by folder so `in:` is a
+- Names live in one checked memory snapshot, laid out folder by folder so `in:` is a
   range. Each distinct name is scored once.
 - Content search uses a trigram index of your text files. Matches are read
   fresh from disk, so they're never stale.
