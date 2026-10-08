@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 
 #[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -118,7 +117,7 @@ fn try_lock(f: &std::fs::File) -> bool {
         use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
         use windows_sys::Win32::System::IO::OVERLAPPED;
 
-        let handle = f.as_raw_handle() as isize;
+        let handle = f.as_raw_handle() as *mut std::ffi::c_void;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
 
         let result = unsafe {
@@ -430,11 +429,15 @@ pub fn has_full_disk_access() -> bool {
 fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
+    #[cfg(target_os = "macos")]
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+            }
             no_materialize();
         })
         .build()

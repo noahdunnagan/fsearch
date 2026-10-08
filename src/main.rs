@@ -16,21 +16,41 @@ const BIG: usize = 1 << 20;
 
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() < BIG || l.align() > 16384 {
-            return unsafe { System.alloc(l) };
+        #[cfg(target_os = "macos")]
+        {
+            if l.size() < BIG || l.align() > 16384 {
+                return unsafe { System.alloc(l) };
+            }
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+            if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 }
         }
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-        if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { System.alloc(l) }
+        }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        // Fresh anonymous pages are already zero.
-        if l.size() < BIG || l.align() > 16384 { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
+        #[cfg(target_os = "macos")]
+        {
+            if l.size() < BIG || l.align() > 16384 { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { System.alloc_zeroed(l) }
+        }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if l.size() < BIG || l.align() > 16384 {
+        #[cfg(target_os = "macos")]
+        {
+            if l.size() < BIG || l.align() > 16384 {
+                unsafe { System.dealloc(p, l) }
+            } else {
+                unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             unsafe { System.dealloc(p, l) }
-        } else {
-            unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
         }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
@@ -174,7 +194,12 @@ fn launchctl(args: &[&str]) -> bool {
 }
 
 fn domain() -> String {
-    format!("gui/{}", unsafe { libc::getuid() })
+    #[cfg(target_os = "macos")]
+    let uid = unsafe { libc::getuid() }.to_string();
+    #[cfg(not(target_os = "macos"))]
+    let uid = "0".to_string(); // Fallback for Windows
+
+    format!("gui/{}", uid)
 }
 
 fn install(login: bool) {

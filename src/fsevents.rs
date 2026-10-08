@@ -26,6 +26,7 @@ struct Context {
 
 type Callback = extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_void, *const u32, *const u64);
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
     fn FSEventStreamCreate(
@@ -45,6 +46,10 @@ unsafe extern "C" {
     pub fn FSEventsGetCurrentEventId() -> u64;
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn FSEventsGetCurrentEventId() -> u64 { 0 }
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const i8, enc: u32) -> *const c_void;
@@ -52,10 +57,12 @@ unsafe extern "C" {
     static kCFTypeArrayCallBacks: c_void;
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
     let tx = unsafe { &*(info as *const Sender<Vec<Event>>) };
     let paths = paths as *const *const i8;
@@ -73,6 +80,7 @@ unsafe impl Sync for Stream {}
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
         unsafe {
             FSEventStreamStop(self.0);
             FSEventStreamInvalidate(self.0);
@@ -84,6 +92,7 @@ impl Drop for Stream {
 /// Watch `/` from `since` (an event id). Batches of directory-level events
 /// arrive on `tx` until the returned stream is dropped.
 pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+    #[cfg(target_os = "macos")]
     unsafe {
         let root = CFStringCreateWithCString(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
         let arr = CFArrayCreate(std::ptr::null(), &root, 1, &kCFTypeArrayCallBacks as *const c_void);
@@ -103,5 +112,9 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
         FSEventStreamSetDispatchQueue(s, q);
         FSEventStreamStart(s);
         Stream(s)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Stream(std::ptr::null_mut())
     }
 }

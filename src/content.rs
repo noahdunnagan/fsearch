@@ -1251,11 +1251,10 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
-    #[cfg(windows)]
-    use std::os::windows::ffi::OsStrExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
-
+    #[cfg(unix)]
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    
+    #[cfg(windows)]
+    let f = std::fs::OpenOptions::new().read(true).open(std::str::from_utf8(path).ok()?).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
 }

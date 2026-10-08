@@ -474,7 +474,6 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(path) };
         let path_obj = std::path::Path::new(os_str);
         let metadata = std::fs::symlink_metadata(path_obj).ok()?;

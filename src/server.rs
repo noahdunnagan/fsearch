@@ -5,7 +5,13 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, GrepMode, Options, Query};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+type UnixListener = std::net::TcpListener;
+#[cfg(windows)]
+type UnixStream = std::net::TcpStream;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,6 +19,7 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
+#[cfg(unix)]
 pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
@@ -36,6 +43,11 @@ pub fn serve(dir: PathBuf, home: String) {
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
     }
+}
+
+#[cfg(windows)]
+pub fn serve(_dir: PathBuf, _home: String) {
+    eprintln!("Daemon not supported on Windows yet.");
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
@@ -185,6 +197,7 @@ fn kind_name(k: u8) -> &'static str {
 }
 
 /// Connect to the daemon, starting it if it isn't running.
+#[cfg(unix)]
 pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
     let sock = socket_path(dir);
     if let Ok(s) = UnixStream::connect(&sock) {
@@ -208,4 +221,9 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
         }
     }
     UnixStream::connect(&sock)
+}
+
+#[cfg(windows)]
+pub fn connect(_dir: &Path) -> std::io::Result<UnixStream> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Daemon not supported on Windows yet"))
 }

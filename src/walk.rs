@@ -63,6 +63,7 @@ thread_local! {
 }
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
+#[cfg(target_os = "macos")]
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
     let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
@@ -74,15 +75,24 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn scan(_root: &[u8], _threads: usize) -> Vec<Listing> {
+    Vec::new()
+}
+
 fn raise_fd_limit() {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-    r.rlim_cur = r.rlim_max.min(65536);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    #[cfg(unix)]
+    {
+        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
+        r.rlim_cur = r.rlim_max.min(65536);
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    }
 }
 
 /// List a single directory (no recursion). Subdirectories come back with
 /// `child == NONE`. Used by the live updater.
+#[cfg(target_os = "macos")]
 pub fn list_one(path: &[u8]) -> Option<Listing> {
     if blocked(path) {
         return None;
@@ -91,7 +101,15 @@ pub fn list_one(path: &[u8]) -> Option<Listing> {
     list_into(path, &mut l).then_some(l)
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn list_one(_path: &[u8]) -> Option<Listing> {
+    None
+}
+
+#[cfg(unix)]
 const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(windows)]
+const OPEN_DIR: i32 = 0;
 
 /// Directory fd shared by the tasks that still need to openat() a child.
 struct Fd(i32);
@@ -105,6 +123,7 @@ impl Drop for Fd {
 // never get rebuilt and PATH_MAX never bites. Measured on this Mac: open() +
 // close() is ~19us per directory (two Endpoint Security clients tax every
 // open), getattrlistbulk ~14us; past ~8 threads the kernel side stops scaling.
+#[cfg(target_os = "macos")]
 fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
     if fd < 0 {
@@ -141,15 +160,18 @@ fn push(l: Listing, ctx: &Ctx) {
     ctx.out[slot].lock().unwrap().push(l);
 }
 
+#[cfg(target_os = "macos")]
 fn rd32(b: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
 }
 
+#[cfg(target_os = "macos")]
 fn rd64(b: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// Returns false if the directory could not be opened.
+#[cfg(target_os = "macos")]
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
     let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
@@ -161,6 +183,7 @@ fn list_into(path: &[u8], l: &mut Listing) -> bool {
     true
 }
 
+#[cfg(target_os = "macos")]
 fn list_fd(fd: i32, l: &mut Listing) {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
@@ -184,6 +207,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
     });
 }
 
+#[cfg(target_os = "macos")]
 fn parse_entry(b: &[u8], l: &mut Listing) {
     let common = rd32(b, 4);
     let dirattr = rd32(b, 12);
