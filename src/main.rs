@@ -3,7 +3,7 @@ mod server;
 use fsearch::{index, live, query};
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -68,9 +68,7 @@ fn home() -> String {
 }
 
 fn data_dir() -> PathBuf {
-    let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
-    std::fs::create_dir_all(&d).ok();
-    d
+    fsearch::default_dir(&home())
 }
 
 unsafe extern "C" {
@@ -85,7 +83,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
-        Some("serve") => server::serve(data_dir(), home()),
+        Some("serve") => server::serve(data_dir(), home()).unwrap_or_else(|e| die(&e)),
         Some("stdio") => stdio(),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
@@ -101,14 +99,18 @@ fn main() {
 
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    writeln!(s, "{req}").unwrap();
-    let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).unwrap();
+    writeln!(s, "{req}").unwrap_or_else(|e| die(&format!("cannot send request: {e}")));
+    let line = server::read_line(&mut BufReader::new(&s), server::MAX_RESPONSE_BYTES)
+        .unwrap_or_else(|e| die(&format!("cannot read response: {e}")))
+        .unwrap_or_else(|| die("daemon closed the connection"));
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| die(&format!("bad response: {e}")));
     if raw {
         print!("{line}");
+        if v["ok"] != true {
+            std::process::exit(1);
+        }
         return;
     }
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
     if v["ok"] != true {
         die(v["error"].as_str().unwrap_or("error"));
     }
@@ -124,21 +126,20 @@ fn print_one(req: &serde_json::Value, raw: bool) {
 }
 
 fn stdio() {
-    let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    let mut up = s.try_clone().unwrap();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            if writeln!(up, "{line}").is_err() {
-                break;
-            }
-        }
-        let _ = up.shutdown(std::net::Shutdown::Write);
-    });
+    let mut input = std::io::stdin().lock();
     let mut out = std::io::stdout().lock();
-    for line in BufReader::new(s).lines() {
-        let Ok(line) = line else { break };
-        if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+    while let Some(line) = server::read_line(&mut input, server::MAX_REQUEST_BYTES).unwrap_or_else(|e| die(&format!("cannot read request: {e}"))) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // No connection is held while stdin is idle. Each request still
+        // produces one response, in input order.
+        let mut connection = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
+        writeln!(connection, "{}", line.trim_end_matches('\n')).unwrap_or_else(|e| die(&format!("cannot send request: {e}")));
+        let line = server::read_line(&mut BufReader::new(connection), server::MAX_RESPONSE_BYTES)
+            .unwrap_or_else(|e| die(&format!("cannot read response: {e}")))
+            .unwrap_or_else(|| die("daemon closed the connection"));
+        if write!(out, "{line}").and_then(|_| out.flush()).is_err() {
             break;
         }
     }
@@ -188,7 +189,10 @@ fn install(login: bool) {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
     }
-    let log = data_dir().join("daemon.log");
+    let dir = data_dir();
+    fsearch::storage::ensure_private_dir(&dir).unwrap_or_else(|e| die(&format!("state directory: {e}")));
+    let log = dir.join("daemon.log");
+    fsearch::storage::open_private_log(&log).unwrap_or_else(|e| die(&format!("daemon log: {e}")));
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

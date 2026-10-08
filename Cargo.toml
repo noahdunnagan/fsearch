@@ -2,10 +2,11 @@
 name = "fsearch"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 
 [dependencies]
-libc = "0.2"
+libc = "=0.2.189"
 rayon = "1.12"
 memchr = "2.8"
 memmap2 = "0.9"

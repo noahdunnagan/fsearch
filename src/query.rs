@@ -44,6 +44,9 @@ const TYPO_MIN_LEN: usize = 5;
 /// What a typo costs, so clean matches of the same quality rank first.
 const TYPO_COST: i32 = 60;
 
+/// Bound result allocation for the CLI and embedded engine alike.
+pub const MAX_RESULTS: usize = 200;
+
 fn takes_typos(text: &[u8], mode: Mode) -> bool {
     mode == Mode::Fuzzy && text.len() >= TYPO_MIN_LEN
 }
@@ -107,7 +110,16 @@ impl Query {
                 q.push_token(piece);
             }
         }
+        q.validate_limits()?;
         Ok(q)
+    }
+
+    /// Public callers can construct a query directly, so check it at use too.
+    pub fn validate_limits(&self) -> Result<(), String> {
+        if !(1..=MAX_RESULTS).contains(&self.limit) {
+            return Err(format!("limit must be between 1 and {MAX_RESULTS}"));
+        }
+        Ok(())
     }
 
     pub fn push_token(&mut self, w: &str) {
@@ -173,7 +185,10 @@ impl Query {
             }
             "re" => self.name_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
             "path" => self.path_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
-            "limit" => self.limit = v.parse().map_err(|_| "bad limit")?,
+            "limit" => {
+                self.limit = v.parse().map_err(|_| "bad limit")?;
+                self.validate_limits()?;
+            }
             "grep" | "content" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Literal),
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
@@ -258,6 +273,51 @@ impl Query {
             d.best[t] = comps.iter().filter_map(|c| token_score(c, !0, tok)).max();
         }
         d
+    }
+}
+
+#[cfg(test)]
+mod result_limit_tests {
+    use super::{MAX_RESULTS, Query};
+
+    #[test]
+    fn query_language_rejects_zero_and_excessive_result_limits() {
+        // Given the default query has a valid, useful result count.
+        assert_eq!(Query::parse("report", "/trial").unwrap().limit, 50);
+
+        // When a query asks for no results or exceeds the safe bound.
+        for limit in [0, MAX_RESULTS + 1, usize::MAX] {
+            let result = Query::parse(&format!("report limit:{limit}"), "/trial");
+
+            // Then parsing returns the specific range error.
+            assert_eq!(result.err(), Some(format!("limit must be between 1 and {MAX_RESULTS}")));
+        }
+    }
+
+    #[test]
+    fn query_language_preserves_allowed_boundary_limits() {
+        // Given every allowed boundary and the normal default limit.
+        for limit in [1, 50, MAX_RESULTS] {
+            // When the query is parsed.
+            let query = Query::parse(&format!("report limit:{limit}"), "/trial").unwrap();
+
+            // Then the exact requested limit is retained.
+            assert_eq!(query.limit, limit);
+            assert_eq!(query.validate_limits(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn directly_modified_queries_are_checked_at_use() {
+        // Given a parsed query is valid.
+        let mut query = Query::parse("report", "/trial").unwrap();
+        assert_eq!(query.validate_limits(), Ok(()));
+
+        // When an embedding caller changes the public limit field.
+        query.limit = MAX_RESULTS + 1;
+
+        // Then the same validation rejects the value.
+        assert_eq!(query.validate_limits(), Err(format!("limit must be between 1 and {MAX_RESULTS}")));
     }
 }
 

@@ -12,7 +12,7 @@
 //! knows about with the docs we hold, reindex what changed, tombstone what
 //! went away. The first build is just a sync of $HOME.
 
-use crate::index::{HDR, as_bytes, fields, header, layout, sec};
+use crate::index::{HDR, as_bytes, cache_count, fields, header, layout, read_cache, read_cache_text, sec, valid_offsets};
 use crate::live::{Live, join};
 use crate::query::{GrepMode, Query, fold};
 use crate::walk::KIND_FILE;
@@ -29,7 +29,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG03";
+const MAGIC: &[u8; 8] = b"FSCSEG04";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -99,8 +99,14 @@ enum S {
 }
 const NS: usize = 9;
 
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs]
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> Option<[usize; NS]> {
+    let sections =
+        [(ntri, 4), (ntri.checked_add(1)?, 4), (plen, 1), (ndocs.checked_add(1)?, 4), (paths_len, 1), (ndocs, 8), (ndocs, 4), (ndocs, 4), (ndocs, 1)];
+    let mut lengths = [0usize; NS];
+    for (k, (count, size)) in sections.into_iter().enumerate() {
+        lengths[k] = count.checked_mul(size)?;
+    }
+    Some(lengths)
 }
 
 impl Segment {
@@ -193,7 +199,7 @@ impl Segment {
         }
         let mut last = 0u32;
         while !bytes.is_empty() {
-            let (v, n) = varint(bytes);
+            let (v, n) = varint(bytes).expect("validated posting varint");
             bytes = &bytes[n..];
             last += v;
             out.push(last);
@@ -201,27 +207,95 @@ impl Segment {
     }
 
     fn load(dir: &Path, id: u64) -> Option<Segment> {
-        let f = std::fs::File::open(seg_path(dir, id)).ok()?;
-        let map = unsafe { Mmap::map(&f) }.ok()?;
-        let [ndocs, ntri, plen, paths_len] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len));
-        if map.len() < total {
+        let map = read_cache(&seg_path(dir, id)).ok()?;
+        let [ndocs, ntri, plen, paths_len] = fields(&map, MAGIC)?;
+        let (ndocs, ntri, plen, paths_len) = (cache_count(ndocs)?, cache_count(ntri)?, cache_count(plen)?, cache_count(paths_len)?);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len)?)?;
+        if ndocs == 0 || plen >= BITSET as usize || map.len() != total {
             return None;
         }
         let mut dead = vec![0u64; ndocs.div_ceil(64)];
-        if let Ok(b) = std::fs::read(dead_path(dir, id)) {
-            for (w, c) in dead.iter_mut().zip(b.chunks_exact(8)) {
-                *w = u64::from_le_bytes(c.try_into().unwrap());
+        match read_cache(&dead_path(dir, id)) {
+            Ok(bytes) => {
+                if bytes.len() != dead.len().checked_mul(8)? {
+                    return None;
+                }
+                for (word, bytes) in dead.iter_mut().zip(bytes.chunks_exact(8)) {
+                    *word = u64::from_le_bytes(bytes.try_into().ok()?);
+                }
+                if ndocs % 64 != 0 && dead.last()? >> (ndocs % 64) != 0 {
+                    return None;
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
         let live_docs = ndocs - dead.iter().map(|w| w.count_ones() as usize).sum::<usize>();
-        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, off, dead, live_docs })
+        let segment = Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, off, dead, live_docs };
+        segment.valid_records().then_some(segment)
+    }
+
+    fn valid_records(&self) -> bool {
+        if !valid_offsets(self.path_off(), self.paths_len) || self.tri_key().windows(2).any(|w| w[0] >= w[1]) {
+            return false;
+        }
+        for d in 0..self.ndocs {
+            let path = self.path(d as u32);
+            if !path.starts_with(b"/")
+                || path.len() < 2
+                || path.contains(&0)
+                || path[1..].split(|&b| b == b'/').any(|p| p.is_empty() || p == b"." || p == b"..")
+            {
+                return false;
+            }
+        }
+        let mut previous: Option<&[u8]> = None;
+        for &d in self.by_path() {
+            if d as usize >= self.ndocs {
+                return false;
+            }
+            let path = self.path(d);
+            if previous.is_some_and(|p| p >= path) {
+                return false;
+            }
+            previous = Some(path);
+        }
+        let offsets = self.tri_off();
+        if offsets[0] & !BITSET != 0 || offsets[self.ntri] as usize != self.plen {
+            return false;
+        }
+        for k in 0..self.ntri {
+            let (start, end) = ((offsets[k] & !BITSET) as usize, (offsets[k + 1] & !BITSET) as usize);
+            if start >= end || end > self.plen {
+                return false;
+            }
+            let mut bytes = &self.post()[start..end];
+            if offsets[k] & BITSET != 0 {
+                if bytes.len() != self.ndocs.div_ceil(8) || (self.ndocs % 8 != 0 && bytes.last().unwrap() >> (self.ndocs % 8) != 0) {
+                    return false;
+                }
+            } else {
+                let mut last = 0u32;
+                let mut first = true;
+                while !bytes.is_empty() {
+                    let Some((delta, length)) = varint(bytes) else { return false };
+                    let Some(d) = last.checked_add(delta) else { return false };
+                    if d as usize >= self.ndocs || (!first && delta == 0) {
+                        return false;
+                    }
+                    first = false;
+                    last = d;
+                    bytes = &bytes[length..];
+                }
+            }
+        }
+        true
     }
 
     fn save_dead(&self, dir: &Path) {
         let bytes: Vec<u8> = self.dead.iter().flat_map(|w| w.to_le_bytes()).collect();
         let tmp = dead_path(dir, self.id).with_extension("tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
+        if crate::storage::write_private_file(&tmp, &bytes).is_ok() {
             let _ = std::fs::rename(tmp, dead_path(dir, self.id));
         }
     }
@@ -235,15 +309,18 @@ fn dead_path(dir: &Path, id: u64) -> PathBuf {
 }
 
 #[inline]
-fn varint(b: &[u8]) -> (u32, usize) {
+fn varint(b: &[u8]) -> Option<(u32, usize)> {
     let mut v = 0u32;
     for (i, &x) in b.iter().enumerate().take(5) {
+        if i == 4 && x > 0x0f {
+            return None;
+        }
         v |= ((x & 0x7f) as u32) << (7 * i);
         if x & 0x80 == 0 {
-            return (v, i + 1);
+            return (i == 0 || x != 0).then_some((v, i + 1));
         }
     }
-    (v, b.len().min(5))
+    None
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u32) {
@@ -585,7 +662,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(&docs[b as usize].path));
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len()));
+    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len())?)?;
     let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64]);
     let sections: [&[u8]; NS] = [
         as_bytes(&keys),
@@ -601,7 +678,9 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
     let write = || -> std::io::Result<()> {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let file = crate::storage::open_private_file(&tmp)?;
+        file.set_len(0)?;
+        let mut f = std::io::BufWriter::new(file);
         f.write_all(&hdr)?;
         let mut at = HDR;
         for (k, sec) in sections.iter().enumerate() {
@@ -620,7 +699,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
 /// Should this file be in the content index?
 pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
     let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-    name_ok(name, size) && in_scope(path, home)
+    name_ok(name, size) && in_scope(path, home) && crate::content_policy::allows(path)
 }
 
 /// The name/size half of eligibility, checkable before building a path.
@@ -673,8 +752,11 @@ impl Content {
     /// Open the segments the manifest lists, without touching anything: the
     /// view of an engine that follows another process's index.
     pub fn open_shared(dir: PathBuf) -> Content {
-        let manifest: Vec<u64> =
-            std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        let mut manifest: Vec<u64> =
+            read_cache_text(&dir.join("manifest"), 1 << 20).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        manifest.retain(|&id| id < u64::MAX);
+        manifest.sort_unstable();
+        manifest.dedup();
         let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
         let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         Content { dir, segs, next_id }
@@ -698,7 +780,7 @@ impl Content {
     fn save_manifest(&self) {
         let s: String = self.segs.iter().map(|s| format!("{}\n", s.id)).collect();
         let tmp = self.dir.join("manifest.tmp");
-        if std::fs::write(&tmp, s).is_ok() {
+        if crate::storage::write_private_file(&tmp, s.as_bytes()).is_ok() {
             let _ = std::fs::rename(tmp, self.dir.join("manifest"));
         }
     }
@@ -767,9 +849,10 @@ impl Content {
         out
     }
 
-    pub fn alloc_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id - 1
+    pub fn alloc_id(&mut self) -> Option<u64> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1)?;
+        Some(id)
     }
 
     pub fn push(&mut self, seg: Segment) {
@@ -865,7 +948,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             } else {
                 p = join(dir, idx.name(i));
             }
-            if in_scope(&p, home) {
+            if in_scope(&p, home) && crate::content_policy::allows(&p) {
                 want.push(&p, idx.size_of(i), idx.mtime()[i]);
             }
         }
@@ -1211,24 +1294,30 @@ fn regex_plan(h: &Hir) -> TQ {
 /// picked from the name index instead of crawling, newest first. `q` is the
 /// name query restricted to the files worth reading.
 pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
+    struct Candidate {
+        path: Vec<u8>,
+        mtime: u32,
+    }
+
     q.kind = Some(KIND_FILE);
     q.limit = 200_000;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
-    let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
+    let mut files: Vec<Candidate> = (crate::query::Searcher { live }.search(&q).into_iter())
         .map(|h| match h.over {
             Some(path) => {
-                let m = live.over[&path].mtime;
-                (path, m)
+                let mtime = live.over[&path].mtime;
+                Candidate { path, mtime }
             }
             None => {
                 let mut p = Vec::new();
                 live.base.path(h.idx as usize, &mut p);
-                (p, live.base.mtime()[h.idx as usize])
+                Candidate { path: p, mtime: live.base.mtime()[h.idx as usize] }
             }
         })
+        .filter(|candidate| crate::content_policy::allows(&candidate.path))
         .collect();
-    files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
-    files.into_iter().map(|(p, _)| p).collect()
+    files.sort_by_key(|candidate| std::cmp::Reverse(candidate.mtime));
+    files.into_iter().map(|candidate| candidate.path).collect()
 }
 
 /// Open a path for reading only if it is a regular file, never blocking:
@@ -1236,8 +1325,339 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 /// "don't materialize dataless files" policy keeps iCloud placeholders from
 /// being downloaded just because we searched.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+    crate::content_io::open_regular(path)
+}
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn fixture_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("fsearch-segment-tests-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn fixture(dir: &Path) -> Segment {
+        let paths: Vec<Vec<u8>> = (0..65).map(|d| format!("/fixture/file-{d:03}.txt").into_bytes()).collect();
+        let docs: Vec<DocMeta> = paths.iter().map(|path| DocMeta { path, size: 12, mtime: 123, rank: 0 }).collect();
+        let mut key = 0;
+        write_segment(dir, 7, &docs, |list| {
+            key += 1;
+            match key {
+                1 => list.extend_from_slice(&[0, 8, 16, 24, 32, 40, 48, 64]),
+                2 => list.extend(0..9),
+                _ => return None,
+            }
+            Some(key)
+        })
+        .unwrap()
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn cache_segment_roundtrip_preserves_sparse_and_dense_postings() {
+        // Given a saved segment with sparse varints and dense bitset postings.
+        let dir = fixture_dir();
+        let original = fixture(&dir);
+        assert_eq!(original.ndocs, 65);
+        // When the production loader reads the segment.
+        let loaded = Segment::load(&dir, 7).expect("valid segment must load");
+        // Then its paths, postings, and live document count remain correct.
+        assert_eq!(loaded.path(64), b"/fixture/file-064.txt");
+        assert_eq!(loaded.postings(1), vec![0, 8, 16, 24, 32, 40, 48, 64]);
+        assert_eq!(loaded.postings(2), (0..9).collect::<Vec<_>>());
+        assert_eq!(loaded.with_prefix(b"/fixture/").count(), 65);
+        assert_eq!(loaded.live_docs, 65);
+    }
+
+    #[test]
+    fn cache_segment_with_no_trigrams_loads() {
+        // Given a saved text document with no indexed trigram.
+        let dir = fixture_dir();
+        write_segment(&dir, 7, &[DocMeta { path: b"/fixture/empty.txt", size: 0, mtime: 1, rank: 0 }], |_| None).unwrap();
+        // When the production loader reads that segment.
+        let loaded = Segment::load(&dir, 7).expect("segment without trigrams must load");
+        // Then the document remains available and its postings are empty.
+        assert_eq!(loaded.path(0), b"/fixture/empty.txt");
+        assert_eq!(loaded.postings(1), Vec::<u32>::new());
+        assert_eq!(loaded.live_docs, 1);
+    }
+
+    #[test]
+    fn cache_segment_loader_rejects_truncation_overflow_and_empty_documents() {
+        let dir = fixture_dir();
+        fixture(&dir);
+        let original = std::fs::read(seg_path(&dir, 7)).unwrap();
+        for (label, field, value) in
+            [("empty documents", 0, 0), ("document count", 0, u64::MAX), ("trigram count", 1, u64::MAX), ("posting length", 2, BITSET as u64)]
+        {
+            // Given a saved segment with one invalid header count.
+            let mut bytes = original.clone();
+            bytes[8 + field * 8..16 + field * 8].copy_from_slice(&value.to_le_bytes());
+            std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+            // When the production loader reads that segment.
+            let loaded = Segment::load(&dir, 7);
+            // Then it rejects the invalid storage representation.
+            assert!(loaded.is_none(), "accepted invalid {label}");
+        }
+        for length in [7, HDR - 1, original.len() - 1] {
+            // Given a saved segment that ends before its complete layout.
+            std::fs::write(seg_path(&dir, 7), &original[..length]).unwrap();
+            // When the production loader reads that segment.
+            let loaded = Segment::load(&dir, 7);
+            // Then the incomplete segment is rejected.
+            assert!(loaded.is_none(), "accepted segment truncated to {length} bytes");
+        }
+    }
+
+    #[test]
+    fn cache_segment_loader_rejects_invalid_paths_order_ids_and_posting_ranges() {
+        let dir = fixture_dir();
+        let segment = fixture(&dir);
+        let original = std::fs::read(seg_path(&dir, 7)).unwrap();
+        for (label, section, element, value) in [
+            ("path offset", S::PathOff, 1, u32::MAX),
+            ("document id", S::ByPath, 0, 65),
+            ("duplicate document id", S::ByPath, 1, 0),
+            ("key order", S::TriKey, 1, 1),
+            ("posting range", S::TriOff, 1, u32::MAX),
+            ("posting origin", S::TriOff, 0, 1),
+            ("posting end", S::TriOff, 2, 0),
+            ("bitset length", S::TriOff, 1, BITSET | 9),
+        ] {
+            // Given a saved segment with one invalid record or range.
+            let mut bytes = original.clone();
+            put_u32(&mut bytes, segment.off[section as usize] + element * 4, value);
+            std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+            // When the production loader reads that segment.
+            let loaded = Segment::load(&dir, 7);
+            // Then the invalid record cannot reach segment consumers.
+            assert!(loaded.is_none(), "accepted invalid {label}");
+        }
+        // Given a valid document permutation saved in the wrong path order.
+        let mut bytes = original.clone();
+        put_u32(&mut bytes, segment.off[S::ByPath as usize], 1);
+        put_u32(&mut bytes, segment.off[S::ByPath as usize] + 4, 0);
+        std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+        // When the production loader reads that permutation.
+        let loaded = Segment::load(&dir, 7);
+        // Then it rejects the order required by binary path lookup.
+        assert!(loaded.is_none(), "accepted unsorted path permutation");
+        for (label, offset, byte) in [
+            ("relative path", segment.off[S::Paths as usize], b'.'),
+            ("NUL path", segment.off[S::Paths as usize] + 1, 0),
+            ("bitset padding", segment.off[S::Post as usize] + segment.plen - 1, 2),
+        ] {
+            // Given a saved segment with invalid path or padding bytes.
+            let mut bytes = original.clone();
+            bytes[offset] = byte;
+            std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+            // When the production loader reads that segment.
+            let loaded = Segment::load(&dir, 7);
+            // Then it rejects that invalid byte representation.
+            assert!(loaded.is_none(), "accepted invalid {label}");
+        }
+    }
+
+    #[test]
+    fn cache_segment_loader_rejects_invalid_delta_varints() {
+        let dir = fixture_dir();
+        let segment = fixture(&dir);
+        let original = std::fs::read(seg_path(&dir, 7)).unwrap();
+        for (label, prefix) in [
+            ("unterminated", vec![0x80; 8]),
+            ("overflow", vec![0xff, 0xff, 0xff, 0xff, 0x10]),
+            ("delta sum overflow", vec![8, 0xff, 0xff, 0xff, 0xff, 0x0f]),
+            ("document out of range", vec![65]),
+            ("duplicate document", vec![0, 0]),
+            ("noncanonical", vec![0x80, 0]),
+        ] {
+            // Given a saved sparse posting list with an invalid delta encoding.
+            let mut bytes = original.clone();
+            let start = segment.off[S::Post as usize];
+            bytes[start..start + prefix.len()].copy_from_slice(&prefix);
+            std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+            // When the production loader reads that segment.
+            let loaded = Segment::load(&dir, 7);
+            // Then it rejects invalid varints and invalid resulting document IDs.
+            assert!(loaded.is_none(), "accepted {label} varint list");
+        }
+    }
+
+    #[test]
+    fn cache_segment_loader_validates_tombstone_length_and_padding() {
+        let dir = fixture_dir();
+        fixture(&dir);
+        let valid: Vec<u8> = [1u64, 0].into_iter().flat_map(u64::to_le_bytes).collect();
+        // Given a valid tombstone that marks document zero as deleted.
+        std::fs::write(dead_path(&dir, 7), &valid).unwrap();
+        // When the production loader reads the segment and its tombstone.
+        let loaded = Segment::load(&dir, 7).expect("valid tombstone must load");
+        // Then exactly that document is deleted.
+        assert_eq!(loaded.live_docs, 64);
+        assert!(loaded.is_dead(0));
+        assert!(!loaded.is_dead(64));
+        for (label, bytes) in
+            [("truncated", vec![0; 7]), ("extra word", vec![0; 24]), ("padding bit", [0u64, 2].into_iter().flat_map(u64::to_le_bytes).collect())]
+        {
+            // Given a tombstone whose size or unused bits are invalid.
+            std::fs::write(dead_path(&dir, 7), bytes).unwrap();
+            // When the production loader reads the segment and tombstone.
+            let loaded = Segment::load(&dir, 7);
+            // Then it rejects the segment instead of changing its live count.
+            assert!(loaded.is_none(), "accepted {label} tombstone");
+        }
+    }
+
+    #[test]
+    fn cache_manifest_rejects_overflow_id_and_loads_each_segment_once() {
+        // Given a manifest with an overflow ID and a repeated valid segment.
+        let dir = fixture_dir();
+        fixture(&dir);
+        std::fs::copy(seg_path(&dir, 7), seg_path(&dir, u64::MAX)).unwrap();
+        std::fs::write(dir.join("manifest"), format!("{}\n7\n7\n", u64::MAX)).unwrap();
+        // When the production shared-cache loader reads the manifest.
+        let mut loaded = Content::open_shared(dir);
+        // Then it retains the valid segment once and allocates a valid next ID.
+        assert_eq!(loaded.segs.iter().map(|s| s.id).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(loaded.next_id, 8);
+        assert_eq!(loaded.docs(), 65);
+        assert_eq!(loaded.alloc_id(), Some(8));
+    }
+
+    #[test]
+    fn cache_segment_id_exhaustion_stops_allocation_without_overflow() {
+        // Given a valid loaded segment using the last persistable ID.
+        let dir = fixture_dir();
+        fixture(&dir);
+        std::fs::copy(seg_path(&dir, 7), seg_path(&dir, u64::MAX - 1)).unwrap();
+        std::fs::write(dir.join("manifest"), format!("{}\n", u64::MAX - 1)).unwrap();
+        let mut loaded = Content::open_shared(dir);
+        assert_eq!(loaded.next_id, u64::MAX);
+        assert_eq!(loaded.docs(), 65);
+        // When a caller requests a fresh segment ID.
+        let id = loaded.alloc_id();
+        // Then it receives an explicit exhaustion result and the cache remains usable.
+        assert_eq!(id, None);
+        assert_eq!(loaded.next_id, u64::MAX);
+        assert_eq!(loaded.docs(), 65);
+    }
+
+    #[test]
+    fn cache_manifest_rejects_symlinks_and_oversized_files() {
+        // Given a manifest reached through a symbolic link.
+        let dir = fixture_dir();
+        fixture(&dir);
+        let target = dir.join("manifest-target");
+        std::fs::write(&target, "7\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("manifest")).unwrap();
+        // When the production shared-cache loader opens that manifest.
+        let loaded = Content::open_shared(dir.clone());
+        // Then it loads no segment from the indirect manifest.
+        assert_eq!(loaded.docs(), 0);
+
+        // Given a regular manifest whose size exceeds 1 MiB.
+        let dir = fixture_dir();
+        fixture(&dir);
+        let manifest = dir.join("manifest");
+        std::fs::write(&manifest, "7\n").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&manifest).unwrap().set_len((1 << 20) + 1).unwrap();
+        // When the production shared-cache loader opens that manifest.
+        let loaded = Content::open_shared(dir);
+        // Then it rejects the manifest before allocating or parsing its text.
+        assert_eq!(loaded.docs(), 0);
+    }
+
+    #[test]
+    fn cache_segment_rejects_the_previous_content_policy_format() {
+        // Given a segment saved with the previous content-policy format.
+        let dir = fixture_dir();
+        fixture(&dir);
+        let mut bytes = std::fs::read(seg_path(&dir, 7)).unwrap();
+        bytes[..8].copy_from_slice(b"FSCSEG03");
+        std::fs::write(seg_path(&dir, 7), bytes).unwrap();
+        // When the production loader opens the old segment.
+        let loaded = Segment::load(&dir, 7);
+        // Then it rejects that segment so the owner can rebuild with the new policy.
+        assert!(loaded.is_none(), "accepted an old content-policy segment");
+    }
+
+    #[test]
+    fn cache_loaded_segment_survives_source_file_truncation() {
+        // Given a valid segment loaded into stable memory.
+        let dir = fixture_dir();
+        fixture(&dir);
+        let loaded = Segment::load(&dir, 7).unwrap();
+        assert_eq!(loaded.postings(2), (0..9).collect::<Vec<_>>());
+        // When another writer truncates the original segment file.
+        std::fs::OpenOptions::new().write(true).open(seg_path(&dir, 7)).unwrap().set_len(0).unwrap();
+        // Then both path access and posting decoding remain valid.
+        assert_eq!(loaded.path(64), b"/fixture/file-064.txt");
+        assert_eq!(loaded.postings(1), vec![0, 8, 16, 24, 32, 40, 48, 64]);
+        assert_eq!(loaded.postings(2), (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cache_save_segment_rejects_a_planted_temporary_symlink() {
+        // Given a generated target file and a segment temporary symlink to that target.
+        let dir = fixture_dir();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"keep these target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, seg_path(&dir, 7).with_extension("tmp")).unwrap();
+        // When the production segment writer uses that temporary path.
+        let saved = write_segment(&dir, 7, &[DocMeta { path: b"/fixture/empty.txt", size: 0, mtime: 1, rank: 0 }], |_| None);
+        // Then it rejects the save and leaves the target bytes unchanged.
+        assert!(saved.is_none(), "accepted a symbolic-link temporary segment");
+        assert_eq!(std::fs::read(target).unwrap(), b"keep these target bytes");
+    }
+
+    #[test]
+    fn cache_save_tombstone_rejects_a_planted_temporary_symlink() {
+        // Given a deleted document and a tombstone temporary symlink to a generated target.
+        let dir = fixture_dir();
+        let mut segment = fixture(&dir);
+        assert!(segment.kill(0));
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"keep these target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, dead_path(&dir, 7).with_extension("tmp")).unwrap();
+        // When the production tombstone writer uses that temporary path.
+        segment.save_dead(&dir);
+        // Then the target bytes remain unchanged and no tombstone is published.
+        assert_eq!(std::fs::read(target).unwrap(), b"keep these target bytes");
+        assert_eq!(Segment::load(&dir, 7).unwrap().live_docs, 65);
+    }
+
+    #[test]
+    fn cache_save_manifest_rejects_a_planted_temporary_symlink() {
+        // Given a content segment and a manifest temporary symlink to a generated target.
+        let dir = fixture_dir();
+        let segment = fixture(&dir);
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"keep these target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("manifest.tmp")).unwrap();
+        let content = Content { dir: dir.clone(), segs: vec![segment], next_id: 8 };
+        // When the production manifest writer uses that temporary path.
+        content.save_manifest();
+        // Then the target bytes remain unchanged and no manifest is published.
+        assert_eq!(std::fs::read(target).unwrap(), b"keep these target bytes");
+        assert_eq!(Content::open_shared(dir).docs(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "section byte length overflow")]
+    fn cache_sections_reject_an_invalid_public_document_count() {
+        // Given a valid segment whose public count is changed after loading.
+        let dir = fixture_dir();
+        let mut segment = fixture(&dir);
+        assert_eq!(segment.size().len(), 65);
+        segment.ndocs = usize::MAX;
+        // When a safe caller asks for the corresponding typed section.
+        // Then the accessor fails with the stated bounds error before creating a raw slice.
+        segment.size();
+    }
 }

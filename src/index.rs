@@ -14,10 +14,13 @@ use crate::walk::{KIND_DIR, Listing, NONE};
 use memmap2::{Mmap, MmapMut};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"FSIDX007";
+// This FSEvents value starts a watch without replaying saved history.
+const EVENT_SINCE_NOW: u64 = u64::MAX;
 
 #[derive(Clone, Copy)]
 enum Sec {
@@ -72,7 +75,10 @@ pub struct MemoPlan {
 macro_rules! sec {
     ($name:ident, $s:expr, $t:ty, $len:ident) => {
         pub fn $name(&self) -> &[$t] {
-            unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(self.off[$s as usize]) as *const $t, self.$len) }
+            let length = self.$len.checked_mul(std::mem::size_of::<$t>()).expect("section byte length overflow");
+            let bytes = &self.map[self.off[$s as usize]..][..length];
+            // Section offsets are privately owned and 64-byte aligned.
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const $t, self.$len) }
         }
     };
 }
@@ -162,20 +168,18 @@ impl Index {
 
     pub fn path(&self, i: usize, out: &mut Vec<u8>) {
         out.clear();
-        let mut chain = [0u32; 256];
-        let mut k = 0;
+        let mut chain = Vec::new();
         let mut e = i as u32;
-        while e != 0 && k < chain.len() {
-            chain[k] = e;
-            k += 1;
+        while e != 0 {
+            chain.push(e);
             e = self.dir_entry()[self.parent()[e as usize] as usize];
         }
-        if k == 0 {
+        if chain.is_empty() {
             out.push(b'/');
         }
-        for j in (0..k).rev() {
+        for e in chain.into_iter().rev() {
             out.push(b'/');
-            out.extend_from_slice(self.name(chain[j] as usize));
+            out.extend_from_slice(self.name(e as usize));
         }
     }
 
@@ -328,7 +332,7 @@ impl Index {
         }
 
         // Write the blob.
-        let (off, total) = layout(&section_lens(n, d, u, unames.len()));
+        let (off, total) = layout(&section_lens(n, d, u, unames.len()).expect("index lengths")).expect("index layout");
         let mut m = MmapMut::map_anon(total).expect("anon map");
         let mut put = |s: Sec, v: &[u8]| m[off[s as usize]..][..v.len()].copy_from_slice(v);
         put(Sec::NameMask, as_bytes(&umask));
@@ -352,29 +356,111 @@ impl Index {
     }
 
     fn from_map(map: Mmap) -> Option<Index> {
-        let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&section_lens(n, d, u, names_len));
-        if map.len() < total {
+        let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?;
+        let (n, d, u, names_len) = (cache_count(n)?, cache_count(d)?, cache_count(u)?, cache_count(names_len)?);
+        let synced_at = u32::try_from(synced_at).ok()?;
+        let (off, total) = layout(&section_lens(n, d, u, names_len)?)?;
+        if n == 0 || d == 0 || u == 0 || d > n || u > n || map.len() != total || event_id == EVENT_SINCE_NOW {
             return None;
         }
-        Some(Index {
-            n,
-            d,
-            u,
-            u1: u + 1,
-            names_len,
-            event_id: event_id as u64,
-            synced_at: synced_at as u32,
-            off,
-            map,
-            plan: std::sync::OnceLock::new(),
-        })
+        let index = Index { n, d, u, u1: u + 1, names_len, event_id, synced_at, off, map, plan: std::sync::OnceLock::new() };
+        index.valid_records().then_some(index)
+    }
+
+    /// The checked layout makes typed slices safe; these checks make their
+    /// IDs, path components, and DFS ranges safe for all query consumers.
+    fn valid_records(&self) -> bool {
+        let (de, dp, parent, names) = (self.dir_entry(), self.dir_parent(), self.parent(), self.ent_name());
+        if de[0] != 0 || dp[0] != 0 || parent[0] != 0 || names[0] != 0 || self.kind()[0] != KIND_DIR {
+            return false;
+        }
+        if !valid_offsets(self.name_off(), self.names_len) || self.name_off()[1] != 0 {
+            return false;
+        }
+        for k in 0..self.u {
+            let name = self.uname(k as u32);
+            if (k != 0 && !valid_component(name)) || self.name_mask()[k] != name_mask(name) {
+                return false;
+            }
+        }
+        for i in 0..self.n {
+            let p = parent[i] as usize;
+            if names[i] as usize >= self.u || p >= self.d || self.kind()[i] & !0x0f != 0 {
+                return false;
+            }
+            if i != 0 {
+                let start = self.dir_start()[p] as usize;
+                let Some(end) = start.checked_add(self.dir_len()[p] as usize) else { return false };
+                if names[i] == 0 || !(start..end).contains(&i) {
+                    return false;
+                }
+            }
+        }
+        let mut ends = Vec::with_capacity(self.d);
+        for k in 0..self.d {
+            let e = de[k] as usize;
+            let start = self.dir_start()[k] as usize;
+            let Some(end) = start.checked_add(self.dir_len()[k] as usize) else { return false };
+            if e >= self.n
+                || self.kind()[e] & 3 != KIND_DIR
+                || (k > 0 && (de[k - 1] >= de[k] || dp[k] as usize >= k))
+                || dp[k] != parent[e]
+                || start > end
+                || end > self.n
+            {
+                return false;
+            }
+            let mut previous: Option<&[u8]> = None;
+            for (i, &entry_parent) in parent.iter().enumerate().take(end).skip(start) {
+                let name = self.name(i);
+                if entry_parent != k as u32 || previous.is_some_and(|p| p >= name) {
+                    return false;
+                }
+                previous = Some(name);
+            }
+            ends.push(end as u32);
+        }
+        let mut next = 1usize;
+        let mut visited = 0usize;
+        let mut stack = vec![0usize];
+        while let Some(k) = stack.pop() {
+            let range = self.children(k as u32);
+            if range.start != next {
+                return false;
+            }
+            next = range.end;
+            visited += 1;
+            let children = de.partition_point(|&e| (e as usize) < range.start)..de.partition_point(|&e| (e as usize) < range.end);
+            stack.extend(children.rev());
+        }
+        if visited != self.d || next != self.n {
+            return false;
+        }
+        for k in (1..self.d).rev() {
+            let p = dp[k] as usize;
+            ends[p] = ends[p].max(ends[k]);
+        }
+        if ends != self.dir_end() || !valid_offsets(self.name_ents_off(), self.n) {
+            return false;
+        }
+        for k in 0..self.u {
+            let off = self.name_ents_off();
+            let group = &self.name_ents()[off[k] as usize..off[k + 1] as usize];
+            if group.is_empty()
+                || group.windows(2).any(|w| w[0] >= w[1])
+                || group.iter().any(|&e| e as usize >= self.n || names[e as usize] != k as u32)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = crate::storage::open_private_file(&tmp)?;
+        f.set_len(0)?;
         f.write_all(&header(MAGIC, &[self.n as u64, self.d as u64, self.u as u64, self.names_len as u64, self.event_id, self.synced_at as u64]))?;
         f.write_all(&self.map[HDR..])?;
         f.sync_data()?;
@@ -383,15 +469,14 @@ impl Index {
 
     /// The event id a saved index is current as of, from its header alone.
     pub fn saved_event_id(path: &Path) -> Option<u64> {
-        use std::io::Read;
         let mut h = [0u8; 56];
-        std::fs::File::open(path).ok()?.read_exact(&mut h).ok()?;
-        fields::<6>(&h, MAGIC).map(|f| f[4])
+        open_cache(path, MAX_CACHE_BYTES).ok()?.file.read_exact(&mut h).ok()?;
+        let event_id = fields::<6>(&h, MAGIC)?[4];
+        (event_id != EVENT_SINCE_NOW).then_some(event_id)
     }
 
     pub fn load(path: &Path) -> Option<Index> {
-        let f = std::fs::File::open(path).ok()?;
-        Index::from_map(unsafe { Mmap::map(&f) }.ok()?)
+        Index::from_map(read_cache(path).ok()?)
     }
 
     pub fn bytes(&self) -> usize {
@@ -432,22 +517,82 @@ pub(crate) fn fields<const N: usize>(b: &[u8], magic: &[u8; 8]) -> Option<[u64; 
 }
 
 /// Section offsets for these lengths, and the file size.
-pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> ([usize; N], usize) {
+pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> Option<([usize; N], usize)> {
     let mut off = [0usize; N];
     let mut at = HDR;
     for (k, &l) in lens.iter().enumerate() {
         off[k] = at;
-        at = (at + l + 63) & !63;
+        at = at.checked_add(l)?.checked_add(63)? & !63;
+        if at > isize::MAX as usize {
+            return None;
+        }
     }
-    (off, at)
+    Some((off, at))
+}
+
+/// A 1 GiB file limit bounds allocation before parsing. Larger cache files
+/// are rejected, so raising this limit is an explicit memory-budget choice.
+const MAX_CACHE_BYTES: u64 = 1 << 30;
+
+struct CacheFile {
+    file: std::fs::File,
+    length: usize,
+}
+
+fn open_cache(path: &Path, limit: u64) -> std::io::Result<CacheFile> {
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cache file type or size"));
+    }
+    let length = usize::try_from(metadata.len()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cache file is too large"))?;
+    Ok(CacheFile { file, length })
+}
+
+/// Cache writers rename complete files. Copy into an anonymous mapping so
+/// later changes or truncation of the source cannot invalidate safe slices.
+pub(crate) fn read_cache(path: &Path) -> std::io::Result<Mmap> {
+    let CacheFile { mut file, length } = open_cache(path, MAX_CACHE_BYTES)?;
+    let mut map = MmapMut::map_anon(length)?;
+    file.read_exact(&mut map)?;
+    map.make_read_only()
+}
+
+pub(crate) fn read_cache_text(path: &Path, limit: u64) -> std::io::Result<String> {
+    let CacheFile { file, length } = open_cache(path, limit)?;
+    let mut text = String::with_capacity(length);
+    let read = file.take(length as u64).read_to_string(&mut text)?;
+    if read != length {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "cache text changed while reading"));
+    }
+    Ok(text)
+}
+
+pub(crate) fn cache_count(value: u64) -> Option<usize> {
+    usize::try_from(u32::try_from(value).ok()?).ok()
+}
+
+pub(crate) fn valid_offsets(offsets: &[u32], length: usize) -> bool {
+    offsets.first() == Some(&0) && offsets.last().is_some_and(|&last| last as usize == length) && offsets.windows(2).all(|w| w[0] <= w[1])
+}
+
+fn valid_component(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.iter().any(|&b| b == 0 || b == b'/')
 }
 
 pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
-    [u * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4, (u + 1) * 4, n * 4]
+fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> Option<[usize; NSEC]> {
+    let u1 = u.checked_add(1)?;
+    let sections =
+        [(u, 8), (u1, 4), (names_len, 1), (n, 4), (n, 1), (n, 4), (n, 4), (n, 4), (d, 4), (d, 4), (d, 4), (d, 4), (d, 1), (d, 4), (u1, 4), (n, 4)];
+    let mut lengths = [0usize; NSEC];
+    for (k, (count, size)) in sections.into_iter().enumerate() {
+        lengths[k] = count.checked_mul(size)?;
+    }
+    Some(lengths)
 }
 
 /// Sizes in 4 bytes: exact below 2 GiB, 2 MiB granularity above.
@@ -558,5 +703,317 @@ fn prior_adjust(name: &[u8], depth: u8) -> i32 {
         b"folders" | b"Containers" | b"Group Containers" => -10,
         b"Application Support" => -5,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::walk::{KIND_FILE, RawEnt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn fixture_path() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("fsearch-index-tests-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        dir.join("index.bin")
+    }
+
+    fn listing(id: u32, entries: &[(&[u8], u8, u32)]) -> Listing {
+        let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+        for &(name, kind, child) in entries {
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, child, size: 12, mtime: 123 });
+            l.names.extend_from_slice(name);
+        }
+        l
+    }
+
+    fn fixture() -> Index {
+        Index::build(
+            vec![
+                listing(0, &[(b"folder", KIND_DIR, 1), (b"readme.txt", KIND_FILE, NONE)]),
+                listing(1, &[(b"alpha.txt", KIND_FILE, NONE), (b"nested", KIND_DIR, 2)]),
+                listing(2, &[(b"last.txt", KIND_FILE, NONE), (b"readme.txt", KIND_FILE, NONE)]),
+            ],
+            42,
+            123,
+            b"/folder",
+        )
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn cache_roundtrip_preserves_lookup_and_tree_ranges() {
+        // Given a saved index with a nested directory and distinct names.
+        let path = fixture_path();
+        let original = fixture();
+        original.save(&path).unwrap();
+        assert_eq!(original.lookup(b"/folder/nested/last.txt"), Some(5));
+        // When the production loader reads the saved cache.
+        let loaded = Index::load(&path).expect("valid cache must load");
+        // Then paths, subtree bounds, and the source event remain correct.
+        let mut out = Vec::new();
+        loaded.path(5, &mut out);
+        assert_eq!(out, b"/folder/nested/last.txt");
+        assert_eq!(loaded.lookup(&out), Some(5));
+        assert_eq!(loaded.children(0), 1..3);
+        assert_eq!(loaded.descendants(0), 1..3);
+        assert_eq!(loaded.event_id, 42);
+        assert_eq!(loaded.memo_plan().upper, vec![1]);
+        let name_id = loaded.ent_name()[2] as usize;
+        assert_eq!(&loaded.name_ents()[loaded.name_ents_off()[name_id] as usize..loaded.name_ents_off()[name_id + 1] as usize], &[2, 6]);
+    }
+
+    #[test]
+    fn cache_root_only_tree_loads_and_searches() {
+        // Given a saved index with no files or child directories.
+        let path = fixture_path();
+        Index::build(vec![listing(0, &[])], 0, 0, b"/").save(&path).unwrap();
+        // When the production loader reads the root-only cache.
+        let loaded = Index::load(&path).expect("root-only cache must load");
+        // Then the root is available and all child ranges are empty.
+        assert_eq!((loaded.n, loaded.d, loaded.u), (1, 1, 1));
+        assert_eq!(loaded.lookup(b"/"), Some(0));
+        assert_eq!(loaded.lookup(b"/missing"), None);
+        assert_eq!(loaded.children(0), 1..1);
+        assert_eq!(loaded.descendants(0), 1..1);
+        assert!(loaded.memo_plan().upper.is_empty());
+    }
+
+    #[test]
+    fn cache_loader_rejects_truncated_and_invalid_header_counts() {
+        let original = fixture();
+        for (label, field, value) in [
+            ("zero entries", 0, 0),
+            ("zero directories", 1, 0),
+            ("zero names", 2, 0),
+            ("oversized count", 2, u64::MAX),
+            ("timestamp overflow", 5, u32::MAX as u64 + 1),
+        ] {
+            // Given a valid saved cache with one invalid header count.
+            let path = fixture_path();
+            original.save(&path).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[8 + field * 8..16 + field * 8].copy_from_slice(&value.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            // When the production loader reads that cache.
+            let loaded = Index::load(&path);
+            // Then it rejects the cache before any consumer can use it.
+            assert!(loaded.is_none(), "accepted cache with {label}");
+        }
+        for length in [7, HDR - 1, original.bytes() - 1] {
+            // Given a cache that ends before its full serialized layout.
+            let path = fixture_path();
+            original.save(&path).unwrap();
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(length as u64).unwrap();
+            // When the production loader reads that cache.
+            let loaded = Index::load(&path);
+            // Then it rejects the incomplete cache.
+            assert!(loaded.is_none(), "accepted cache truncated to {length} bytes");
+        }
+    }
+
+    #[test]
+    fn cache_loader_rejects_invalid_record_offsets_ids_and_order() {
+        let original = fixture();
+        let edits = [
+            ("name offset", Sec::NameOff, 1, u32::MAX),
+            ("entry name id", Sec::EntName, 1, original.u as u32),
+            ("parent id", Sec::Parent, 1, original.d as u32),
+            ("directory entry id", Sec::DirEntry, 1, original.n as u32),
+            ("directory cycle", Sec::DirParent, 1, 1),
+            ("child range", Sec::DirLen, 0, u32::MAX),
+            ("subtree range", Sec::DirEnd, 0, 3),
+            ("DFS block order", Sec::DirStart, 1, 1),
+            ("name posting offset", Sec::NameEntsOff, 1, u32::MAX),
+            ("name posting id", Sec::NameEnts, 1, original.n as u32),
+            ("name posting order", Sec::NameEnts, original.name_ents_off()[original.ent_name()[2] as usize] as usize + 1, 2),
+            ("sibling order", Sec::EntName, 1, original.ent_name()[2]),
+        ];
+        for (label, section, element, value) in edits {
+            // Given a saved cache with one invalid record or range.
+            let path = fixture_path();
+            original.save(&path).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            put_u32(&mut bytes, original.off[section as usize] + element * 4, value);
+            std::fs::write(&path, bytes).unwrap();
+            // When the production loader reads that cache.
+            let loaded = Index::load(&path);
+            // Then it rejects the invalid storage representation.
+            assert!(loaded.is_none(), "accepted invalid {label}");
+        }
+    }
+
+    #[test]
+    fn cache_loader_rejects_invalid_name_components_and_masks() {
+        let original = fixture();
+        for (label, section, byte) in [("path separator", Sec::Names, b'/'), ("NUL", Sec::Names, 0), ("character mask", Sec::NameMask, 0)] {
+            // Given a saved index with invalid name bytes or a mismatched mask.
+            let path = fixture_path();
+            original.save(&path).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let offset = original.off[section as usize] + if matches!(section, Sec::NameMask) { 8 } else { 0 };
+            bytes[offset] = byte;
+            std::fs::write(&path, bytes).unwrap();
+            // When the production loader reads that cache.
+            let loaded = Index::load(&path);
+            // Then the invalid component cannot become a filesystem path.
+            assert!(loaded.is_none(), "accepted invalid {label}");
+        }
+    }
+
+    #[test]
+    fn cache_loader_rejects_symlinks_and_oversized_files() {
+        // Given a valid cache reached through a symbolic link.
+        let path = fixture_path();
+        fixture().save(&path).unwrap();
+        let link = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        // When the production loader opens that path.
+        let loaded = Index::load(&link);
+        // Then it rejects the indirect file.
+        assert!(loaded.is_none(), "accepted a symbolic-link cache");
+        assert_eq!(Index::saved_event_id(&link), None);
+
+        // Given a cache with a declared file length above the 1 GiB bound.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len((1 << 30) + 1).unwrap();
+        // When the production loader reads that file.
+        let loaded = Index::load(&path);
+        // Then it rejects the file before allocating its cache buffer.
+        assert!(loaded.is_none(), "accepted an oversized cache");
+    }
+
+    #[test]
+    fn cache_loader_and_header_reader_reject_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        // Given a FIFO in place of a saved cache file.
+        let path = fixture_path();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // When both production read paths try to load it.
+        let loaded = Index::load(&path);
+        let event = Index::saved_event_id(&path);
+        // Then both return immediately with an invalid-cache result.
+        assert!(loaded.is_none());
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn cache_loader_and_header_reader_reject_reserved_event_id() {
+        // Given a valid saved cache whose event ID is changed to the reserved SinceNow value.
+        let path = fixture_path();
+        fixture().save(&path).unwrap();
+        assert_eq!(Index::saved_event_id(&path), Some(42));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        // When the production full-cache and header-only readers load that file.
+        let loaded_event = Index::load(&path).map(|index| index.event_id);
+        let header_event = Index::saved_event_id(&path);
+        // Then both reject the reserved value so startup can rebuild and replay history.
+        assert_eq!((loaded_event, header_event), (None, None));
+    }
+
+    #[test]
+    fn cache_save_rejects_a_planted_temporary_symlink() {
+        // Given a generated target file and a temporary-cache symlink to that target.
+        let path = fixture_path();
+        let target = path.with_extension("target");
+        std::fs::write(&target, b"keep these target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, path.with_extension("tmp")).unwrap();
+        // When the production index writer saves through that temporary path.
+        let result = fixture().save(&path);
+        // Then it rejects the save and leaves the target bytes unchanged.
+        assert!(result.is_err(), "accepted a symbolic-link temporary cache");
+        assert_eq!(std::fs::read(target).unwrap(), b"keep these target bytes");
+    }
+
+    #[test]
+    #[should_panic(expected = "section byte length overflow")]
+    fn cache_sections_reject_an_invalid_public_entry_count() {
+        // Given a valid index whose public count is changed after construction.
+        let mut index = fixture();
+        assert_eq!(index.size_raw().len(), 7);
+        index.n = usize::MAX;
+        // When a safe caller asks for the corresponding typed section.
+        // Then the accessor fails with the stated bounds error before creating a raw slice.
+        index.size_raw();
+    }
+
+    #[test]
+    fn cache_loaded_index_survives_source_file_truncation() {
+        // Given a valid cache that has been loaded into stable memory.
+        let path = fixture_path();
+        fixture().save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.lookup(b"/folder/nested/last.txt"), Some(5));
+        // When another writer truncates the original file.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        // Then the loaded index still returns its complete saved path.
+        let mut out = Vec::new();
+        loaded.path(5, &mut out);
+        assert_eq!(out, b"/folder/nested/last.txt");
+        assert_eq!(loaded.lookup(&out), Some(5));
+    }
+
+    #[test]
+    fn cache_roundtrip_preserves_paths_deeper_than_256_directories() {
+        // Given a saved valid tree with 300 ancestor directories.
+        let path = fixture_path();
+        let mut listings: Vec<Listing> = (0..300).map(|id| listing(id, &[(b"x", KIND_DIR, id + 1)])).collect();
+        listings.push(listing(300, &[(b"leaf.txt", KIND_FILE, NONE)]));
+        let expected = format!("{}/leaf.txt", "/x".repeat(300)).into_bytes();
+        Index::build(listings, 0, 0, b"/").save(&path).unwrap();
+        // When the production loader reconstructs the leaf path.
+        let loaded = Index::load(&path).unwrap();
+        let mut out = Vec::new();
+        loaded.path(301, &mut out);
+        // Then all ancestor components survive and lookup finds the same leaf.
+        assert_eq!(out, expected);
+        assert_eq!(loaded.lookup(&out), Some(301));
+    }
+
+    #[test]
+    fn cache_large_tree_search_uses_valid_parallel_ancestor_ranges() {
+        use crate::live::Live;
+        use crate::query::{FULL_PASS, Query, Searcher};
+        // Given more than 4,096 directories, nested branches, and an empty root sibling.
+        let path = fixture_path();
+        let mut listings = vec![listing(0, &[(b"selected", KIND_DIR, 1), (b"empty", KIND_DIR, 2)]), listing(2, &[])];
+        let branches: Vec<Vec<u8>> = (0..4100).map(|i| format!("branch-{i:04}").into_bytes()).collect();
+        let entries: Vec<(&[u8], u8, u32)> = branches.iter().enumerate().map(|(i, name)| (name.as_slice(), KIND_DIR, i as u32 + 3)).collect();
+        listings.push(listing(1, &entries));
+        for i in 0..4100 {
+            let mut children: Vec<(&[u8], u8, u32)> = vec![(b"readme.txt", KIND_FILE, NONE)];
+            if i % 10 == 0 {
+                children.push((b"nested", KIND_DIR, 5000 + i));
+                listings.push(listing(5000 + i, &[(b"leaf.txt", KIND_FILE, NONE)]));
+            }
+            listings.push(listing(3 + i, &children));
+        }
+        Index::build(listings, 0, 0, b"/").save(&path).unwrap();
+        let live = Live::new(Index::load(&path).expect("valid large cache must load"));
+        assert!(live.base.memo_plan().upper.len() > 4096);
+        assert_eq!(live.base.memo_plan().chunks.len(), 410);
+        let query = Query::parse("selected leaf limit:200", "/").unwrap();
+        // When a full search folds directory tokens through the parallel memo ranges.
+        FULL_PASS.store(true, Ordering::Relaxed);
+        let hits = Searcher { live: &live }.search(&query);
+        FULL_PASS.store(false, Ordering::Relaxed);
+        // Then the ordered result paths exactly match the expected first 200 files.
+        let actual: Vec<Vec<u8>> = hits
+            .into_iter()
+            .map(|hit| {
+                let mut path = Vec::new();
+                live.base.path(hit.idx as usize, &mut path);
+                path
+            })
+            .collect();
+        let expected: Vec<Vec<u8>> = (0..200).map(|i| format!("/selected/branch-{:04}/nested/leaf.txt", i * 10).into_bytes()).collect();
+        assert_eq!(actual, expected);
     }
 }

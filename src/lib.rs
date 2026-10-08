@@ -4,11 +4,14 @@
 //! a daemon with a JSON-lines socket.
 
 pub mod content;
+mod content_io;
+mod content_policy;
 mod engine;
 mod fsevents;
 pub mod index;
 pub mod live;
 pub mod query;
+pub mod storage;
 pub mod walk;
 
 pub use content::{FileMatches, Grep, GrepResult};

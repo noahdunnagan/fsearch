@@ -146,16 +146,22 @@ impl Engine {
     /// Start indexing in the background and return at once; searches answer
     /// `Err` until the index is loaded (or, on the very first run, built).
     pub fn start(opts: Options) -> Result<Engine, String> {
-        std::fs::create_dir_all(&opts.dir).map_err(|e| e.to_string())?;
+        crate::storage::ensure_private_dir(&opts.dir).map_err(|e| e.to_string())?;
+        crate::storage::ensure_private_dir(&opts.dir.join("content")).map_err(|e| e.to_string())?;
+        // A reused name cache can predate private file permissions. Check and
+        // secure it without truncation before loading it or sharing its state.
+        crate::storage::open_private_file(&opts.dir.join("index.bin")).map_err(|e| e.to_string())?;
+        // Empty content scopes may never trigger a new manifest write.
+        crate::storage::open_private_file(&opts.dir.join("content/manifest")).map_err(|e| e.to_string())?;
         // One writer per index: a second one would race index writes. The
         // lock dies with the process.
-        let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
+        let lock = crate::storage::open_private_file(&opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
         let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
             Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
-                log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
+                log("no Full Disk Access: skipping consent-gated folders");
                 gated(&opts.home)
             }
         };
@@ -225,6 +231,7 @@ impl Engine {
 
     /// Name search.
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
+        q.validate_limits()?;
         let g = self.s.live.read().unwrap();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
@@ -253,6 +260,7 @@ impl Engine {
     /// The bool says whether the content index answered (false: files were
     /// picked from the name index and read, for folders it doesn't cover).
     pub fn grep(&self, q: &Query, g: &Grep) -> Result<(GrepResult, bool), String> {
+        q.validate_limits()?;
         let home = self.s.home.as_bytes();
         let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
         if indexed {
@@ -443,10 +451,14 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         let n = todo.len();
         shared.content_pending.store(n, Ordering::Relaxed);
         for batch in todo.batches() {
-            let (dir, id) = {
-                let mut c = shared.content.write().unwrap();
-                (c.dir.clone(), c.alloc_id())
+            let mut content = shared.content.write().unwrap();
+            let Some(id) = content.alloc_id() else {
+                shared.content_pending.store(0, Ordering::Relaxed);
+                log("content segment IDs exhausted; content worker stopped");
+                return;
             };
+            let dir = content.dir.clone();
+            drop(content);
             let len = batch.len();
             if let Some(seg) = pool.install(|| content::build_segment(&dir, id, &todo, batch)) {
                 shared.content.write().unwrap().push(seg);
@@ -458,10 +470,14 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
         loop {
             let plan = shared.content.read().unwrap().merge_plan();
             let Some(ids) = plan else { break };
-            let (dir, id) = {
-                let mut c = shared.content.write().unwrap();
-                (c.dir.clone(), c.alloc_id())
+            let mut content = shared.content.write().unwrap();
+            let Some(id) = content.alloc_id() else {
+                shared.content_pending.store(0, Ordering::Relaxed);
+                log("content segment IDs exhausted; content worker stopped");
+                return;
             };
+            let dir = content.dir.clone();
+            drop(content);
             let merged = {
                 let c = shared.content.read().unwrap();
                 pool.install(|| content::merge(&dir, id, &c.segments(&ids)))
