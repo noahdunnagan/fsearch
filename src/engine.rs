@@ -197,7 +197,7 @@ impl Engine {
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
         let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
-            Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
+          Some(v) => v.into_iter().map(|p| p.as_os_str().as_encoded_bytes().to_vec()).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
                 log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
@@ -289,7 +289,7 @@ impl Engine {
                         (live.base.kind()[i], live.base.size_of(i), live.base.mtime()[i])
                     }
                 };
-                Found { path: PathBuf::from(std::ffi::OsStr::from_bytes(&p)), kind, size, mtime, score: h.score }
+                Found { path: PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&p) }), kind, size, mtime, score: h.score }
             })
             .collect())
     }
@@ -609,7 +609,7 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
-    let ours = shared.dir.as_os_str().as_bytes();
+    let ours = shared.dir.as_os_str().as_encoded_bytes();
     loop {
         let mut events = match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(b) => b,
