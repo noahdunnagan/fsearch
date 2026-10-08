@@ -963,7 +963,17 @@ fn read_pool() -> &'static rayon::ThreadPool {
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
                 // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                // Around line 966, wrap the unsafe block:
+                #[cfg(target_vendor = "apple")]
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0)
+                };
+
+                #[cfg(windows)]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                }
                 crate::no_materialize()
             })
             .build()
