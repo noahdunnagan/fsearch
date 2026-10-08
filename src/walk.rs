@@ -53,9 +53,9 @@ pub struct Listing {
     pub ents: Vec<RawEnt>,
 }
 
-struct Ctx {
-    next_id: AtomicU32,
-    out: Vec<Mutex<Vec<Listing>>>,
+pub struct Ctx {
+    pub next_id: AtomicU32,
+    pub out: Vec<Mutex<Vec<Listing>>>,
 }
 
 thread_local! {
@@ -76,35 +76,20 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn scan(_root: &[u8], _threads: usize) -> Vec<Listing> {
-    Vec::new()
-}
-
-fn raise_fd_limit() {
-    #[cfg(unix)]
-    {
-        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-        r.rlim_cur = r.rlim_max.min(65536);
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
-    }
-}
-
-/// List a single directory (no recursion). Subdirectories come back with
-/// `child == NONE`. Used by the live updater.
-#[cfg(target_os = "macos")]
-pub fn list_one(path: &[u8]) -> Option<Listing> {
-    if blocked(path) {
-        return None;
-    }
-    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
-    list_into(path, &mut l).then_some(l)
+pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
+    win::scan(root, threads)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn list_one(_path: &[u8]) -> Option<Listing> {
-    None
+pub fn list_one(path: &[u8]) -> Option<Listing> {
+    win::list_one(path)
 }
+
+#[cfg(not(target_os = "macos"))]
+#[path = "walk_win.rs"]
+mod walk_win;
+#[cfg(not(target_os = "macos"))]
+use walk_win::win;
 
 #[cfg(unix)]
 const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
