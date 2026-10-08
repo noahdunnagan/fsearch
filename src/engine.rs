@@ -9,7 +9,13 @@ use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
 use crate::walk;
 use std::collections::HashMap;
+
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
