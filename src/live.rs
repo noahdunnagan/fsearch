@@ -450,16 +450,51 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
-    let c = std::ffi::CString::new(path).ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
-        return None;
+    #[cfg(unix)]
+    {
+        let c = std::ffi::CString::new(path).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let kind = match st.st_mode & (libc::S_IFMT as _) {
+            v if v == libc::S_IFREG as _ => walk::KIND_FILE,
+            v if v == libc::S_IFDIR as _ => KIND_DIR,
+            v if v == libc::S_IFLNK as _ => walk::KIND_LINK,
+            _ => walk::KIND_OTHER,
+        };
+
+        #[cfg(target_os = "macos")]
+        let mtime = st.st_mtime;
+        #[cfg(not(target_os = "macos"))]
+        let mtime = st.st_mtime;
+
+        Some(OEnt::new(path, kind, st.st_size as u64, mtime.clamp(0, u32::MAX as i64) as u32))
     }
-    let kind = match st.st_mode & libc::S_IFMT {
-        libc::S_IFREG => walk::KIND_FILE,
-        libc::S_IFDIR => KIND_DIR,
-        libc::S_IFLNK => walk::KIND_LINK,
-        _ => walk::KIND_OTHER,
-    };
-    Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(path) };
+        let path_obj = std::path::Path::new(os_str);
+        let metadata = std::fs::symlink_metadata(path_obj).ok()?;
+        let file_type = metadata.file_type();
+
+        let kind = if file_type.is_file() {
+            walk::KIND_FILE
+        } else if file_type.is_dir() {
+            KIND_DIR
+        } else if file_type.is_symlink() {
+            walk::KIND_LINK
+        } else {
+            walk::KIND_OTHER
+        };
+
+        let mtime = metadata.modified().ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+
+        Some(OEnt::new(path, kind, metadata.len(), mtime))
+    }
 }
