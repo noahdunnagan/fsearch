@@ -154,15 +154,28 @@ pub fn no_materialize() {
 fn search_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("fsearch-search-{i}"))
-            .start_handler(|_| unsafe {
+        let mut builder = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("fsearch-search-{i}"));
+
+        #[cfg(target_vendor = "apple")]
+        {
+            builder = builder.start_handler(|_| unsafe {
                 libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            })
-            .build()
-            .unwrap()
+            });
+        }
+
+        #[cfg(windows)]
+        {
+            builder = builder.start_handler(|_| unsafe {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            });
+        }
+
+        builder.build().unwrap()
     })
 }
+
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
