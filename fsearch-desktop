@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Native FSearch results in fzf; no file contents are rendered or executed."""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+
+SORTS = {
+    "relevance": ("Relevance", "alt-r"),
+    "name": ("Name", "alt-n"),
+    "type": ("Type", "alt-t"),
+    "modified-desc": ("Newest", "alt-d"),
+    "modified-asc": ("Oldest", "alt-a"),
+    "size-desc": ("Largest", "alt-s"),
+}
+LIMIT = 200
+RESET = "\033[0m"
+MUTED = "\033[38;5;245m"
+
+
+def safe_text(text):
+    escapes = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
+    return "".join(
+        escapes.get(c, f"\\u{ord(c):04x}")
+        if unicodedata.category(c) in ("Cc", "Cf", "Cs") or c in "\u2028\u2029"
+        else c
+        for c in str(text)
+    )
+
+
+def cells(text):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def fit(text, width):
+    width = max(1, width)
+    size = cells(text)
+    if size > width:
+        end = used = 0
+        for index, char in enumerate(text):
+            count = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1
+            if used + count > width - 1:
+                break
+            used += count
+            end = index + 1
+        text = text[:end] + "…"
+        size = used + 1
+    return text + " " * (width - size)
+
+
+def human_size(size):
+    size = max(0, int(size))
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"):
+        if value < 1024 or unit == "EiB":
+            return f"{size} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def modified(mtime):
+    try:
+        return datetime.datetime.fromtimestamp(int(mtime)).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        return "Unknown"
+
+
+def file_icon(hit):
+    # nnn-style single-cell Nerd Font glyphs, with two spaces of right padding.
+    if hit["kind"] == "dir":
+        return "", 75
+    if hit["kind"] == "link":
+        return "", 80
+    ext = os.path.splitext(hit["path"])[1].lower().lstrip(".")
+    for extensions, icon, color in (
+        ("zip gz bz2 xz zst tar tgz 7z rar deb rpm iso", "󰀼", 179),
+        ("png jpg jpeg gif webp svg bmp ico tiff avif heic", "󰈟", 141),
+        ("mp4 mkv webm mov avi m4v mpg mpeg", "󰈫", 141),
+        ("mp3 flac wav ogg opus m4a aac", "󰎈", 141),
+        ("pdf", "󰈦", 174),
+        ("doc docx odt rtf txt tex epub", "󰈙", 110),
+        ("rs", "", 173),
+        ("py pyw", "", 179),
+        ("c h", "", 75),
+        ("cpp cc cxx hpp hxx", "", 75),
+        ("js jsx mjs cjs ts tsx", "󰌞", 179),
+        ("json jsonl yaml yml toml xml ini conf", "", 110),
+        ("md markdown", "", 110),
+        ("sh bash zsh fish", "", 114),
+    ):
+        if ext in extensions.split():
+            return icon, color
+    if os.path.basename(hit["path"]) in ("Makefile", "Dockerfile", "CMakeLists.txt"):
+        return "", 114
+    return "󰈔", 252
+
+
+def encode_hit(hit):
+    return base64.urlsafe_b64encode(json.dumps(hit, ensure_ascii=True).encode("ascii")).decode("ascii")
+
+
+def decode_hit(token):
+    hit = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
+    path = hit["path"]
+    if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+        raise ValueError("result path must be absolute and contain no NUL")
+    return hit
+
+
+def open_target(token, parent=False):
+    path = decode_hit(token)["path"]
+    return os.path.dirname(path.rstrip("/")) or "/" if parent else path
+
+
+def columns(width):
+    # Reserve the list border, selection pointer and gutter, not terminal columns.
+    width = max(24, width - 8)
+    if width < 70:
+        return width, None
+    name = min(44, max(22, (width - 35) // 2))
+    return width, (name, 19, 9, max(1, width - name - 37))
+
+
+def render_display(hit, width):
+    available, widths = columns(width)
+    path = hit["path"]
+    name = safe_text(os.path.basename(path.rstrip("/")) or "/")
+    parent = safe_text(os.path.dirname(path.rstrip("/")) or "/")
+    date = modified(hit["mtime"])
+    size = "—" if hit["kind"] == "dir" else human_size(hit["size"])
+    icon, color = file_icon(hit)
+    glyph = f"\033[38;5;{color}m{icon}{RESET}  "
+    if widths is None:
+        detail = f"{date}  {size:>9}  "
+        return (glyph + fit(name, available - 3) + "\n" + MUTED
+                + fit(detail + parent, available) + RESET)
+    name_width, date_width, size_width, path_width = widths
+    return (glyph + fit(name, name_width - 3) + "  " + MUTED
+            + fit(date, date_width) + "  " + fit(size, size_width).rstrip().rjust(size_width) + "  "
+            + fit(parent, path_width) + RESET)
+
+
+def column_header(width):
+    available, widths = columns(width)
+    if widths is None:
+        return MUTED + "  NAME\n" + fit("MODIFIED (local)       SIZE       FOLDER", available) + RESET
+    name, date, size, parent = widths
+    return MUTED + "  ".join((fit("  NAME", name), fit("MODIFIED (local)", date), fit("SIZE", size), fit("FOLDER", parent))) + RESET
+
+
+def result_records(response, sort, width):
+    label = SORTS[sort][0]
+    if not response.get("ok"):
+        status = "Error: " + safe_text(response.get("error", "daemon returned an error"))
+        hits = []
+    elif "hits" not in response:
+        status = "Content search is available in the CLI; this picker shows filename results."
+        hits = []
+    else:
+        hits = response["hits"]
+        count = f"Top {LIMIT} matches" if len(hits) == LIMIT else f"{len(hits)} matches"
+        status = f"{count} · {label}" if hits else f"No matches · {label}"
+    yield "-\t" + status
+    yield "-\t" + column_header(width)
+    for hit in hits:
+        yield encode_hit(hit) + "\t" + render_display(hit, width)
+
+
+def selected_sort(explicit):
+    if explicit:
+        return explicit
+    prompt = os.environ.get("FZF_PROMPT", "")
+    return next((sort for sort, (label, _) in SORTS.items() if prompt == f"{label} > "), "relevance")
+
+
+def fetch_results(query, sort):
+    # stdio keeps the original query separate from native sort/limit overrides.
+    request = json.dumps({"q": query, "sort": sort, "limit": LIMIT}) + "\n"
+    try:
+        result = subprocess.run(
+            [os.path.expanduser("~/.local/bin/fsearch"), "stdio"],
+            input=request, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode:
+            return {"ok": False, "error": result.stderr.strip() or f"fsearch exited with {result.returncode}"}
+        response = json.loads(result.stdout)
+        if not isinstance(response, dict):
+            raise ValueError("daemon response is not an object")
+        return response
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "error": str(error)}
+
+
+def preview(token):
+    if not token or token == "-":
+        return
+    try:
+        hit = decode_hit(token)
+        path = hit["path"]
+        icon, _ = file_icon(hit)
+        print(f"{icon}  {safe_text(os.path.basename(path.rstrip('/')) or '/')}  [{safe_text(hit['kind'])}]")
+        print(f"Modified: {modified(hit['mtime'])} (local)   Size: {human_size(hit['size'])}")
+        print("Path: " + safe_text(path))
+        os.lstat(path)
+        if os.path.islink(path):
+            print("Link target: " + safe_text(os.readlink(path)))
+        else:
+            print("Enter: open   Ctrl-O: open parent folder   Ctrl-P: hide details")
+    except (OSError, ValueError, KeyError) as error:
+        print("Unavailable: " + safe_text(error))
+
+
+def open_result(token, parent=False):
+    if not token or token == "-":
+        print("No result selected")
+        return
+    try:
+        path = open_target(token, parent)
+        os.lstat(path)
+        result = subprocess.run(["xdg-open", path], capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise OSError(result.stderr.strip() or f"xdg-open exited with {result.returncode}")
+        print("Opened folder: " + safe_text(path) if parent else "Opened: " + safe_text(path))
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        print("Open failed: " + safe_text(error))
+
+
+def picker(query, sort):
+    helper = shlex.join([sys.executable, os.path.abspath(__file__)])
+    reload_action = f"change-border-label( FSearch · Searching… )+reload({helper} --results)"
+    bindings = [
+        "start,change,resize,ctrl-r:" + reload_action,
+        "load:change-border-label( FSearch )",
+        f"enter:transform-footer({helper} --open {{1}})",
+        f"ctrl-o:transform-footer({helper} --folder {{1}})",
+        "ctrl-p:toggle-preview",
+        "esc:abort",
+    ]
+    for mode, (label, key) in SORTS.items():
+        bindings.append(f"{key}:change-prompt({label} > )+" + reload_action)
+    environment = os.environ.copy()
+    # The picker owns layout and bindings; do not inherit unrelated fzf shell options.
+    environment.pop("FZF_DEFAULT_OPTS", None)
+    environment.pop("FZF_DEFAULT_OPTS_FILE", None)
+    environment["FZF_DEFAULT_COMMAND"] = ""
+    command = [
+        "fzf", "--disabled", "--no-sort", "--read0", "--ansi", "--delimiter=\t",
+        "--with-nth=2..", "--header-lines=2", "--layout=reverse", "--border=rounded",
+        "--border-label= FSearch ", "--highlight-line",
+        "--no-hscroll", "--info=hidden", "--pointer=›", "--scroll-off=2",
+        "--color=dark,fg:252,bg:-1,hl:110,fg+:255,bg+:236,hl+:117,header:245,prompt:117,pointer:117,border:239,label:110",
+        f"--prompt={SORTS[sort][0]} > ", f"--query={query}",
+        "--ghost=Search names · ext:pdf · kind:dir · in:~/Documents",
+        "--header=Sort: Alt-R relevance · Alt-N name · Alt-T type\n      Alt-D newest · Alt-A oldest · Alt-S largest\nEnter open · Ctrl-O folder · Ctrl-P details · Ctrl-R refresh · Esc close",
+        "--footer=Dates use local time. Type filters directly in the search box.",
+        f"--preview={helper} --preview {{1}}", "--preview-window=down,5,wrap,border-top",
+        "--preview-label= Selected result ", "--with-shell=/bin/sh -c",
+    ]
+    for binding in bindings:
+        command.extend(("--bind", binding))
+    print("\033]0;FSearch\007", end="", flush=True)
+    try:
+        # Never let fzf's default walker run when the first reload is pending.
+        result = subprocess.run(command, input=b"", stdout=subprocess.DEVNULL, env=environment)
+        return 0 if result.returncode in (0, 1, 130) else result.returncode
+    except OSError as error:
+        print("FSearch: " + str(error), file=sys.stderr)
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--results", action="store_true", help="emit NUL-delimited rendered results; first two records are headers")
+    modes.add_argument("--preview", metavar="PAYLOAD", help=argparse.SUPPRESS)
+    modes.add_argument("--open", metavar="PAYLOAD", help=argparse.SUPPRESS)
+    modes.add_argument("--folder", metavar="PAYLOAD", help=argparse.SUPPRESS)
+    parser.add_argument("--sort", choices=SORTS, help="initial/native results sort")
+    parser.add_argument("--width", type=int, help="render width in terminal columns (for --results)")
+    parser.add_argument("--query", help="initial query, or query for --results")
+    parser.add_argument("words", nargs="*", help="initial search query")
+    args = parser.parse_args()
+    if args.preview is not None:
+        preview(args.preview)
+    elif args.open is not None or args.folder is not None:
+        open_result(args.folder if args.folder is not None else args.open, args.folder is not None)
+    else:
+        sort = selected_sort(args.sort)
+        query = args.query if args.query is not None else " ".join(args.words) if args.words else os.environ.get("FZF_QUERY", "") if args.results else ""
+        if args.results:
+            width = args.width
+            if width is None:
+                # fzf's start-reload reports FZF_COLUMNS=0 before its first layout.
+                try:
+                    with open("/dev/tty") as tty:
+                        width = os.get_terminal_size(tty.fileno()).columns
+                except OSError:
+                    width = shutil.get_terminal_size().columns
+            response = fetch_results(query, sort)
+            for record in result_records(response, sort, width):
+                sys.stdout.buffer.write(record.encode("utf-8") + b"\0")
+        else:
+            return picker(query, sort)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

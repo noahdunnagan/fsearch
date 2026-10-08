@@ -8,7 +8,7 @@
 use rayon::Scope;
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const NONE: u32 = u32::MAX;
@@ -71,7 +71,7 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     // Paths are only tracked when there is something to skip.
     let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
-    ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
+    ctx.out.into_iter().flat_map(|m| m.into_inner()).collect()
 }
 
 fn raise_fd_limit() {
@@ -138,7 +138,7 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
 
 fn push(l: Listing, ctx: &Ctx) {
     let slot = rayon::current_thread_index().unwrap_or(ctx.out.len() - 1);
-    ctx.out[slot].lock().unwrap().push(l);
+    ctx.out[slot].lock().push(l);
 }
 
 fn rd32(b: &[u8], at: usize) -> u32 {

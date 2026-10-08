@@ -29,7 +29,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG03";
+const MAGIC: &[u8; 8] = b"FSCSEG04";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -96,11 +96,12 @@ enum S {
     Mtime,
     ByPath,
     Rank,
+    ChangeNs,
 }
-const NS: usize = 9;
+const NS: usize = 10;
 
 fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs]
+    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, ndocs * 8]
 }
 
 impl Segment {
@@ -113,6 +114,7 @@ impl Segment {
     sec!(mtime, S::Mtime, u32, ndocs);
     sec!(by_path, S::ByPath, u32, ndocs);
     sec!(rank, S::Rank, i8, ndocs);
+    sec!(change_ns, S::ChangeNs, u64, ndocs);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -329,16 +331,24 @@ fn symbols(buf: &[u8], out: &mut Vec<u32>) {
 #[derive(Default)]
 pub struct Docs {
     buf: Vec<u8>,
-    items: Vec<(u32, u32, u64, u32)>,
+    items: Vec<(u32, u32, u64, u32, u64)>,
 }
 
 impl Docs {
-    fn push(&mut self, path: &[u8], size: u64, mtime: u32) {
-        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime));
+    fn push(&mut self, path: &[u8], size: u64, mtime: u32, change_ns: u64) {
+        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime, change_ns));
         self.buf.extend_from_slice(path);
     }
+    fn push_current(&mut self, path: &[u8]) {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        let Ok(meta) = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path)) else { return };
+        if !meta.is_file() || meta.len() > MAX_FILE { return; }
+        // ctime catches equal-size writes even if mtime is restored.
+        let change_ns = (meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128).clamp(0, u64::MAX as i128) as u64;
+        self.push(path, meta.len(), meta.mtime().clamp(0, u32::MAX as i64) as u32, change_ns);
+    }
     fn path(&self, i: usize) -> &[u8] {
-        let (o, l, _, _) = self.items[i];
+        let (o, l, _, _, _) = self.items[i];
         &self.buf[o as usize..(o + l) as usize]
     }
     pub fn len(&self) -> usize {
@@ -350,7 +360,7 @@ impl Docs {
         self.items.dedup_by(|a, b| buf[a.0 as usize..(a.0 + a.1) as usize] == buf[b.0 as usize..(b.0 + b.1) as usize]);
     }
     fn find(&self, path: &[u8]) -> Option<usize> {
-        let i = self.items.partition_point(|&(o, l, _, _)| &self.buf[o as usize..(o + l) as usize] < path);
+        let i = self.items.partition_point(|&(o, l, _, _, _)| &self.buf[o as usize..(o + l) as usize] < path);
         (i < self.items.len() && self.path(i) == path).then_some(i)
     }
 
@@ -379,6 +389,7 @@ struct DocMeta<'a> {
     path: &'a [u8],
     size: u64,
     mtime: u32,
+    change_ns: u64,
     rank: i8,
 }
 
@@ -429,8 +440,8 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         .iter()
         .map(|&(si, k)| {
             let (i, _, _, text, _, _) = splits[si].docs[k];
-            let (_, _, size, mtime) = docs.items[i];
-            DocMeta { path: docs.path(i), size, mtime, rank: if text { doc_rank(docs.path(i)) } else { NOT_TEXT } }
+            let (_, _, size, mtime, change_ns) = docs.items[i];
+            DocMeta { path: docs.path(i), size, mtime, change_ns, rank: if text { doc_rank(docs.path(i)) } else { NOT_TEXT } }
         })
         .collect();
     let tris = |d: usize| {
@@ -517,7 +528,7 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
         for d in 0..s.ndocs as u32 {
             if !s.is_dead(d) {
                 r[d as usize] = meta.len() as u32;
-                meta.push(DocMeta { path: s.path(d), size: s.size()[d as usize], mtime: s.mtime()[d as usize], rank: s.rank()[d as usize] });
+                meta.push(DocMeta { path: s.path(d), size: s.size()[d as usize], mtime: s.mtime()[d as usize], change_ns: s.change_ns()[d as usize], rank: s.rank()[d as usize] });
             }
         }
         remap.push(r);
@@ -582,6 +593,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let size: Vec<u64> = docs.iter().map(|d| d.size).collect();
     let mtime: Vec<u32> = docs.iter().map(|d| d.mtime).collect();
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
+    let change_ns: Vec<u64> = docs.iter().map(|d| d.change_ns).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(&docs[b as usize].path));
 
@@ -597,6 +609,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         as_bytes(&mtime),
         as_bytes(&by_path),
         as_bytes(&rank),
+        as_bytes(&change_ns),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -724,15 +737,15 @@ impl Content {
                 let ids = if recursive { s.with_prefix(&lo).collect::<Vec<_>>() } else { s.direct_children(&lo) };
                 for d in ids {
                     match want.find(s.path(d)) {
-                        Some(i) if want.items[i].2 == s.size()[d as usize] && want.items[i].3 == s.mtime()[d as usize] => held[i] = true,
+                        Some(i) if want.items[i].2 == s.size()[d as usize] && want.items[i].4 == s.change_ns()[d as usize] => held[i] = true,
                         _ => touched[si] |= s.kill(d),
                     }
                 }
             }
             for (i, h) in held.iter().enumerate() {
                 if !h {
-                    let (_, _, size, mtime) = want.items[i];
-                    todo.push(want.path(i), size, mtime);
+                    let (_, _, size, mtime, change_ns) = want.items[i];
+                    todo.push(want.path(i), size, mtime, change_ns);
                 }
             }
         }
@@ -866,14 +879,14 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
                 p = join(dir, idx.name(i));
             }
             if in_scope(&p, home) {
-                want.push(&p, idx.size_of(i), idx.mtime()[i]);
+                want.push_current(&p);
             }
         }
     }
     let lo = join(dir, b"");
     for (k, o) in live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)) {
         if o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && eligible(k, o.size, home) {
-            want.push(k, o.size, o.mtime);
+            want.push_current(k);
         }
     }
     want
@@ -963,7 +976,9 @@ fn read_pool() -> &'static rayon::ThreadPool {
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
                 // cores and out of the throttled IO tiers.
+                #[cfg(target_os = "macos")]
                 unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                #[cfg(target_os = "macos")]
                 crate::no_materialize()
             })
             .build()
@@ -1238,6 +1253,21 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::ffi::CString::new(path).ok()?;
+        // access() uses the real uid, excluding the watcher's DAC capability.
+        if unsafe { libc::access(path.as_ptr(), libc::R_OK) } != 0 {
+            return None;
+        }
+    }
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::syscall(libc::SYS_faccessat2, f.as_raw_fd(), c"".as_ptr(), libc::R_OK, libc::AT_EMPTY_PATH) } != 0 {
+            return None;
+        }
+    }
     f.metadata().ok()?.is_file().then_some(f)
 }

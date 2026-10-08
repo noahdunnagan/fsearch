@@ -83,7 +83,7 @@ impl Drop for Stream {
 
 /// Watch `/` from `since` (an event id). Batches of directory-level events
 /// arrive on `tx` until the returned stream is dropped.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> std::io::Result<Stream> {
     unsafe {
         let root = CFStringCreateWithCString(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
         let arr = CFArrayCreate(std::ptr::null(), &root, 1, &kCFTypeArrayCallBacks as *const c_void);
@@ -99,9 +99,22 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
         let s = FSEventStreamCreate(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
+        if s.is_null() {
+            return Err(std::io::Error::other("could not create FSEvents stream"));
+        }
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
         FSEventStreamSetDispatchQueue(s, q);
-        FSEventStreamStart(s);
-        Stream(s)
+        if FSEventStreamStart(s) == 0 {
+            if !s.is_null() {
+                FSEventStreamInvalidate(s);
+                FSEventStreamRelease(s);
+            }
+            return Err(std::io::Error::other("could not start FSEvents stream"));
+        }
+        Ok(Stream(s))
     }
+}
+
+pub fn current_id() -> u64 {
+    unsafe { FSEventsGetCurrentEventId() }
 }

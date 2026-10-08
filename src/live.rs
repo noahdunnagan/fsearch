@@ -401,7 +401,10 @@ impl Live {
 
 /// Threads for bulk lstat: path lookups scale further than opens do.
 pub fn stat_pool() -> rayon::ThreadPool {
-    rayon::ThreadPoolBuilder::new().num_threads(12).start_handler(|_| crate::no_materialize()).build().unwrap()
+    rayon::ThreadPoolBuilder::new().num_threads(12).start_handler(|_| {
+        #[cfg(target_os = "macos")]
+        crate::no_materialize();
+    }).build().unwrap()
 }
 
 /// Visit every entry of a scan with its full path.

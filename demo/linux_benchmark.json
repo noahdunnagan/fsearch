@@ -1,0 +1,188 @@
+{
+  "workloads": {
+    "global_fuzzy": {
+      "p50_ms": 0.924,
+      "p95_ms": 1.164,
+      "samples": 25,
+      "returned": 50
+    },
+    "global_common_name": {
+      "p50_ms": 0.387,
+      "p95_ms": 0.574,
+      "samples": 25,
+      "returned": 50
+    },
+    "scoped_name": {
+      "p50_ms": 0.086,
+      "p95_ms": 0.107,
+      "samples": 25,
+      "returned": 1
+    },
+    "scoped_typo": {
+      "p50_ms": 0.084,
+      "p95_ms": 0.115,
+      "samples": 25,
+      "returned": 1
+    },
+    "global_newest": {
+      "p50_ms": 7.918,
+      "p95_ms": 8.332,
+      "samples": 25,
+      "returned": 200
+    },
+    "global_oldest": {
+      "p50_ms": 7.657,
+      "p95_ms": 8.039,
+      "samples": 25,
+      "returned": 200
+    },
+    "global_name_sort": {
+      "p50_ms": 17.228,
+      "p95_ms": 26.604,
+      "samples": 25,
+      "returned": 200
+    },
+    "global_type_sort": {
+      "p50_ms": 17.115,
+      "p95_ms": 18.43,
+      "samples": 25,
+      "returned": 200
+    },
+    "global_size_sort": {
+      "p50_ms": 8.116,
+      "p95_ms": 9.166,
+      "samples": 25,
+      "returned": 200
+    },
+    "scoped_content": {
+      "p50_ms": 0.596,
+      "p95_ms": 0.823,
+      "samples": 25,
+      "returned": 1,
+      "complete": true,
+      "source": "index",
+      "read": 2,
+      "candidates": 2
+    },
+    "global_content": {
+      "p50_ms": 23.928,
+      "p95_ms": 26.272,
+      "samples": 25,
+      "returned": 5,
+      "complete": true,
+      "source": "index",
+      "read": 1981,
+      "candidates": 1981
+    },
+    "scoped_regex": {
+      "p50_ms": 1.392,
+      "p95_ms": 1.742,
+      "samples": 25,
+      "returned": 4,
+      "complete": true,
+      "source": "index",
+      "read": 11,
+      "candidates": 11
+    },
+    "scoped_symbol": {
+      "p50_ms": 0.376,
+      "p95_ms": 0.432,
+      "samples": 25,
+      "returned": 1,
+      "complete": true,
+      "source": "index",
+      "read": 1,
+      "candidates": 1
+    },
+    "typing_sequence": {
+      "p50_ms": 2.455,
+      "p95_ms": 4.005,
+      "samples": 250
+    },
+    "live_create": {
+      "p50_ms": 103.789,
+      "p95_ms": 104.118,
+      "samples": 25
+    },
+    "live_rename": {
+      "p50_ms": 103.847,
+      "p95_ms": 104.305,
+      "samples": 25
+    },
+    "live_delete": {
+      "p50_ms": 103.818,
+      "p95_ms": 104.605,
+      "samples": 25
+    },
+    "picker_reload": {
+      "p50_ms": 36.369,
+      "p95_ms": 38.66,
+      "samples": 25
+    },
+    "picker_reload_200": {
+      "p50_ms": 43.994,
+      "p95_ms": 45.866,
+      "samples": 25
+    },
+    "warm_service_first_answer": {
+      "p50_ms": 36.746,
+      "p95_ms": 42.306,
+      "samples": 5
+    },
+    "warm_service_reconciled": {
+      "p50_ms": 2472.342,
+      "p95_ms": 2486.972,
+      "samples": 5
+    }
+  },
+  "status_before": {
+    "content_bytes": 890856512,
+    "content_docs": 970169,
+    "content_pending": 0,
+    "content_segments": 52,
+    "dirs": 681766,
+    "entries": 5151087,
+    "event_id": 1791491703773386891,
+    "id": null,
+    "index_bytes": 192088576,
+    "ok": true,
+    "overlay": 311,
+    "owner": true,
+    "removed": 231
+  },
+  "status_after": {
+    "content_bytes": 890621184,
+    "content_docs": 970169,
+    "content_pending": 0,
+    "content_segments": 49,
+    "dirs": 681766,
+    "entries": 5151087,
+    "event_id": 1791491714618504302,
+    "id": null,
+    "index_bytes": 192088576,
+    "ok": true,
+    "overlay": 319,
+    "owner": true,
+    "removed": 243
+  },
+  "memory_after_warm": {
+    "VmHWM_KiB": 1764808,
+    "VmRSS_KiB": 883284,
+    "RssAnon_KiB": 272172,
+    "RssFile_KiB": 611112,
+    "VmSwap_KiB": 0
+  },
+  "method": "warm, serial daemon round-trip; picker includes Python/CLI startup and rendering; live updates poll every 5ms; restart includes systemctl overhead and warm OS cache",
+  "renderer_comparison": {
+    "quadratic": {
+      "p50_ms": 17.819,
+      "p95_ms": 20.275,
+      "samples": 50
+    },
+    "linear": {
+      "p50_ms": 6.071,
+      "p95_ms": 7.372,
+      "samples": 50
+    }
+  }
+}

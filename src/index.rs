@@ -529,9 +529,9 @@ const BUNDLE_EXTS: &[&[u8]] = &[
 fn prior_adjust(name: &[u8], depth: u8) -> i32 {
     if depth == 1 {
         return match name {
-            b"Users" => 0,
+            b"Users" | b"home" => 0,
             b"Applications" => 10,
-            b"Volumes" => -10,
+            b"Volumes" | b"mnt" | b"media" => -10,
             b"Library" => -25,
             b"System" => -40,
             b"opt" => -25,

@@ -5,6 +5,7 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, GrepMode, Options, Query};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,29 +14,44 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
-pub fn serve(dir: PathBuf, home: String) {
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    let metadata = file.metadata()?;
+    if metadata.uid() != unsafe { libc::getuid() } {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "data directory belongs to another user"));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+pub fn serve(dir: PathBuf, home: String) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::getuid() } == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "run as an ordinary user with CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH, not root"));
+    }
+    unsafe { libc::umask(0o077) };
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
-    std::fs::create_dir_all(&dir).ok();
-    let Ok(lock) = std::fs::File::create(dir.join("socket.lock")) else { return };
+    private_dir(&dir)?;
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(dir.join("socket.lock"))?;
     if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
-        return;
+        return Ok(());
     }
-    let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("{} {e}", fsearch::query::now_secs());
-            return;
-        }
-    };
+    let engine = Engine::start(Options { dir: dir.clone(), home, skip: None }).map_err(std::io::Error::other)?;
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).expect("bind socket");
-    for conn in listener.incoming().flatten() {
+    let listener = UnixListener::bind(&sock)?;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700))?;
+    for conn in listener.incoming() {
+        let conn = conn?;
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
     }
+    Ok(())
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
@@ -82,7 +98,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
         "status" => {
             let s = engine.status();
             if !s.ready {
-                return Err("indexing (first run scans the whole disk, ~20s)".into());
+                return Err("indexing (building the whole-disk name index)".into());
             }
             let mut v = serde_json::to_value(s).map_err(|e| e.to_string())?;
             v["ok"] = true.into();
@@ -186,26 +202,43 @@ fn kind_name(k: u8) -> &'static str {
 
 /// Connect to the daemon, starting it if it isn't running.
 pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
+    private_dir(dir)?;
     let sock = socket_path(dir);
     if let Ok(s) = UnixStream::connect(&sock) {
         return Ok(s);
     }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"))?;
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    // Own session: closing the terminal that started it doesn't kill it.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    #[cfg(target_os = "linux")]
+    {
+        let unit = service_name();
+        let status = std::process::Command::new("sudo").args(["-n", "systemctl", "start", &unit]).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!("could not start {unit}; install with `sudo -v && fsearch install --login`, or start it with `sudo systemctl start {unit}`")));
+        }
     }
-    cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    #[cfg(target_os = "macos")]
+    {
+        let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(dir.join("daemon.log"))?;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        // Own session: closing the terminal that started it doesn't kill it.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    }
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(30));
         if let Ok(s) = UnixStream::connect(&sock) {
             return Ok(s);
         }
     }
-    UnixStream::connect(&sock)
+    UnixStream::connect(&sock).map_err(|e| std::io::Error::new(e.kind(), format!("daemon socket {} is unavailable: {e}; check the service log", sock.display())))
+}
+
+#[cfg(target_os = "linux")]
+pub fn service_name() -> String {
+    format!("fsearch-{}.service", unsafe { libc::getuid() })
 }
