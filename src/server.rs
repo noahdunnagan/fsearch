@@ -46,8 +46,12 @@ pub fn serve(dir: PathBuf, home: String) {
 }
 
 #[cfg(windows)]
-pub fn serve(_dir: PathBuf, _home: String) {
-    eprintln!("Daemon not supported on Windows yet.");
+#[path = "server_win.rs"]
+mod server_win;
+
+#[cfg(windows)]
+pub fn serve(dir: PathBuf, home: String) {
+    server_win::serve(dir, home, handle);
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
@@ -224,6 +228,6 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 }
 
 #[cfg(windows)]
-pub fn connect(_dir: &Path) -> std::io::Result<UnixStream> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Daemon not supported on Windows yet"))
+pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
+    server_win::connect(dir)
 }

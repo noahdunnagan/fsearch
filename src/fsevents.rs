@@ -46,8 +46,14 @@ unsafe extern "C" {
     pub fn FSEventsGetCurrentEventId() -> u64;
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn FSEventsGetCurrentEventId() -> u64 { 0 }
+#[cfg(windows)]
+#[path = "fsevents_win.rs"]
+mod fsevents_win;
+
+#[cfg(windows)]
+pub fn FSEventsGetCurrentEventId() -> u64 {
+    fsevents_win::current_event_id()
+}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -86,6 +92,10 @@ impl Drop for Stream {
             FSEventStreamInvalidate(self.0);
             FSEventStreamRelease(self.0);
         }
+        #[cfg(windows)]
+        {
+            fsevents_win::drop_stream(self.0);
+        }
     }
 }
 
@@ -113,8 +123,8 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
         FSEventStreamStart(s);
         Stream(s)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        Stream(std::ptr::null_mut())
+        fsevents_win::watch(since, latency, tx)
     }
 }
