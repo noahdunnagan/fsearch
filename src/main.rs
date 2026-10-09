@@ -102,6 +102,8 @@ fn main() {
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     writeln!(s, "{req}").unwrap();
+    // One request only: the daemon needn't keep the cores warm for a next one.
+    let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).unwrap();
     if raw {

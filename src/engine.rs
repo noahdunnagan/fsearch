@@ -11,7 +11,7 @@ use crate::walk;
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -131,6 +131,41 @@ fn search_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// The keep-warm window: spin from `WARM_FROM` to `WARM_UNTIL` (`now_ns`).
+static WARM_FROM: AtomicU64 = AtomicU64::new(0);
+static WARM_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// The warmer is parked until the next `keep_warm`.
+static WARM_IDLE: AtomicBool = AtomicBool::new(false);
+
+fn now_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+fn warmer() -> &'static std::thread::Thread {
+    static T: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let t = std::thread::Builder::new().name("fsearch-warm".into()).spawn(|| {
+            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+            loop {
+                let (from, until, now) = (WARM_FROM.load(Ordering::SeqCst), WARM_UNTIL.load(Ordering::SeqCst), now_ns());
+                if now >= until {
+                    WARM_IDLE.store(true, Ordering::SeqCst);
+                    if now_ns() >= WARM_UNTIL.load(Ordering::SeqCst) {
+                        std::thread::park();
+                    }
+                    WARM_IDLE.store(false, Ordering::SeqCst);
+                } else if now < from {
+                    std::thread::park_timeout(Duration::from_nanos(from - now));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        t.expect("spawn").thread().clone()
+    })
+}
+
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .name(name.into())
@@ -223,8 +258,25 @@ impl Engine {
         &self.s.home
     }
 
+    /// Keep the cores clocked up for `d` from now. After ~20 ms idle macOS
+    /// slows them down, and a search then runs 3-6x slower while they ramp
+    /// back up; one spinning thread keeps them up, so the next keystroke's
+    /// search starts fast. The spinning stops when a search starts (the
+    /// search keeps the cores busy itself) and when `d` runs out.
+    pub fn keep_warm(&self, d: Duration) {
+        let w = warmer();
+        let now = now_ns();
+        // They stay up for the first few ms anyway.
+        WARM_FROM.store(now + 2_000_000, Ordering::SeqCst);
+        WARM_UNTIL.store(now + d.as_nanos() as u64, Ordering::SeqCst);
+        if WARM_IDLE.load(Ordering::SeqCst) {
+            w.unpark();
+        }
+    }
+
     /// Name search.
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
+        WARM_UNTIL.store(0, Ordering::Relaxed);
         let g = self.s.live.read().unwrap();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
@@ -253,6 +305,7 @@ impl Engine {
     /// The bool says whether the content index answered (false: files were
     /// picked from the name index and read, for folders it doesn't cover).
     pub fn grep(&self, q: &Query, g: &Grep) -> Result<(GrepResult, bool), String> {
+        WARM_UNTIL.store(0, Ordering::Relaxed);
         let home = self.s.home.as_bytes();
         let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
         if indexed {

@@ -70,6 +70,10 @@ pub fn stop(dir: &Path) -> Result<(), String> {
     })
 }
 
+/// How long the cores stay clocked up after an answer to a client that is
+/// still connected (typing): most gaps between keystrokes are shorter.
+const WARM: Duration = Duration::from_millis(250);
+
 fn handle(conn: UnixStream, engine: &Engine) {
     let Ok(r) = conn.try_clone() else { return };
     let mut w = std::io::BufWriter::new(conn);
@@ -82,7 +86,19 @@ fn handle(conn: UnixStream, engine: &Engine) {
         if writeln!(w, "{resp}").and_then(|_| w.flush()).is_err() {
             return;
         }
+        if waiting(w.get_ref()) {
+            engine.keep_warm(WARM);
+        }
     }
+}
+
+/// The client is still connected with nothing more to ask yet: a session
+/// whose next request is a keystroke away. (One-shot clients like the CLI
+/// close their side as soon as the request is out.)
+fn waiting(conn: &UnixStream) -> bool {
+    let mut b = 0u8;
+    let n = unsafe { libc::recv(std::os::fd::AsRawFd::as_raw_fd(conn), (&raw mut b).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
 }
 
 fn respond(line: &str, engine: &Engine) -> Value {
