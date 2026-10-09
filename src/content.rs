@@ -1164,6 +1164,26 @@ pub struct GrepResult {
     pub complete: bool,
 }
 
+/// Threads reading candidates: the read pool's and the searching one.
+const READERS: usize = 4;
+
+/// Run `f` with this thread never downloading iCloud placeholders (as the
+/// read pool's threads), then restore its policy.
+fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
+    unsafe extern "C" {
+        fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    }
+    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
+    let prior = unsafe { getiopolicy_np(3, 1) };
+    crate::no_materialize();
+    let r = f();
+    if prior >= 0 {
+        unsafe { setiopolicy_np(3, 1, prior) };
+    }
+    r
+}
+
 /// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
 /// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
 /// 16), so candidate reads get their own small pool.
@@ -1171,7 +1191,7 @@ fn read_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(READERS - 1)
             .thread_name(|i| format!("fsearch-read-{i}"))
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
@@ -1205,11 +1225,11 @@ fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, found, read) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let hits = std::sync::Mutex::new(Vec::new());
-    read_pool().broadcast(|_| {
+    let work = || {
         while found.load(Relaxed) < limit && g.budget.is_none_or(|b| t.elapsed() <= b) {
             let i = next.fetch_add(1, Relaxed);
             if i >= n {
-                return;
+                break;
             }
             let Some(p) = path(i) else { continue };
             read.fetch_add(1, Relaxed);
@@ -1224,6 +1244,14 @@ fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path
                 *b = Vec::new();
             }
         });
+    };
+    // This thread reads too, from the start: the pool's threads take ~0.1
+    // ms to wake when they sleep.
+    read_pool().in_place_scope(|sc| {
+        for _ in 1..READERS {
+            sc.spawn(|_| work());
+        }
+        without_materializing(work);
     });
     let mut hits = hits.into_inner().unwrap();
     hits.sort_unstable_by_key(|h| h.0);
