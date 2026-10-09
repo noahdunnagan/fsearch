@@ -178,7 +178,14 @@ fn domain() -> String {
 }
 
 fn install(login: bool) {
+    // A plain reinstall keeps an existing login agent.
+    let login = login || plist_path().exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
+    // Stop the old daemon so the next one runs the new binary. Unload the
+    // login agent first, or KeepAlive would restart it straight away.
+    let target = format!("{}/{LABEL}", domain());
+    launchctl(&["bootout", &target]);
+    server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache.
@@ -208,8 +215,6 @@ fn install(login: bool) {
         log.display()
     );
     std::fs::write(plist_path(), plist).unwrap();
-    let target = format!("{}/{LABEL}", domain());
-    launchctl(&["bootout", &target]);
     // bootout returns before the old job is fully gone; bootstrap fails
     // until it is.
     let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);

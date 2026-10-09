@@ -17,11 +17,14 @@ pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
-    let Ok(lock) = std::fs::File::create(dir.join("socket.lock")) else { return };
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // Opened without truncating: a loser must not wipe the owner's pid.
+    let Ok(mut lock) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")) else { return };
+    if !try_lock(&lock) {
         eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
         return;
     }
+    // The pid lets `stop` find us.
+    let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
         Err(e) => {
@@ -36,6 +39,35 @@ pub fn serve(dir: PathBuf, home: String) {
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
     }
+}
+
+fn try_lock(f: &std::fs::File) -> bool {
+    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Stop the daemon serving `dir`, if one is running, and wait until it has
+/// let go of the socket lock. One already on its way out (say, after a
+/// launchd bootout) is just waited for.
+pub fn stop(dir: &Path) -> Result<(), String> {
+    let path = dir.join("socket.lock");
+    let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
+    let mut killed = None;
+    for _ in 0..50 {
+        if try_lock(&lock) {
+            return Ok(());
+        }
+        if killed.is_none() {
+            killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+            if let Some(pid) = killed {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(match killed {
+        Some(pid) => format!("daemon {pid} did not exit"),
+        None => "a daemon is running but did not record its pid; stop it by hand".into(),
+    })
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
