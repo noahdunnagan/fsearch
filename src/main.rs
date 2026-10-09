@@ -194,10 +194,8 @@ fn install(login: bool) {
     let target = format!("{}/{LABEL}", domain());
     let had_agent = launchctl(&["bootout", &target]);
     if let Err(e) = server::stop(&data_dir()) {
-        if had_agent {
-            launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-        }
-        die(&e);
+        let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+        die(&rollback(e, had_agent, bootstrap, BOOTSTRAP_WAIT));
     }
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
@@ -223,17 +221,35 @@ fn install(login: bool) {
         log.display()
     );
     std::fs::write(plist_path(), plist).unwrap();
-    // bootout returns before the old job is fully gone; bootstrap fails
-    // until it is.
     let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-    let retry = || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        false
-    };
-    if !(0..50).any(|_| bootstrap() || retry()) {
+    if !retry(BOOTSTRAP_TRIES, BOOTSTRAP_WAIT, bootstrap) {
         die("launchctl bootstrap failed");
     }
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
+}
+
+// bootout returns before the old job is fully gone; bootstrap fails until
+// it is.
+const BOOTSTRAP_TRIES: usize = 50;
+const BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Try `f` up to `tries` times, `wait` apart, until it succeeds.
+fn retry(tries: usize, wait: std::time::Duration, mut f: impl FnMut() -> bool) -> bool {
+    (0..tries).any(|i| {
+        if i > 0 {
+            std::thread::sleep(wait);
+        }
+        f()
+    })
+}
+
+/// The old daemon wouldn't stop: load the login agent again if we unloaded
+/// it, and say what went wrong.
+fn rollback(err: String, had_agent: bool, bootstrap: impl FnMut() -> bool, wait: std::time::Duration) -> String {
+    if had_agent && !retry(BOOTSTRAP_TRIES, wait, bootstrap) {
+        return format!("{err}; the login agent could not be loaded again: run fsearch install --login");
+    }
+    err
 }
 
 fn uninstall() {
@@ -250,6 +266,43 @@ fn die(msg: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// launchd refuses bootstrap until the old job is gone: the rollback
+    /// keeps trying, like the main path.
+    #[test]
+    fn rollback_retries_until_the_agent_loads() {
+        let mut calls = 0;
+        let err = rollback(
+            "stuck".into(),
+            true,
+            || {
+                calls += 1;
+                calls == 3
+            },
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!((calls, err.as_str()), (3, "stuck"));
+    }
+
+    #[test]
+    fn rollback_says_when_the_agent_stays_unloaded() {
+        let err = rollback("stuck".into(), true, || false, std::time::Duration::ZERO);
+        assert!(err.starts_with("stuck") && err.contains("install --login"), "{err}");
+        let mut calls = 0;
+        assert_eq!(
+            rollback(
+                "stuck".into(),
+                false,
+                || {
+                    calls += 1;
+                    true
+                },
+                std::time::Duration::ZERO
+            ),
+            "stuck"
+        );
+        assert_eq!(calls, 0, "no agent was unloaded, so none to load");
+    }
 
     unsafe fn check(p: *mut u8, n: usize, fill: u8) {
         assert!(!p.is_null());
