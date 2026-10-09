@@ -200,17 +200,26 @@ impl Segment {
     }
 
     /// The live docs under `prefix` lie in this doc id range (exactly, for a
-    /// segment built from sorted paths; a superset after a merge).
-    fn doc_range(&self, prefix: &[u8]) -> std::ops::Range<u32> {
+    /// segment built from sorted paths; a superset after a merge, or when
+    /// most of the segment is under it). True if every doc is under it.
+    fn doc_range(&self, prefix: &[u8]) -> (std::ops::Range<u32>, bool) {
         let bp = self.by_path();
-        let (Some(&first), Some(&last)) = (bp.first(), bp.last()) else { return 0..0 };
-        if self.path(last) < prefix || (self.path(first) > prefix && !self.path(first).starts_with(prefix)) {
-            return 0..0;
+        let (Some(&first), Some(&last)) = (bp.first(), bp.last()) else { return (0..0, false) };
+        let (first, last) = (self.path(first), self.path(last));
+        if last < prefix || (first > prefix && !first.starts_with(prefix)) {
+            return (0..0, false);
+        }
+        // Paths under the prefix are one run in path order.
+        if first.starts_with(prefix) && last.starts_with(prefix) {
+            return (0..self.ndocs as u32, true);
         }
         let a = bp.partition_point(|&d| self.path(d) < prefix);
         let z = a + bp[a..].partition_point(|&d| self.path(d).starts_with(prefix));
+        if (z - a) * 2 > bp.len() {
+            return (0..self.ndocs as u32, false);
+        }
         let (lo, hi) = bp[a..z].iter().fold((u32::MAX, 0), |(lo, hi), &d| (lo.min(d), hi.max(d + 1)));
-        lo.min(hi)..hi
+        (lo.min(hi)..hi, false)
     }
 
     fn list_into(&self, k: usize, out: &mut Vec<u32>) {
@@ -770,11 +779,11 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
-/// Does the name query let every indexed doc through (no scope, words,
-/// extensions, ranges or patterns)? Then it needn't be checked per doc.
-fn passes_every_doc(q: &Query) -> bool {
-    q.scope.is_none()
-        && q.tokens.is_empty()
+/// Does the name query let every indexed doc under its scope (if any)
+/// through: no words, extensions, ranges or patterns? Then a segment wholly
+/// in scope needn't be checked doc by doc.
+fn only_scope(q: &Query) -> bool {
+    q.tokens.is_empty()
         && q.kind_ok(KIND_FILE)
         && q.exts.is_empty()
         && q.size == (0, u64::MAX)
@@ -970,14 +979,17 @@ impl Content {
     fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
         // A scope narrows each segment to the doc range holding its paths.
         let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
-        let check = !passes_every_doc(filt);
-        let work: Vec<(usize, std::ops::Range<u32>)> = (self.segs.iter().enumerate())
+        let only_scope = only_scope(filt);
+        let work: Vec<(usize, std::ops::Range<u32>, bool)> = (self.segs.iter().enumerate())
             .filter(|(_, s)| s.live_docs > 0)
-            .map(|(si, s)| (si, prefix.as_ref().map_or(0..s.ndocs as u32, |p| s.doc_range(p))))
-            .filter(|(_, docs)| !docs.is_empty())
+            .map(|(si, s)| {
+                let (docs, whole) = prefix.as_ref().map_or((0..s.ndocs as u32, true), |p| s.doc_range(p));
+                (si, docs, !(only_scope && whole))
+            })
+            .filter(|(_, docs, _)| !docs.is_empty())
             .collect();
-        let one = |(si, docs): &(usize, std::ops::Range<u32>)| {
-            let s = &self.segs[*si];
+        let one = |(si, docs, check): &(usize, std::ops::Range<u32>, bool)| {
+            let (s, check) = (&self.segs[*si], *check);
             let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
             let (rank, mtime) = (s.rank(), s.mtime());
             let mut v: Vec<Ranked> = ids
@@ -993,7 +1005,7 @@ impl Content {
         };
         // About a lane per 50k docs to search: a small index is done on this
         // thread before a helper would wake.
-        let docs: usize = work.iter().map(|(_, docs)| docs.len()).sum();
+        let docs: usize = work.iter().map(|(_, docs, _)| docs.len()).sum();
         par_claim(&work, (docs / 50_000).clamp(1, work.len().max(1)), one)
     }
 
