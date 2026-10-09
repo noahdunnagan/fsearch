@@ -163,20 +163,26 @@ impl Index {
     pub fn path(&self, i: usize, out: &mut Vec<u8>) {
         out.clear();
         let mut chain = [0u32; 256];
+        let mut deep = Vec::new();
         let mut k = 0;
         let mut e = i as u32;
-        while e != 0 {
-            if k == chain.len() {
-                // Deeper than the buffer: the rest of the way up first.
-                self.path(e as usize, out);
-                break;
+        // No real chain is longer than the entry count: a corrupt index
+        // whose parents loop is cut off there, not followed forever.
+        while e != 0 && k + deep.len() < self.n {
+            if k < chain.len() {
+                chain[k] = e;
+                k += 1;
+            } else {
+                deep.push(e);
             }
-            chain[k] = e;
-            k += 1;
             e = self.dir_entry()[self.parent()[e as usize] as usize];
         }
         if k == 0 {
             out.push(b'/');
+        }
+        for &d in deep.iter().rev() {
+            out.push(b'/');
+            out.extend_from_slice(self.name(d as usize));
         }
         for j in (0..k).rev() {
             out.push(b'/');
@@ -793,6 +799,27 @@ pub(crate) mod tests {
         let mut p = Vec::new();
         idx.path(leaf as usize, &mut p);
         assert_eq!(p, want);
+    }
+
+    /// A corrupt index whose parent links loop must not recurse forever: a
+    /// stack overflow would crash the daemon on every start.
+    #[test]
+    fn path_survives_a_parent_cycle() {
+        let t = Tmp::new("idx-cycle");
+        let idx = Index::build(vec![lst(0, &[(b"a", D, 0, 1)]), lst(1, &[(b"f", F, 1, NONE)])], 0, 0, b"");
+        let path = t.p("index.bin");
+        idx.save(&path).unwrap();
+        let a = idx.lookup(b"/a").unwrap() as usize;
+        let da = idx.dir_of(a as u32).unwrap();
+        // Make /a's parent folder /a itself.
+        let at = idx.parent().as_ptr() as usize - idx.map.as_ptr() as usize + a * 4;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[at..at + 4].copy_from_slice(&da.to_ne_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let bad = Index::load(&path).unwrap();
+        let mut p = Vec::new();
+        bad.path(a, &mut p);
+        assert!(p.len() <= (bad.n + 1) * 3, "a cycle is cut off, not followed");
     }
 
     #[test]
