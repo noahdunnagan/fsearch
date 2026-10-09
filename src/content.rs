@@ -941,43 +941,82 @@ impl Content {
         self.save_manifest();
     }
 
-    /// Candidate docs for a pattern, filtered by the name query.
-    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<(usize, u32)> {
+    /// Candidate docs for a pattern, filtered by the name query: one list
+    /// per segment, with its `FIRST` best-ranked in front (unordered).
+    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
         // A scope narrows each segment to the doc range holding its paths.
         let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
         let check = !passes_every_doc(filt);
-        // Your files before dot-dirs/logs, then most recently modified first;
-        // ties in segment, then doc order. Packed so the sort compares ints.
-        let mut out: Vec<(u64, u32, u32)> = self
-            .segs
+        self.segs
             .par_iter()
             .enumerate()
-            .filter(|(_, s)| s.live_docs > 0)
-            .flat_map_iter(|(si, s)| {
+            .map(|(si, s)| {
                 let docs = prefix.as_ref().map_or(0..s.ndocs as u32, |p| s.doc_range(p));
-                let ids = if docs.is_empty() { Vec::new() } else { eval(s, plan, docs.clone()).unwrap_or_else(|| docs.collect()) };
+                if s.live_docs == 0 || docs.is_empty() {
+                    return Vec::new();
+                }
+                let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.collect());
                 let (rank, mtime) = (s.rank(), s.mtime());
-                ids.into_iter()
-                    .filter(move |&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
-                    .filter(move |&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                    .map(move |d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
-                    .collect::<Vec<_>>()
+                let mut v: Vec<Ranked> = ids
+                    .into_iter()
+                    .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
+                    .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
+                    .collect();
+                if v.len() > FIRST {
+                    v.select_nth_unstable(FIRST);
+                }
+                v
             })
-            .collect();
-        out.par_sort_unstable();
-        out.into_iter().map(|(_, si, d)| (si as usize, d)).collect()
+            .collect()
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
-        let cands = self.candidates(&g.plan(), filt);
+        let mut per = self.candidates(&g.plan(), filt);
+        let total = per.iter().map(Vec::len).sum();
         // A candidate whose bloom filter lacks one of the pattern's grams
         // can't match: skip it without opening the file.
         let probes = g.probes();
-        verify_with(g, cands.len(), filt.limit, |i| {
-            let (si, d) = cands[i];
-            self.segs[si].may_contain(d, &probes).then(|| self.segs[si].path(d))
-        })
+        let path = |&(_, si, d): &Ranked| {
+            let s = &self.segs[si as usize];
+            s.may_contain(d, &probes).then(|| s.path(d))
+        };
+        // Most searches are done within the best few hundred candidates:
+        // rank those first, and the rest only if reading gets that far.
+        let t = std::time::Instant::now();
+        let best = take_best(&mut per);
+        let (mut r, done) = verify_from(g, best.len(), filt.limit, t, |i| path(&best[i]));
+        if r.files.len() < filt.limit && done == best.len() && best.len() < total {
+            let mut rest: Vec<Ranked> = per.concat();
+            rest.par_sort_unstable();
+            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), t, |i| path(&rest[i]));
+            r.files.extend(more.files);
+            r.read += more.read;
+            r.complete = more.complete;
+        }
+        r.candidates = total;
+        r
     }
+}
+
+/// A candidate's place in the ranking, packed so sorting compares ints: your
+/// files before dot-dirs/logs, then most recently modified first; ties in
+/// segment, then doc order. Then its segment and doc.
+type Ranked = (u64, u32, u32);
+
+/// Candidates ranked in the first round.
+const FIRST: usize = 512;
+
+/// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
+/// with its own best in front), in order.
+fn take_best(per: &mut [Vec<Ranked>]) -> Vec<Ranked> {
+    let mut top: Vec<Ranked> = per.iter_mut().flat_map(|v| v.drain(..v.len().min(FIRST))).collect();
+    if top.len() > FIRST {
+        top.select_nth_unstable(FIRST);
+        per[0].extend(top.drain(FIRST..));
+    }
+    top.sort_unstable();
+    top
 }
 
 /// What the name index says should be indexed under `dir` (direct
@@ -1128,14 +1167,14 @@ pub struct FileMatches {
 /// the next unread candidate, so the files read are always a prefix of the
 /// ranking and reading stops as soon as the `limit`th match is in.
 pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
-    verify_with(g, paths.len(), limit, |i| Some(paths[i].as_ref()))
+    verify_from(g, paths.len(), limit, std::time::Instant::now(), |i| Some(paths[i].as_ref())).0
 }
 
 /// `verify` over `n` candidates, `path(i)` giving the i-th, or None if the
-/// index already rules it out.
-fn verify_with<'a>(g: &Grep, n: usize, limit: usize, path: impl Fn(usize) -> Option<&'a [u8]> + Sync) -> GrepResult {
+/// index already rules it out; the budget counts from `t`. Also returns how
+/// many candidates it got through.
+fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path: impl Fn(usize) -> Option<&'a [u8]> + Sync) -> (GrepResult, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let t = std::time::Instant::now();
     let (next, found, read) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let hits = std::sync::Mutex::new(Vec::new());
     read_pool().broadcast(|_| {
@@ -1155,8 +1194,9 @@ fn verify_with<'a>(g: &Grep, n: usize, limit: usize, path: impl Fn(usize) -> Opt
     let mut hits = hits.into_inner().unwrap();
     hits.sort_unstable_by_key(|h| h.0);
     hits.truncate(limit);
-    let complete = next.into_inner() >= n || hits.len() >= limit;
-    GrepResult { files: hits.into_iter().map(|h| h.1).collect(), candidates: n, read: read.into_inner(), complete }
+    let done = next.into_inner().min(n);
+    let complete = done == n || hits.len() >= limit;
+    (GrepResult { files: hits.into_iter().map(|h| h.1).collect(), candidates: n, read: read.into_inner(), complete }, done)
 }
 
 thread_local! {
