@@ -1225,7 +1225,12 @@ pub struct Grep {
     pub max_per_file: usize,
     /// Stop reading candidates after this long (None = read them all).
     pub budget: Option<std::time::Duration>,
-    re: Regex,
+    /// The matching regex, compiled when first needed (a plain ASCII
+    /// literal mostly isn't: `literal` finds it).
+    re: std::sync::OnceLock<Regex>,
+    src: String,
+    case_insensitive: bool,
+    literal: Option<Literal>,
 }
 
 impl Grep {
@@ -1239,13 +1244,37 @@ impl Grep {
             // DFA path even in files with non-ASCII text.
             GrepMode::Symbol => format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?{}(?-u:\b)", regex::escape(pattern)),
         };
-        let re = RegexBuilder::new(&src)
-            .case_insensitive(smart_ci && mode != GrepMode::Symbol)
-            .multi_line(true)
-            .size_limit(1 << 26)
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re })
+        let case_insensitive = smart_ci && mode != GrepMode::Symbol;
+        let literal = (mode == GrepMode::Literal && pattern.is_ascii() && (1..=4096).contains(&pattern.len())).then(|| {
+            if case_insensitive {
+                Literal::folded(pattern.as_bytes())
+            } else {
+                Literal::Exact(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned())
+            }
+        });
+        let g = Grep {
+            pattern: pattern.to_string(),
+            mode,
+            max_per_file: 5,
+            budget: Some(std::time::Duration::from_millis(250)),
+            re: std::sync::OnceLock::new(),
+            src,
+            case_insensitive,
+            literal,
+        };
+        if g.literal.is_none() {
+            g.re.set(g.build()?).ok();
+        }
+        Ok(g)
+    }
+
+    fn build(&self) -> Result<Regex, String> {
+        RegexBuilder::new(&self.src).case_insensitive(self.case_insensitive).multi_line(true).size_limit(1 << 26).build().map_err(|e| e.to_string())
+    }
+
+    fn re(&self) -> &Regex {
+        // A literal's regex always compiles (it was 4096 bytes at most).
+        self.re.get_or_init(|| self.build().expect("literal regex"))
     }
 
     /// Hashes of the grams every match holds (see `GRAM`).
@@ -1377,26 +1406,119 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
         if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
             return None;
         }
-        let mut lines = Vec::new();
-        let (mut line_no, mut counted) = (1usize, 0usize);
-        let mut last_line_start = usize::MAX;
-        for m in g.re.find_iter(buf) {
-            line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
-            counted = m.start();
-            let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
-            if ls == last_line_start {
-                continue;
-            }
-            last_line_start = ls;
-            let le = memchr::memchr(b'\n', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p);
-            let text = String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string();
-            lines.push((line_no, text));
-            if lines.len() >= g.max_per_file {
-                break;
-            }
-        }
+        let lines = match g.literal.as_ref().filter(|l| !l.needs_regex(buf)) {
+            Some(l) => lines_at(g, buf, l.starts(buf)),
+            None => lines_at(g, buf, g.re().find_iter(buf).map(|m| m.start())),
+        };
         (!lines.is_empty()).then(|| FileMatches { path: path.to_vec(), lines })
     })
+}
+
+/// The first `max_per_file` lines holding a match (by where matches start),
+/// numbered, as shown.
+fn lines_at(g: &Grep, buf: &[u8], starts: impl Iterator<Item = usize>) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let (mut line_no, mut counted) = (1usize, 0usize);
+    let mut last_line_start = usize::MAX;
+    for start in starts {
+        line_no += memchr::memchr_iter(b'\n', &buf[counted..start]).count();
+        counted = start;
+        let ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
+        if ls == last_line_start {
+            continue;
+        }
+        last_line_start = ls;
+        let le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
+        lines.push((line_no, String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string()));
+        if lines.len() >= g.max_per_file {
+            break;
+        }
+    }
+    lines
+}
+
+/// An ASCII literal pattern, found without a regex: its exact bytes (it has
+/// an upper-case letter), or else its letters in either case. That is what
+/// the case-insensitive regex matches too, but for two non-ASCII letters it
+/// folds onto ASCII ones (ſ for s, the Kelvin sign for k): a file holding
+/// one of those goes to the regex.
+enum Literal {
+    Exact(memchr::memmem::Finder<'static>),
+    Folded { needle: Vec<u8>, pair: (usize, usize), odd: Vec<memchr::memmem::Finder<'static>> },
+}
+
+impl Literal {
+    fn folded(pattern: &[u8]) -> Literal {
+        let needle: Vec<u8> = pattern.iter().map(|&b| fold(b)).collect();
+        // Scan for the two rarest bytes first.
+        let common = |b: u8| match b {
+            b' ' | b'e' | b't' | b'a' | b'o' | b'i' | b'n' | b's' | b'r' => 3,
+            b'h' | b'l' | b'd' | b'c' | b'u' | b'm' | b'\n' | b'\t' => 2,
+            b'f' | b'p' | b'g' | b'w' | b'y' | b'b' | b'.' | b',' | b'_' | b'(' | b')' | b'"' | b'=' | b'0'..=b'9' => 1,
+            _ => 0,
+        };
+        let mut by_rarity: Vec<usize> = (0..needle.len()).collect();
+        by_rarity.sort_by_key(|&i| (common(needle[i]), i));
+        let (a, b) = (by_rarity[0], *by_rarity.get(1).unwrap_or(&by_rarity[0]));
+        let odd = [(b's', "\u{17F}"), (b'k', "\u{212A}")].iter().filter(|(c, _)| needle.contains(c));
+        let odd = odd.map(|(_, u)| memchr::memmem::Finder::new(u.as_bytes()).into_owned()).collect();
+        Literal::Folded { needle, pair: (a.min(b), a.max(b)), odd }
+    }
+
+    fn needs_regex(&self, hay: &[u8]) -> bool {
+        matches!(self, Literal::Folded { odd, .. } if odd.iter().any(|f| f.find(hay).is_some()))
+    }
+
+    /// Where its matches start, left to right, not overlapping.
+    fn starts<'a>(&'a self, hay: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+        let len = match self {
+            Literal::Exact(f) => f.needle().len(),
+            Literal::Folded { needle, .. } => needle.len(),
+        };
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let p = match self {
+                Literal::Exact(f) => f.find(hay.get(at..)?).map(|p| at + p),
+                Literal::Folded { needle, pair, .. } => find_folded(hay, at, needle, *pair),
+            }?;
+            at = p + len;
+            Some(p)
+        })
+    }
+}
+
+/// The first place at or after `from` where `hay` holds `needle` (lower
+/// case) in either case; `pair` are two positions of rare bytes in it, the
+/// ones checked first.
+fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> Option<usize> {
+    let k = needle.len();
+    let last = hay.len().checked_sub(k)?;
+    let at = |c: usize| hay[c..c + k].iter().zip(needle).all(|(&x, &y)| fold(x) == y);
+    let mut i = from;
+    #[cfg(target_arch = "aarch64")]
+    // Safety: every load reads 16 bytes at i + pair.1 at most, and the loop
+    // keeps i + 16 <= last + 1, so they end by hay.len().
+    unsafe {
+        use std::arch::aarch64::*;
+        let (c1, c2) = (needle[pair.0], needle[pair.1]);
+        let case = |c: u8| vdupq_n_u8(if c.is_ascii_lowercase() { 0x20 } else { 0 });
+        let (v1, v2, m1, m2) = (vdupq_n_u8(c1), vdupq_n_u8(c2), case(c1), case(c2));
+        while i + 16 <= last + 1 {
+            let p = hay.as_ptr().add(i);
+            let eq = vandq_u8(vceqq_u8(vorrq_u8(vld1q_u8(p.add(pair.0)), m1), v1), vceqq_u8(vorrq_u8(vld1q_u8(p.add(pair.1)), m2), v2));
+            // Four bits per byte lane.
+            let mut bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(eq))));
+            while bits != 0 {
+                let c = i + (bits.trailing_zeros() / 4) as usize;
+                if at(c) {
+                    return Some(c);
+                }
+                bits &= !(0xF << ((c - i) * 4));
+            }
+            i += 16;
+        }
+    }
+    (i..=last).find(|&c| at(c))
 }
 
 /// A trigram query: which docs could possibly match.
