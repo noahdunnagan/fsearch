@@ -992,11 +992,7 @@ impl Content {
         };
         // A small scope is searched sooner on this thread than by waking
         // the pool's (each parallel step costs ~0.1 ms when they sleep).
-        if work.iter().map(|(_, docs)| docs.len()).sum::<usize>() < 100_000 {
-            work.iter().map(one).collect()
-        } else {
-            work.par_iter().map(one).collect()
-        }
+        if work.iter().map(|(_, docs)| docs.len()).sum::<usize>() < 100_000 { work.iter().map(one).collect() } else { par_claim(&work, one) }
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
@@ -1034,6 +1030,33 @@ type Ranked = (u64, u32, u32);
 
 /// Candidates ranked in the first round.
 const FIRST: usize = 512;
+
+/// `items.iter().map(f).collect()` on the current rayon pool: each thread
+/// claims the next item, and this one starts at once, so it never waits on
+/// a thread still waking up (one that does finds nothing left).
+fn par_claim<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let next = AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    let work = || {
+        let mut mine = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(x) = items.get(i) else { break };
+            mine.push((i, f(x)));
+        }
+        out.lock().unwrap().extend(mine);
+    };
+    rayon::scope(|s| {
+        for _ in 1..rayon::current_num_threads() {
+            s.spawn(|_| work());
+        }
+        work();
+    });
+    let mut out = out.into_inner().unwrap();
+    out.sort_unstable_by_key(|r| r.0);
+    out.into_iter().map(|r| r.1).collect()
+}
 
 /// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
 /// with its own best in front), in order.
