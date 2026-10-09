@@ -357,10 +357,11 @@ fn grams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
     }
 }
 
-/// Append a bloom filter of these gram hashes to `out`: one bit per gram,
-/// in whole words.
+/// Append a bloom filter of these gram hashes to `out`: two bits per gram
+/// (a gram the doc lacks still passes 39% of the time; one bit, 63%), in
+/// whole words.
 fn bloom(hashes: &[u32], out: &mut Vec<u64>) {
-    let words = hashes.len().div_ceil(64);
+    let words = (hashes.len() * 2).div_ceil(64);
     let at = out.len();
     out.resize(at + words, 0);
     for &h in hashes {
