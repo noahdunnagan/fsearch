@@ -185,12 +185,25 @@ fn domain() -> String {
 }
 
 fn install(login: bool) {
+    // A plain reinstall keeps an existing login agent.
+    #[cfg(target_os = "macos")]
+    let login = login || plist_path().exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
+    // Stop the old daemon so the next one runs the new binary.
+    server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
+    #[cfg(target_os = "macos")]
+    {
+        // Unload the login agent first, or KeepAlive would restart it
+        // straight away.
+        let target = format!("{}/{LABEL}", domain());
+        launchctl(&["bootout", &target]);
+    }
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap_or_else(|e| die(&format!("install: cannot create {:?}: {e}", bin.parent().unwrap())));
     // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache.
-    let _ = std::fs::remove_file(&bin);
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    // path can be SIGKILLed by the code-signing cache. Copy then rename, so
+    // reinstalling from the installed copy works too.
+    let tmp = bin.with_extension("new");
+    std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
@@ -248,8 +261,6 @@ WantedBy=default.target
             log.display()
         );
         std::fs::write(plist_path(), plist).unwrap();
-        let target = format!("{}/{LABEL}", domain());
-        launchctl(&["bootout", &target]);
         // bootout returns before the old job is fully gone; bootstrap fails
         // until it is.
         let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
