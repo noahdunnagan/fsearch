@@ -1,6 +1,6 @@
 mod server;
 
-use fsearch::{index, live, query};
+use fsearch::{default_dir, index, live, query};
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{BufRead, BufReader, Write};
@@ -61,6 +61,7 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "mt.nd.fsearch";
 
 fn home() -> String {
@@ -68,11 +69,12 @@ fn home() -> String {
 }
 
 fn data_dir() -> PathBuf {
-    let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
+    let d = default_dir(&home());
     std::fs::create_dir_all(&d).ok();
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
@@ -80,8 +82,10 @@ unsafe extern "C" {
 fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
-    // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
-    unsafe { setiopolicy_np(3, 0, 1) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        setiopolicy_np(3, 0, 1)
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
@@ -165,21 +169,24 @@ fn bench(qs: &str) {
     eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
 fn install(login: bool) {
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap_or_else(|e| die(&format!("install: cannot create {:?}: {e}", bin.parent().unwrap())));
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache.
     let _ = std::fs::remove_file(&bin);
@@ -188,9 +195,42 @@ fn install(login: bool) {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
     }
-    let log = data_dir().join("daemon.log");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let service_dir = PathBuf::from(home()).join(".config/systemd/user");
+        std::fs::create_dir_all(&service_dir).unwrap_or_else(|e| die(&format!("install: cannot create {service_dir:?}: {e}")));
+        let service_path = service_dir.join("fsearch.service");
+        let service = format!(
+            r#"[Unit]
+Description=FSearch file search daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart="{}" serve
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target
+"#,
+            bin.display()
+        );
+        std::fs::write(&service_path, &service).unwrap_or_else(|e| die(&format!("cannot write {service_path:?}: {e}")));
+        let reload = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+        let enable = Command::new("systemctl").args(["--user", "enable", "--now", "fsearch.service"]).status();
+        if !reload.is_ok_and(|s| s.success()) || !enable.is_ok_and(|s| s.success()) {
+            eprintln!("fsearch: installed {service_path:?} but systemctl failed (non-systemd host? run `fsearch serve` directly)");
+            return;
+        }
+        println!("installed {} (systemd user service)", bin.display());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let log = data_dir().join("daemon.log");
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -203,30 +243,51 @@ fn install(login: bool) {
 </dict>
 </plist>
 "#,
-        bin.display(),
-        log.display(),
-        log.display()
-    );
-    std::fs::write(plist_path(), plist).unwrap();
-    let target = format!("{}/{LABEL}", domain());
-    launchctl(&["bootout", &target]);
-    // bootout returns before the old job is fully gone; bootstrap fails
-    // until it is.
-    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-    let retry = || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        false
-    };
-    if !(0..50).any(|_| bootstrap() || retry()) {
-        die("launchctl bootstrap failed");
+            bin.display(),
+            log.display(),
+            log.display()
+        );
+        std::fs::write(plist_path(), plist).unwrap();
+        let target = format!("{}/{LABEL}", domain());
+        launchctl(&["bootout", &target]);
+        // bootout returns before the old job is fully gone; bootstrap fails
+        // until it is.
+        let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+        let retry = || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        };
+        if !(0..50).any(|_| bootstrap() || retry()) {
+            die("launchctl bootstrap failed");
+        }
+        println!("installed {} (LaunchAgent {LABEL})", bin.display());
     }
-    println!("installed {} (LaunchAgent {LABEL})", bin.display());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    println!("installed {}", bin.display());
 }
 
 fn uninstall() {
-    launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
-    let _ = std::fs::remove_file(plist_path());
-    println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+    #[cfg(target_os = "macos")]
+    {
+        launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
+        let _ = std::fs::remove_file(plist_path());
+        println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let disable = Command::new("systemctl").args(["--user", "disable", "--now", "fsearch.service"]).status();
+        let service_path = PathBuf::from(home()).join(".config/systemd/user/fsearch.service");
+        let _ = std::fs::remove_file(&service_path);
+        let reload = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+        if !disable.is_ok_and(|s| s.success()) || !reload.is_ok_and(|s| s.success()) {
+            eprintln!("fsearch: removed {service_path:?} but systemctl reported failure");
+            return;
+        }
+        println!("removed systemd user service; index kept in {}", data_dir().display());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    eprintln!("fsearch: uninstall is not supported on this platform; index kept in {}", data_dir().display());
 }
 
 fn die(msg: &str) -> ! {

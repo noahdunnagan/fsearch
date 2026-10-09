@@ -1,9 +1,12 @@
-//! Parallel whole-disk enumeration with getattrlistbulk(2).
+//! Parallel whole-disk enumeration with getattrlistbulk(2) on macOS,
+//! getdents64 + fstatat on Linux.
 //!
 //! One syscall returns hundreds of entries with name, type, size, mtime and
 //! flags already attached, so there is no per-file stat. Directories fan out
 //! over a rayon pool; mount points are not crossed, firmlinks are (that is
 //! how /Users etc. on the data volume appear under / exactly once).
+//! On Linux, getdents64 plus fstatat build the same listings. The walker
+//! skips mount points by comparing each device id against the scan root.
 
 use rayon::Scope;
 use std::cell::RefCell;
@@ -16,14 +19,13 @@ pub const NONE: u32 = u32::MAX;
 /// Folders never to open: set when the daemon runs without Full Disk
 /// Access, where opening a consent-gated folder (Downloads, Desktop, ...)
 /// pops a privacy prompt and blocks the call until someone answers it.
+/// On Linux it holds pseudo-filesystems like `/proc` and `/sys`. The walker
+/// never opens them.
 pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
 }
-
-const ATTR_CMN_ERROR: u32 = 0x2000_0000;
-const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
 
 pub const KIND_FILE: u8 = 0;
 pub const KIND_DIR: u8 = 1;
@@ -56,6 +58,8 @@ pub struct Listing {
 struct Ctx {
     next_id: AtomicU32,
     out: Vec<Mutex<Vec<Listing>>>,
+    #[cfg(target_os = "linux")]
+    root_dev: u64,
 }
 
 thread_local! {
@@ -64,10 +68,29 @@ thread_local! {
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
     raise_fd_limit();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
+    #[cfg(target_os = "linux")]
+    let (fd, root_dev) = if fd >= 0 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // A failed fstat would zero the dev and disable mount-skip; drop
+        // the fd instead of crossing mounts blind.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            unsafe { libc::close(fd) };
+            (-1, 0)
+        } else {
+            (fd, st.st_dev)
+        }
+    } else {
+        (fd, 0)
+    };
+    let ctx = Ctx {
+        next_id: AtomicU32::new(1),
+        out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(),
+        #[cfg(target_os = "linux")]
+        root_dev,
+    };
     // Paths are only tracked when there is something to skip.
     let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
@@ -111,8 +134,12 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
         push(l, ctx);
         return;
     }
+    #[cfg(target_os = "linux")]
+    list_fd(fd, &mut l, ctx.root_dev);
+    #[cfg(not(target_os = "linux"))]
     list_fd(fd, &mut l);
     let me = std::sync::Arc::new(Fd(fd));
+
     let mut kids = Vec::new();
     for e in l.ents.iter_mut() {
         if e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0 {
@@ -121,8 +148,9 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
             if child_path.as_deref().is_some_and(blocked) {
                 continue;
             }
+            let cname = CString::new(name).unwrap_or_default();
             e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
-            kids.push((CString::new(name).unwrap_or_default(), e.child, child_path));
+            kids.push((cname, e.child, child_path));
         }
     }
     push(l, ctx);
@@ -141,14 +169,6 @@ fn push(l: Listing, ctx: &Ctx) {
     ctx.out[slot].lock().unwrap().push(l);
 }
 
-fn rd32(b: &[u8], at: usize) -> u32 {
-    u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn rd64(b: &[u8], at: usize) -> u64 {
-    u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
-}
-
 /// Returns false if the directory could not be opened.
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
@@ -156,11 +176,155 @@ fn list_into(path: &[u8], l: &mut Listing) -> bool {
     if fd < 0 {
         return false;
     }
+    #[cfg(target_os = "linux")]
+    list_fd(fd, l, 0);
+    #[cfg(not(target_os = "linux"))]
     list_fd(fd, l);
+    #[cfg(target_os = "linux")]
+    {
+        // Mount-skip agreement with full scans: a child on another device
+        // is a mount point the scan would never descend into.
+        let mut pst: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut pst) } == 0 && pst.st_dev != 0 {
+            for e in l.ents.iter_mut() {
+                if e.kind & 3 != KIND_DIR {
+                    continue;
+                }
+                let name = &l.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+                let cname = CString::new(name).unwrap_or_default();
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstatat(fd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0 && st.st_dev != pst.st_dev {
+                    e.kind |= FLAG_MOUNT;
+                }
+            }
+        }
+    }
     unsafe { libc::close(fd) };
     true
 }
 
+#[cfg(target_os = "linux")]
+/// Re-root a home scan at `/`. The index builds paths from listing 0 as `/`,
+/// so a scan rooted at `$HOME` would index `/proj/...` instead of
+/// `$HOME/proj/...` and break lookup, content scope and compact. Synthetic
+/// parents hold the home components. The real scan shifts its ids above them.
+pub fn graft_home_prefix(mut ls: Vec<Listing>, root: &[u8]) -> Vec<Listing> {
+    let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    if comps.is_empty() {
+        return ls;
+    }
+    let k = comps.len() as u32;
+    for l in ls.iter_mut() {
+        l.id += k;
+        for e in l.ents.iter_mut() {
+            if e.child != NONE {
+                e.child += k;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(ls.len() + comps.len());
+    for (i, comp) in comps.iter().enumerate() {
+        let child = if i + 1 < comps.len() { i as u32 + 1 } else { k };
+        out.push(Listing {
+            id: i as u32,
+            names: comp.to_vec(),
+            ents: vec![RawEnt { name_off: 0, name_len: comp.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child }],
+        });
+    }
+    out.extend(ls);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn list_fd(fd: i32, l: &mut Listing, root_dev: u64) {
+    // Raw getdents64: libc has no wrapper. The reclen field is read in native
+    // byte order, matching every architecture Linux runs on.
+    BUF.with_borrow_mut(|buf| {
+        loop {
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut offset = 0;
+            let bytes = n as usize;
+            while offset < bytes {
+                let reclen = u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]) as usize;
+                if reclen == 0 {
+                    break;
+                }
+                let d_type = buf[offset + 18];
+                let name_start = offset + 19;
+                let mut name_end = name_start;
+                while name_end < offset + reclen && buf[name_end] != 0 {
+                    name_end += 1;
+                }
+                let name = &buf[name_start..name_end];
+                if !(name == b"." || name == b"..") {
+                    parse_entry_linux(fd, name, d_type, l, root_dev);
+                }
+                offset += reclen;
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn parse_entry_linux(fd: i32, name: &[u8], d_type: u8, l: &mut Listing, root_dev: u64) {
+    let mut kind = match d_type {
+        libc::DT_REG => KIND_FILE,
+        libc::DT_DIR => KIND_DIR,
+        libc::DT_LNK => KIND_LINK,
+        _ => KIND_OTHER,
+    };
+
+    let cname = CString::new(name).unwrap_or_default();
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::fstatat(fd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if ret == 0 && d_type == libc::DT_UNKNOWN {
+        kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => KIND_FILE,
+            libc::S_IFDIR => KIND_DIR,
+            libc::S_IFLNK => KIND_LINK,
+            _ => KIND_OTHER,
+        };
+    }
+    // Mount points never descend: the fstatat above already statted the
+    // child, so compare its device against the scan root here instead of
+    // statting twice. Live updates agree through list_into's post-pass.
+    if ret == 0 && root_dev != 0 && kind == KIND_DIR && st.st_dev != root_dev {
+        kind |= FLAG_MOUNT;
+    }
+
+    let mut mtime = 0u32;
+    let mut size = 0u64;
+    if ret == 0 {
+        mtime = (st.st_mtime as i64).clamp(0, u32::MAX as i64) as u32;
+        size = st.st_size as u64;
+    }
+
+    if name.is_empty() || name.len() > u16::MAX as usize {
+        return;
+    }
+    l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
+    l.names.extend_from_slice(name);
+}
+
+#[cfg(target_os = "macos")]
+const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+#[cfg(target_os = "macos")]
+const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
+
+#[cfg(target_os = "macos")]
+fn rd32(b: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+#[cfg(target_os = "macos")]
+fn rd64(b: &[u8], at: usize) -> u64 {
+    u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+#[cfg(target_os = "macos")]
 fn list_fd(fd: i32, l: &mut Listing) {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
@@ -184,6 +348,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
     });
 }
 
+#[cfg(target_os = "macos")]
 fn parse_entry(b: &[u8], l: &mut Listing) {
     let common = rd32(b, 4);
     let dirattr = rd32(b, 12);
@@ -236,4 +401,45 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
     }
     l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
     l.names.extend_from_slice(name);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn listing(id: u32, entries: &[(&[u8], u8, u32)]) -> Listing {
+        let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+        for (name, kind, child) in entries {
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind: *kind, size: 0, mtime: 0, child: *child });
+            l.names.extend_from_slice(name);
+        }
+        l
+    }
+
+    #[test]
+    fn graft_roots_home_at_slash() {
+        let scan = vec![listing(0, &[(b"proj", KIND_DIR, 1)]), listing(1, &[(b"main.rs", KIND_FILE, NONE)])];
+        let out = graft_home_prefix(scan, b"/home/alice");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].id, 0);
+        assert_eq!(out[1].id, 1);
+        assert_eq!(out[2].id, 2);
+        let by_id: std::collections::HashMap<u32, &Listing> = out.iter().map(|l| (l.id, l)).collect();
+        for l in &out {
+            for e in &l.ents {
+                if e.child != NONE {
+                    assert!(by_id.contains_key(&e.child), "dangling child id");
+                }
+            }
+        }
+        assert_eq!(&by_id[&2].names[by_id[&2].ents[0].name_off as usize..][..by_id[&2].ents[0].name_len as usize], b"proj");
+    }
+
+    #[test]
+    fn graft_root_slash_is_identity() {
+        let scan = vec![listing(0, &[(b"etc", KIND_DIR, NONE)])];
+        let out = graft_home_prefix(scan, b"/");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, 0);
+    }
 }

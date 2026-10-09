@@ -3,7 +3,10 @@
 //! that links this crate.
 
 use crate::content::{self, Content, Grep, GrepResult};
-use crate::fsevents::{self, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
+#[cfg(target_os = "macos")]
+use crate::fsevents::{self as events, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
+#[cfg(target_os = "linux")]
+use crate::fsevents_linux::{self as events, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
 use crate::index::Index;
 use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
@@ -80,7 +83,7 @@ struct Shared {
     home: String,
     dir: PathBuf,
     /// Wakes the apply loop; an empty batch is a no-op wake-up.
-    wake: Sender<Vec<fsevents::Event>>,
+    wake: Sender<Vec<events::Event>>,
     save_requested: AtomicBool,
     /// (dirs, trees) for the content worker to re-sync.
     content_tx: Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
@@ -92,11 +95,15 @@ struct Shared {
     /// owner goes away.
     owner: AtomicBool,
     lock: std::fs::File,
-    stream: Mutex<Option<fsevents::Stream>>,
+    stream: Mutex<Option<events::Stream>>,
     /// The stream is still replaying history (until HISTORY_DONE).
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
+    /// Follower (Linux): index file mtime at the last follow check. Linux
+    /// saves carry event id 0, so `saved > ours` never fires.
+    #[cfg(target_os = "linux")]
+    index_seen: Mutex<Option<std::time::SystemTime>>,
 }
 
 fn try_lock(f: &std::fs::File) -> bool {
@@ -110,12 +117,35 @@ fn log(msg: impl AsRef<str>) {
 /// Never let indexing download iCloud placeholders: on the calling thread,
 /// opening or listing a dataless file fails fast instead of materializing it.
 pub fn no_materialize() {
-    unsafe extern "C" {
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
+        unsafe { setiopolicy_np(3, 1, 1) };
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
-    unsafe { setiopolicy_np(3, 1, 1) };
 }
+
+#[cfg(target_os = "macos")]
+fn set_qos_user_interactive() {
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_qos_utility() {
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_qos_user_interactive() {}
+
+#[cfg(not(target_os = "macos"))]
+fn set_qos_utility() {}
 
 /// Searches run here, at user-interactive QoS: an app's background executor
 /// (or any low-QoS caller) would otherwise put the scan on efficiency cores.
@@ -124,8 +154,8 @@ fn search_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("fsearch-search-{i}"))
-            .start_handler(|_| unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+            .start_handler(|_| {
+                set_qos_user_interactive();
             })
             .build()
             .unwrap()
@@ -153,10 +183,22 @@ impl Engine {
         let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
             Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
-            None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
-                log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
-                gated(&opts.home)
+                // Pseudo-filesystems the walker never opens. Only consulted
+                // when a scanned path falls under one.
+                #[cfg(target_os = "linux")]
+                {
+                    vec![b"/proc".to_vec(), b"/sys".to_vec(), b"/dev".to_vec(), b"/run".to_vec()]
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() {
+                        Vec::new()
+                    } else {
+                        log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
+                        gated(&opts.home)
+                    }
+                }
             }
         };
         if !skip.is_empty() {
@@ -181,11 +223,16 @@ impl Engine {
             stream: Mutex::new(None),
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            index_seen: Mutex::new(None),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
             Some(b) if b.event_id != 0 => b.event_id,
-            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
+            #[cfg(target_os = "macos")]
+            _ => unsafe { events::FSEventsGetCurrentEventId() },
+            #[cfg(not(target_os = "macos"))]
+            _ => events::FSEventsGetCurrentEventId(),
         };
         if owner {
             // Watch before scanning so nothing that changes mid-scan is
@@ -194,6 +241,8 @@ impl Engine {
         }
         let s = shared.clone();
         spawn("fsearch-apply", move || {
+            #[cfg(target_os = "linux")]
+            let had_base = base.is_some();
             let base = match base {
                 Some(b) => {
                     log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
@@ -211,6 +260,14 @@ impl Engine {
                 }
             };
             *s.live.write().unwrap() = Some(Live::new(base));
+            // A loaded index may have missed everything that changed while
+            // down, and Linux keeps no event history: relist by mtime once
+            // at startup. Fresh builds need no catch-up; afterwards the
+            // watcher keeps the index live.
+            #[cfg(target_os = "linux")]
+            if had_base {
+                relist_changed(&s, "startup", MUST_SCAN_SUBDIRS);
+            }
             if owner {
                 start_content(&s);
             }
@@ -283,7 +340,12 @@ impl Engine {
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
             content_pending: self.s.content_pending.load(Ordering::Relaxed),
+            // No consent model on Linux. Pseudo-filesystem skips are not
+            // permission skips.
+            #[cfg(target_os = "macos")]
             full_disk_access: walk::SKIP.get().is_none(),
+            #[cfg(not(target_os = "macos"))]
+            full_disk_access: true,
             owner: self.s.owner(),
         }
     }
@@ -295,17 +357,25 @@ impl Engine {
     }
 }
 
+#[cfg(target_os = "macos")]
 const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
+#[cfg(not(target_os = "macos"))]
+const INDEXING: &str = "indexing (first run indexes your files, one scan)";
 
 impl Shared {
     fn owner(&self) -> bool {
         self.owner.load(Ordering::Relaxed)
     }
 
-    /// (Re)start the FSEvents stream from `since`, replacing any old one.
+    /// Restart the filesystem watch from `since` and drop the old one.
+    /// macOS watches `/`. Linux watches the indexed home tree. Linux keeps
+    /// no history, see `fsevents_linux`.
     fn watch(&self, since: u64) {
         self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(since, 0.1, self.wake.clone());
+        #[cfg(target_os = "macos")]
+        let new = events::watch(since, 0.1, self.wake.clone());
+        #[cfg(target_os = "linux")]
+        let new = events::watch(Path::new(&self.home), since, 0.1, self.wake.clone());
         *self.stream.lock().unwrap() = Some(new);
     }
 
@@ -321,6 +391,24 @@ impl Shared {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
             self.watch(base.event_id);
             *self.live.write().unwrap() = Some(Live::new(base));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Linux saves carry event id 0, so the check above never
+            // fires: reload when the owner rewrites the file instead.
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let mut seen = self.index_seen.lock().unwrap();
+            if mtime != *seen {
+                *seen = mtime;
+                let ours_sync = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.synced_at);
+                if let Some(base) = Index::load(&path)
+                    && base.synced_at != ours_sync
+                {
+                    log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
+                    self.watch(base.event_id);
+                    *self.live.write().unwrap() = Some(Live::new(base));
+                }
+            }
         }
         let cdir = self.dir.join("content");
         let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
@@ -366,30 +454,45 @@ fn wait_for_index(dir: &Path) -> Index {
 }
 
 #[rustfmt::skip]
+#[cfg(target_os = "macos")]
 const GATED_IN_HOME: &[&str] = &[
     "Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
     "Library/CloudStorage", "Pictures/Photos Library.photoslibrary",
 ];
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
-pub fn gated(home: &str) -> Vec<Vec<u8>> {
-    GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+pub fn gated(_home: &str) -> Vec<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        GATED_IN_HOME.iter().map(|d| format!("{_home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
 }
 
 /// The system TCC database is readable only with Full Disk Access, and
 /// trying without it fails immediately (no prompt).
 pub fn has_full_disk_access() -> bool {
-    std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+    #[cfg(target_os = "macos")]
+    {
+        std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    set_qos_utility();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        .start_handler(|_| {
+            set_qos_utility();
             no_materialize();
         })
         .build()
@@ -478,10 +581,21 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     }
 }
 
-fn full_build(shared: &Shared, event_id: u64) -> Index {
+fn full_build(shared: &Shared, _event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
+    #[cfg(target_os = "macos")]
     let ls = walk::scan(b"/", SCAN_THREADS);
+    #[cfg(target_os = "linux")]
+    let ls = walk::graft_home_prefix(walk::scan(shared.home.as_bytes(), SCAN_THREADS), shared.home.as_bytes());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let ls = walk::scan(shared.home.as_bytes(), SCAN_THREADS);
+    // Linux ids are not a replay cursor, so the saved index keeps 0 and
+    // restarts recover through `synced_at` relists.
+    #[cfg(target_os = "linux")]
+    let event_id = 0;
+    #[cfg(not(target_os = "linux"))]
+    let event_id = _event_id;
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
@@ -494,6 +608,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     Index::load(&path).unwrap_or(idx)
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
@@ -501,7 +616,18 @@ unsafe extern "C" {
 /// Hand freed allocator memory back to the OS after big transient work
 /// (index builds, content batches) instead of letting malloc cache it.
 fn release_memory() {
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // No-op elsewhere
+    }
 }
 
 fn compact(shared: &Shared) {
@@ -523,10 +649,11 @@ fn compact(shared: &Shared) {
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
 }
 
-/// FSEvents lost track of / (dropped events, or no history back to our
-/// save): relist every folder modified since we were last in sync, plus the
-/// folders of indexed text files edited since (an edit in place doesn't
-/// touch its folder). Seconds, instead of recrawling the whole disk.
+/// The event stream lost track of the watched root (dropped events, or no
+/// history back to our save): relist every folder modified since we were
+/// last in sync, plus the folders of indexed text files edited since (an
+/// edit in place doesn't touch its folder). Seconds, instead of recrawling
+/// the whole disk.
 fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let t = Instant::now();
     let started = crate::query::now_secs();
@@ -540,6 +667,16 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     dirs.extend(shared.content.read().unwrap().changed_dirs(from));
     dirs.sort();
     dirs.dedup();
+    // Never relist outside the watched root. The graft makes listing 0 an
+    // alias for a real path above home (/tmp, /tmp/opencode, ...): relisting
+    // one would treat every sibling as a new directory and scan whole
+    // subtrees into the overlay. On macOS the root is / so everything
+    // qualifies and this stays compiled out.
+    #[cfg(not(target_os = "macos"))]
+    dirs.retain(|d| {
+        let root = shared.home.as_bytes();
+        d.as_slice() == root || (d.starts_with(root) && d.get(root.len()) == Some(&b'/'))
+    });
     let stat_time = t.elapsed();
     // Disk reads under the read lock, one folder per write, so searches keep
     // answering meanwhile.
@@ -556,12 +693,12 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let n = dirs.len();
     let _ = shared.content_tx.send((dirs, trees));
     log(format!(
-        "FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
+        "event stream lost track of the watched root ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
         t.elapsed()
     ));
 }
 
-fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
+fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<events::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
     let ours = shared.dir.as_os_str().as_bytes();
@@ -578,9 +715,17 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         if !events.is_empty() {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
             let (mut max_id, mut root_flags) = (0, 0);
+            // The watched root plays the role `/` plays on macOS: a recursive
+            // event there means history was lost.
+            #[cfg(target_os = "macos")]
+            let watch_root: &[u8] = b"/";
+            #[cfg(not(target_os = "macos"))]
+            let watch_root: &[u8] = shared.home.as_bytes();
             for e in events {
-                max_id = max_id.max(e.id);
-                if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
+                if e.flags & HISTORY_DONE == 0 {
+                    max_id = max_id.max(e.id);
+                }
+                if e.path == watch_root && e.flags & MUST_SCAN_SUBDIRS != 0 {
                     root_flags |= e.flags;
                 }
                 if e.flags & HISTORY_DONE != 0 {
@@ -607,7 +752,13 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                         rebuild = true;
                     }
                 }
-                live.event_id = live.event_id.max(max_id);
+                // macOS event ids are a replay cursor, so the save carries
+                // them forward. Linux ids order one run only and are never
+                // persisted; restarts recover through `synced_at` relists.
+                #[cfg(target_os = "macos")]
+                {
+                    live.event_id = live.event_id.max(max_id);
+                }
                 trees.append(&mut live.trees);
             }
             let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, r)| *r);
@@ -641,7 +792,14 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         let (pending, stale) = {
             let g = shared.live.read().unwrap();
             let live = g.as_ref().unwrap();
-            (live.over.len() + live.dead_count, live.event_id != live.base.event_id)
+            let pending = live.over.len() + live.dead_count;
+            // Linux ids order one run only and never advance, so event_id
+            // can't mark staleness: anything pending is stale.
+            #[cfg(target_os = "linux")]
+            let stale = pending > 0;
+            #[cfg(not(target_os = "linux"))]
+            let stale = live.event_id != live.base.event_id;
+            (pending, stale)
         };
         let asked = shared.save_requested.swap(false, Ordering::Relaxed);
         if asked || pending > COMPACT_PENDING || (stale && last_save.elapsed() > COMPACT_EVERY) {
@@ -651,7 +809,19 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     }
 }
 
-/// Default data dir: `~/Library/Application Support/FSearch`.
+/// Default data dir. On macOS it is `~/Library/Application Support/FSearch`.
+/// On Linux it is `$XDG_DATA_HOME/fsearch`, else `~/.local/share/fsearch`.
 pub fn default_dir(home: &str) -> PathBuf {
-    Path::new(home).join("Library/Application Support/FSearch")
+    if cfg!(target_os = "macos") {
+        Path::new(home).join("Library/Application Support/FSearch")
+    } else {
+        // XDG requires an absolute path; a relative one counts as unset.
+        let xdg = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| PathBuf::from(home).join(".local/share"));
+        xdg.join("fsearch")
+    }
 }

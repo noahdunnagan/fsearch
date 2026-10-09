@@ -61,10 +61,17 @@ login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
 grant in System Settings > Privacy & Security, again after each rebuild.
 Without access it skips the protected folders instead of popping a prompt.
 
+## Linux
+
+Indexes `$HOME` with `getdents64` and watches it with inotify. State lives in
+`$XDG_DATA_HOME/fsearch`, else `~/.local/share/fsearch`. `fsearch install
+--login` installs a systemd user unit. There is no event replay. Restarts
+recover with a `synced_at` mtime relist. Very large trees can exceed
+inotify `max_user_watches`. In that case raise it and restart the daemon.
+
 ## API
 
-JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or
-`fsearch stdio`:
+JSON lines over `fsearch.sock` in the data dir, or `fsearch stdio`:
 
 ```json
 {"q": "fsearch main", "limit": 20}

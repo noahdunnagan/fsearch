@@ -954,6 +954,16 @@ pub struct GrepResult {
 /// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
 /// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
 /// 16), so candidate reads get their own small pool.
+#[cfg(target_os = "macos")]
+fn set_qos_user_initiated() {
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_qos_user_initiated() {}
+
 fn read_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -963,7 +973,7 @@ fn read_pool() -> &'static rayon::ThreadPool {
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
                 // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                set_qos_user_initiated();
                 crate::no_materialize()
             })
             .build()

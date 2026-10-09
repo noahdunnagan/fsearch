@@ -14,6 +14,10 @@ regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# File watching on Linux (inotify). macOS uses FSEvents and needs no extra dep.
+notify = "8"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
