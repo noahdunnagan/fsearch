@@ -28,6 +28,13 @@ fn finds(e: &Engine, q: &str, p: &Path) -> bool {
     names(e, q).contains(&p)
 }
 
+/// The root is in the environment before any test thread starts: setting
+/// it from a test, with others running, is unsound.
+#[test]
+fn the_root_is_set_before_any_test_runs() {
+    assert!(std::env::var_os("FSEARCH_ROOT").is_some());
+}
+
 #[test]
 fn indexes_follows_changes_and_saves() {
     let s = Scratch::new();

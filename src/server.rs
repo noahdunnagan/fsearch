@@ -259,6 +259,26 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
+    /// Runs before main, while the process has one thread: `env::set_var`
+    /// with other threads running is unsound.
+    #[used]
+    #[unsafe(link_section = "__DATA,__mod_init_func")]
+    static SET_ROOT: extern "C" fn() = {
+        extern "C" fn init() {
+            // Not in the lock-holder child: it is killed, never exits cleanly.
+            if std::env::var_os("FSEARCH_TEST_HOLD").is_none() {
+                root();
+            }
+        }
+        init
+    };
+
+    /// The root is in the environment before any test thread starts.
+    #[test]
+    fn the_root_is_set_before_any_test_runs() {
+        assert!(std::env::var_os("FSEARCH_ROOT").is_some());
+    }
+
     /// Engines here index this temp folder, never `/`.
     fn root() -> &'static Path {
         static ROOT: OnceLock<PathBuf> = OnceLock::new();

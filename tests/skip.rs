@@ -6,10 +6,26 @@ mod common;
 use common::{Scratch, real, wait_for};
 use fsearch::{Engine, Options, Query};
 
+/// Runs before main, while the process has one thread: `env::set_var`
+/// with other threads running is unsound.
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static RESTRICT: extern "C" fn() = {
+    extern "C" fn init() {
+        unsafe { std::env::set_var("FSEARCH_RESTRICT", "1") };
+    }
+    init
+};
+
+/// Set before any test thread starts: setting it from a test is unsound.
+#[test]
+fn restrict_is_set_before_any_test_runs() {
+    assert!(std::env::var_os("FSEARCH_RESTRICT").is_some());
+}
+
 #[test]
 fn gated_folders_are_skipped_and_recorded() {
     let s = Scratch::new();
-    unsafe { std::env::set_var("FSEARCH_RESTRICT", "1") };
     let home = s.mkdir("home");
     s.write("home/Documents/secretfile", "");
     let open = s.write("home/openfile", "");

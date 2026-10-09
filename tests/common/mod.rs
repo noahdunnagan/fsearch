@@ -7,7 +7,18 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// This process's index root, set as `FSEARCH_ROOT` before any engine starts.
+/// Runs before main, while the process has one thread: `env::set_var`
+/// with other threads running is unsound.
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static SET_ROOT: extern "C" fn() = {
+    extern "C" fn init() {
+        root();
+    }
+    init
+};
+
+/// This process's index root, set as `FSEARCH_ROOT` before main.
 pub fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -22,7 +33,6 @@ pub fn root() -> &'static Path {
             }
         }
         unsafe { libc::atexit(clean) };
-        // Set once, before any engine (or other env reader) runs.
         unsafe { std::env::set_var("FSEARCH_ROOT", &r) };
         r
     })
@@ -63,15 +73,29 @@ impl Drop for Scratch {
     }
 }
 
-/// A folder outside the index root, removed on drop.
+/// A folder outside the index root, removed on drop. Its parent goes at
+/// exit too: an engine's threads may still be writing into it after the
+/// drop, recreating what was removed.
 pub struct Outside(pub PathBuf);
 
 impl Outside {
     pub fn new(tag: &str) -> Outside {
-        let p = std::env::temp_dir().join(format!("fsearch-out-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+        static PARENT: OnceLock<PathBuf> = OnceLock::new();
+        let parent = PARENT.get_or_init(|| {
+            let r = std::env::temp_dir().join(format!("fsearch-out-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&r);
+            std::fs::create_dir_all(&r).unwrap();
+            extern "C" fn clean() {
+                if let Some(r) = PARENT.get() {
+                    let _ = std::fs::remove_dir_all(r);
+                }
+            }
+            unsafe { libc::atexit(clean) };
+            std::fs::canonicalize(r).unwrap()
+        });
+        let p = parent.join(tag);
         std::fs::create_dir_all(&p).unwrap();
-        Outside(std::fs::canonicalize(p).unwrap())
+        Outside(p)
     }
 }
 
