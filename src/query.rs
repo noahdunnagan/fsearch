@@ -40,6 +40,12 @@ impl Token {
 }
 
 impl Token {
+    /// A token for a lowercase literal a name must contain.
+    fn literal(text: Vec<u8>) -> Token {
+        let mask = text.iter().fold(0, |m, &b| m | char_bit(b));
+        Token { text, mask, mode: Mode::Exact, negate: false, loose: 0, start: 0 }
+    }
+
     /// A stand-in for a name's mask (see `token_score`) from what the name
     /// bitmaps tell: whether the name can hold this token cleanly, whether a
     /// word in it starts like the token, whether it has a space. Each bit is
@@ -117,6 +123,17 @@ impl<'a> TokenBits<'a> {
         let clean = first | second;
         (clean | ((all | one) & typo), clean, typo)
     }
+}
+
+/// Lowercased literals one of which starts every match of `re` (so a name
+/// it matches contains it), if the regex has a short list of them.
+fn re_literals(re: &regex::bytes::Regex) -> Option<Vec<Vec<u8>>> {
+    let hir = regex_syntax::ParserBuilder::new().utf8(false).build().parse(re.as_str()).ok()?;
+    let mut lits: Vec<Vec<u8>> =
+        regex_syntax::hir::literal::Extractor::new().extract(&hir).literals()?.iter().map(|l| l.as_bytes().to_ascii_lowercase()).collect();
+    lits.sort();
+    lits.dedup();
+    lits.iter().all(|l| !l.is_empty()).then_some(lits)
 }
 
 /// Fuzzy words this long forgive one typo (see `typo_score`).
@@ -870,8 +887,23 @@ impl Searcher<'_> {
         let toks: Vec<TokenBits> = pos.iter().chain(neg).map(|t| TokenBits::new(idx, t)).collect();
         let space = char_bit(b' ').trailing_zeros() as usize;
         let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
-        // Name k is bit i of `per` (each token's `TokenBits::word`).
-        let score_one = |k: usize, i: u32, per: &[Line<(u64, u64, u64)>], spaced: bool, ok_entries: &mut usize| -> Option<NameHit> {
+        // Name filters as bitmap prefilters: a name passing `ext:` contains
+        // ".ext"; one passing `re:` contains a literal every match starts with.
+        let filter = |lits: Vec<Vec<u8>>| lits.into_iter().map(Token::literal).collect::<Vec<_>>();
+        let ext_toks = (!q.exts.is_empty() && q.exts.len() <= 8).then(|| filter(q.exts.iter().map(|e| [b".", &e[..]].concat()).collect()));
+        let re_toks = q.name_re.as_ref().and_then(re_literals).map(filter);
+        let bits_of = |t: &Option<Vec<Token>>| t.as_ref().map(|t| t.iter().map(|t| TokenBits::new(idx, t)).collect::<Vec<_>>());
+        let (ext_bits, re_bits) = (bits_of(&ext_toks), bits_of(&re_toks));
+        // Name k is bit i of `per` (each token's `TokenBits::word`). `re` is
+        // the task's own copy of `name_re`: sharing one regex's cache pool
+        // across threads costs more than the match.
+        let score_one = |k: usize,
+                         i: u32,
+                         per: &[Line<(u64, u64, u64)>],
+                         spaced: bool,
+                         re: Option<&regex::bytes::Regex>,
+                         ok_entries: &mut usize|
+         -> Option<NameHit> {
             let name = idx.uname(k as u32);
             let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
             let bit = |x: u64| x >> i & 1 != 0;
@@ -896,7 +928,7 @@ impl Searcher<'_> {
             let ok = (pos.is_empty() || h.bits != 0)
                 && h.flags & NF_NEG == 0
                 && (q.exts.is_empty() || ext_ok(name, &q.exts))
-                && q.name_re.as_ref().is_none_or(|re| re.is_match(name));
+                && re.is_none_or(|re| re.is_match(name));
             if ok {
                 h.flags |= NF_OK;
                 *ok_entries += (ne_off[k + 1] - ne_off[k]) as usize;
@@ -910,6 +942,7 @@ impl Searcher<'_> {
             if from.is_some_and(|f| f.hits[c].is_empty()) || within.is_some_and(|s| !s.any[c]) {
                 return (hits, ok);
             }
+            let re = q.name_re.clone();
             let mut per = vec![Line((0, 0, 0)); toks.len()];
             for (wi, (word, r)) in bits.iter_mut().zip(rank.iter_mut()).enumerate() {
                 *r = hits.len() as u16;
@@ -923,13 +956,18 @@ impl Searcher<'_> {
                     p.0 = tb.word(w);
                     any |= p.0.0;
                 }
-                // With no positive token every name is a candidate.
-                cand &= if pos.is_empty() { !0 >> (64 - (idx.u - w * 64).min(64)) } else { any };
+                // With no positive token every name is a candidate, unless
+                // a name filter says which can pass.
+                if pos.is_empty() {
+                    let some = |f: &Option<Vec<TokenBits>>| f.as_ref().map_or(!0, |f| f.iter().fold(0, |a, t| a | t.word(w).0));
+                    any |= !0 >> (64 - (idx.u - w * 64).min(64)) & some(&ext_bits) & some(&re_bits);
+                }
+                cand &= any;
                 while cand != 0 {
                     let i = cand.trailing_zeros();
                     cand &= cand - 1;
                     let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
-                    if let Some(h) = score_one(w * 64 + i as usize, i, &per, spaced, &mut ok) {
+                    if let Some(h) = score_one(w * 64 + i as usize, i, &per, spaced, re.as_ref(), &mut ok) {
                         hits.push(h);
                         *word |= 1 << i;
                     }
@@ -1055,7 +1093,8 @@ impl Scan<'_> {
     /// Score entry `i` whose name scored `nh`, given its parent's memo.
     /// `None` if it fails a filter or cannot beat `floor`.
     #[inline(always)]
-    fn score(&self, i: usize, nh: NameHit, memo: DirMemo, floor: u64, pbuf: &mut Vec<u8>) -> Option<u64> {
+    /// `re` is the caller's own copy of `path_re` (see `score_names`).
+    fn score(&self, i: usize, nh: NameHit, memo: DirMemo, floor: u64, pbuf: &mut Vec<u8>, re: Option<&regex::bytes::Regex>) -> Option<u64> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind()[i];
@@ -1094,7 +1133,7 @@ impl Scan<'_> {
         if key <= floor {
             return None;
         }
-        if let Some(re) = &q.path_re {
+        if let Some(re) = re {
             idx.path(i, pbuf);
             if !re.is_match(pbuf) {
                 return None;
@@ -1109,7 +1148,7 @@ impl Scan<'_> {
         let (ent_name, parent) = (idx.ent_name(), idx.parent());
         let dense = self.names.dense(idx);
         top_k(hi - lo, self.q.limit, hi - lo, |r, top| {
-            let mut pbuf = Vec::new();
+            let (mut pbuf, re) = (Vec::new(), self.q.path_re.clone());
             for i in lo + r.start..lo + r.end {
                 let s = dense[ent_name[i] as usize];
                 if s.flags & NF_OK == 0 {
@@ -1117,7 +1156,7 @@ impl Scan<'_> {
                 }
                 let nh = NameHit { score: s.score, bits: s.bits, flags: s.flags, best: [0; 4] };
                 let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
-                if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf) {
+                if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf, re.as_ref()) {
                     top.push(k);
                 }
             }
@@ -1132,6 +1171,7 @@ impl Scan<'_> {
         let ok: Vec<(u32, NameHit)> = self.names.iter().filter(|(_, h)| h.flags & NF_OK != 0).collect();
         top_k(ok.len(), self.q.limit, self.names.ok_entries, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
+            let re = self.q.path_re.clone();
             for &(id, nh) in &ok[r] {
                 for &e in &ne[ne_off[id as usize] as usize..ne_off[id as usize + 1] as usize] {
                     let i = e as usize;
@@ -1139,7 +1179,7 @@ impl Scan<'_> {
                         continue;
                     }
                     let m = if self.need_dirs { self.memo_of(parent[i], &mut memo) } else { DirMemo::default() };
-                    if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf) {
+                    if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf, re.as_ref()) {
                         top.push(k);
                     }
                 }
