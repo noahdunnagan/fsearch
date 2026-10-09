@@ -133,6 +133,37 @@ impl<'a> TokenBits<'a> {
     }
 }
 
+/// What `score_names` holds for name `k`, scored on its own (from its mask
+/// rather than the bitmaps): the same hit, or None for the same names.
+fn name_hit(idx: &Index, q: &Query, pos: &[&Token], neg: &[&Token], re: Option<&regex::bytes::Regex>, k: u32) -> Option<NameHit> {
+    let name = idx.uname(k);
+    let m = crate::index::name_mask(name);
+    let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
+    for (t, tok) in pos.iter().enumerate() {
+        if tok.fits(m)
+            && let Some(s) = token_score(name, m, tok)
+        {
+            h.bits |= 1 << t;
+            let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            h.score = h.score.saturating_add(s16);
+            if t < 4 {
+                h.best[t] = s16.max(0);
+            }
+        }
+    }
+    if neg.iter().any(|t| token_matches(name, t)) {
+        h.flags |= NF_NEG;
+    }
+    let ok = (pos.is_empty() || h.bits != 0)
+        && h.flags & NF_NEG == 0
+        && (q.exts.is_empty() || ext_ok(name, &q.exts))
+        && re.is_none_or(|re| re.is_match(name));
+    if ok {
+        h.flags |= NF_OK;
+    }
+    (ok || h.bits != 0 || h.flags & NF_NEG != 0).then_some(h)
+}
+
 /// Lowercased literals one of which starts every match of `re` (so a name
 /// it matches contains it), if the regex has a short list of them.
 fn re_literals(re: &regex::bytes::Regex) -> Option<Vec<Vec<u8>>> {
@@ -793,6 +824,8 @@ const INLINE_WORDS: usize = 4096;
 const INLINE_VISITS: usize = 4096;
 /// One-token searches expected to match this many names go `ranked`.
 const RANKED_MIN: f64 = 100_000.0;
+/// `driven` tries a token expected to match at most this many names.
+const DRIVEN_NAMES: f64 = 20_000.0;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -824,15 +857,22 @@ impl Searcher<'_> {
         }
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
+        if (pos.len() > 1 || !neg.is_empty())
+            && let Some(hits) = self.driven(q, &pos, &neg, lo, hi)
+        {
+            return hits;
+        }
         // Step 1: every name-only predicate, once per distinct name (~2M)
         // rather than once per entry (~7.5M); reused while you type.
         let scored = self.names(q, &pos, &neg, lo, hi);
         let s = Scan { q, live: self.live, names: &scored.names, npos: pos.len(), need_dirs: pos.len() > 1 || !neg.is_empty(), now: now_secs() };
         // Step 2: score entries. Few candidates: just the entries carrying a
         // matching name. Many: one sequential pass over every entry.
-        if scored.names.ok_entries <= SELECTIVE && !scored.names.all && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed) {
+        let fast = !scored.names.all && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed);
+        if fast && scored.names.ok_entries <= SELECTIVE {
             return s.selective(lo, hi);
         }
+
         let memo = if s.need_dirs { Some(scored.memo.get_or_init(|| self.dir_tokens(&scored.names))) } else { None };
         s.full(lo, hi, memo.map(|m| m.as_slice()))
     }
@@ -976,6 +1016,118 @@ impl Searcher<'_> {
         };
         let rest: Vec<_> = gather(&pick, &bound).into_iter().filter(|x| x.bound >= floor).collect();
         best(hits.into_iter().chain(visit(&rest)).collect()).0
+    }
+
+    /// Several tokens: a hit has each in its own name or in a folder above
+    /// it, so the names the rarest token matches and the subtrees of folders
+    /// so named hold every hit. When those are few, they are all that gets
+    /// looked at: their names and folders are scored as they come up, not
+    /// all two million names up front. None if they are many.
+    fn driven(&self, q: &Query, pos: &[&Token], neg: &[&Token], lo: usize, hi: usize) -> Option<Vec<Hit>> {
+        let idx = &self.live.base;
+        let (counts, u) = (idx.class_counts(), idx.u as f64);
+        let est = |t: &Token| (0..CLASSES).filter(|&c| t.mask & (1 << c) != 0).fold(u, |e, c| e * counts[c] as f64 / u);
+        let t = (0..pos.len()).min_by(|&a, &b| est(pos[a]).total_cmp(&est(pos[b])))?;
+        if est(pos[t]) > DRIVEN_NAMES {
+            return None;
+        }
+        let tb = TokenBits::new(idx, pos[t]);
+        let space = char_bit(b' ').trailing_zeros() as usize;
+        let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
+        let (ne_off, ne, kind, en, parent) = (idx.name_ents_off(), idx.name_ents(), idx.kind(), idx.ent_name(), idx.parent());
+        // The names' entries, and the subtrees of those that are folders
+        // (from above `lo` too: the scope's own ancestors). Past SELECTIVE
+        // entries in all, give up early.
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let over = || seen.load(std::sync::atomic::Ordering::Relaxed) > SELECTIVE;
+        let spaced = |w: usize, i: u32| (space[0][w] | space[1][w]) >> i & 1 != 0;
+        let (mut ents, mut trees) = (0..idx.words.div_ceil(CHUNK_WORDS))
+            .into_par_iter()
+            .map(|c| {
+                let (mut ents, mut trees) = (Vec::new(), Vec::new());
+                for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.words) {
+                    if over() {
+                        break;
+                    }
+                    let (fits, clean, typo) = tb.word(w);
+                    let mut m = fits;
+                    while m != 0 {
+                        let i = m.trailing_zeros();
+                        m &= m - 1;
+                        let k = w * 64 + i as usize;
+                        let known = pos[t].known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced(w, i));
+                        if token_score(idx.uname(k as u32), known, pos[t]).is_none() {
+                            continue;
+                        }
+                        let mut n = 0;
+                        for &e in &ne[ne_off[k] as usize..ne_off[k + 1] as usize] {
+                            if (lo..hi).contains(&(e as usize)) {
+                                ents.push(e);
+                                n += 1;
+                            }
+                            if kind[e as usize] & 3 == KIND_DIR
+                                && let Some(d) = idx.dir_of(e)
+                            {
+                                let (a, b) = (idx.dir_start()[d as usize].max(lo as u32), idx.dir_end()[d as usize].min(hi as u32));
+                                if a < b {
+                                    trees.push((a, b));
+                                    n += (b - a) as usize;
+                                }
+                            }
+                        }
+                        seen.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                (ents, trees)
+            })
+            .reduce(
+                || (Vec::new(), Vec::new()),
+                |mut a, b| {
+                    a.0.extend(b.0);
+                    a.1.extend(b.1);
+                    a
+                },
+            );
+        if over() {
+            return None;
+        }
+        trees.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (a, b) in trees {
+            match merged.last_mut() {
+                Some(l) if a <= l.1 => l.1 = l.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        // In those subtrees, entries whose name has the token are in `ents`.
+        let first = ents.len();
+        if first + merged.iter().map(|&(a, b)| (b - a) as usize).sum::<usize>() > SELECTIVE {
+            return None;
+        }
+        ents.extend(merged.iter().flat_map(|&(a, b)| a..b));
+        let scan = Scan {
+            q,
+            live: self.live,
+            names: &NameTable::new(Vec::new(), Vec::new(), Vec::new(), 0, false),
+            npos: pos.len(),
+            need_dirs: true,
+            now: now_secs(),
+        };
+        Some(top_k(ents.len(), q.limit, ents.len(), |r, top| {
+            let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
+            let mut hits = HashMap::<u32, Option<NameHit>, crate::index::Fx>::default();
+            let re = q.name_re.clone();
+            let path_re = q.path_re.clone();
+            let mut hit = |k: u32| *hits.entry(k).or_insert_with(|| name_hit(idx, q, pos, neg, re.as_ref(), k));
+            for j in r {
+                let i = ents[j] as usize;
+                let Some(nh) = hit(en[i]).filter(|h| h.flags & NF_OK != 0 && (j < first || h.bits >> t & 1 == 0)) else { continue };
+                let m = scan.memo_of(parent[i], &mut memo, &mut hit);
+                if let Some(key) = scan.score(i, nh, m, top.floor, &mut pbuf, path_re.as_ref()) {
+                    top.push(key);
+                }
+            }
+        }))
     }
 
     /// The name table for this query: cached for a repeat of the last one
@@ -1197,7 +1349,7 @@ impl Searcher<'_> {
         out.resize(idx.d, DirMemo::default());
         out.par_iter_mut().enumerate().with_min_len(1 << 12).for_each(|(k, slot)| {
             if k > 0 {
-                *slot = DirMemo::own(names, en[de[k] as usize]);
+                *slot = DirMemo::own(names.get(en[de[k] as usize]));
             }
         });
         // Fold ancestors in, parents first. A dir's descendants are one
@@ -1352,7 +1504,7 @@ impl Scan<'_> {
                     if i < lo || i >= hi {
                         continue;
                     }
-                    let m = if self.need_dirs { self.memo_of(parent[i], &mut memo) } else { DirMemo::default() };
+                    let m = if self.need_dirs { self.memo_of(parent[i], &mut memo, &mut |k| self.names.get(k)) } else { DirMemo::default() };
                     if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf, re.as_ref()) {
                         top.push(k);
                     }
@@ -1362,7 +1514,7 @@ impl Scan<'_> {
     }
 
     /// The dir memo of `d` (see `dir_tokens`), from its ancestor chain.
-    fn memo_of(&self, d: u32, cache: &mut HashMap<u32, DirMemo, crate::index::Fx>) -> DirMemo {
+    fn memo_of(&self, d: u32, cache: &mut HashMap<u32, DirMemo, crate::index::Fx>, hit: &mut impl FnMut(u32) -> Option<NameHit>) -> DirMemo {
         let idx = &self.live.base;
         let (de, en, dp) = (idx.dir_entry(), idx.ent_name(), idx.dir_parent());
         let mut chain = Vec::new();
@@ -1378,7 +1530,7 @@ impl Scan<'_> {
             k = dp[k as usize];
         };
         for &k in chain.iter().rev() {
-            acc = DirMemo::own(self.names, en[de[k as usize] as usize]).under(acc);
+            acc = DirMemo::own(hit(en[de[k as usize] as usize])).under(acc);
             cache.insert(k, acc);
         }
         acc
@@ -1483,8 +1635,8 @@ pub struct DirMemo {
 impl DirMemo {
     /// A dir's own name's contribution.
     #[inline]
-    fn own(names: &NameTable, name: u32) -> DirMemo {
-        match names.get(name) {
+    fn own(hit: Option<NameHit>) -> DirMemo {
+        match hit {
             Some(h) if h.flags & NF_NEG != 0 => DirMemo { bits: u32::MAX, best: [0; 4] },
             Some(h) => DirMemo { bits: h.bits as u32, best: h.best },
             None => DirMemo::default(),
