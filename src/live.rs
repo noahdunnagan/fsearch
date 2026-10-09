@@ -440,6 +440,12 @@ pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     p
 }
 
+/// `dir` is `path` or a folder above it (not just a name prefix: `/a/b`
+/// is not above `/a/bc`).
+pub fn is_ancestor(dir: &[u8], path: &[u8]) -> bool {
+    path.starts_with(dir) && (dir.ends_with(b"/") || path.len() == dir.len() || path[dir.len()] == b'/')
+}
+
 pub fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(dir.len() + 1 + name.len());
     p.extend_from_slice(dir);
@@ -823,5 +829,14 @@ mod tests {
         seen.sort();
         assert_eq!(seen, [(b"/r/d".to_vec(), KIND_DIR), (b"/r/d/e".to_vec(), KIND_FILE)]);
         assert_eq!(stat_pool().current_num_threads(), 12);
+    }
+
+    #[test]
+    fn ancestors_end_at_a_component() {
+        assert!(is_ancestor(b"/Users", b"/Users/me"));
+        assert!(is_ancestor(b"/Users/me", b"/Users/me"));
+        assert!(is_ancestor(b"/", b"/Users/me"));
+        assert!(!is_ancestor(b"/Users/m", b"/Users/me"));
+        assert!(!is_ancestor(b"/Users/me/x", b"/Users/me"));
     }
 }

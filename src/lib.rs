@@ -12,5 +12,5 @@ pub mod query;
 pub mod walk;
 
 pub use content::{FileMatches, Grep, GrepResult};
-pub use engine::{Engine, Found, Options, Status, default_dir, gated, has_full_disk_access, no_materialize};
+pub use engine::{Engine, Found, Options, Status, default_dir, gated, has_full_disk_access, no_materialize, try_lock};
 pub use query::{GrepMode, Query};

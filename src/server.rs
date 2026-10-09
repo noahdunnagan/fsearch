@@ -2,7 +2,7 @@
 //! `fsearch stdio` and the CLI are thin clients.
 
 use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
-use fsearch::{Engine, GrepMode, Options, Query};
+use fsearch::{Engine, GrepMode, Options, Query, try_lock};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -39,10 +39,6 @@ pub fn serve(dir: PathBuf, home: String) {
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
     }
-}
-
-fn try_lock(f: &std::fs::File) -> bool {
-    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 /// Stop the daemon serving `dir`, if one is running, and wait until it has

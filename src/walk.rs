@@ -20,8 +20,9 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 /// Folders a scan was refused (EPERM): without Full Disk Access macOS also
 /// silently denies some, like ~/Library/Mail. Recorded only while paths are
-/// tracked, i.e. while SKIP is set.
-pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// tracked, i.e. while SKIP is set. A set: rescans refuse the same folders
+/// again.
+pub static DENIED: Mutex<std::collections::BTreeSet<Vec<u8>>> = Mutex::new(std::collections::BTreeSet::new());
 
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
@@ -135,12 +136,11 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
         let parent = me.clone();
         s.spawn(move |s| {
             let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            // Read errno before the drop: closing the parent may reset it.
+            let refused = fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             drop(parent);
-            if fd < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                && let Some(p) = &child_path
-            {
-                DENIED.lock().unwrap().push(p.clone());
+            if refused && let Some(p) = &child_path {
+                DENIED.lock().unwrap().insert(p.clone());
             }
             finish_dir(s, fd, child_path, cid, ctx);
         });

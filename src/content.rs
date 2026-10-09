@@ -898,7 +898,7 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
         if in_scope(d, home) {
             out.push((d.clone(), r));
-        } else if r && home.starts_with(d) && (d.ends_with(b"/") || home.get(d.len()) == Some(&b'/')) {
+        } else if r && crate::live::is_ancestor(d, home) {
             // A subtree containing home (e.g. "/" rescanned): sync all of home.
             out.push((home.to_vec(), true));
         }
