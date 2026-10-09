@@ -1257,13 +1257,15 @@ impl Grep {
             GrepMode::Symbol => format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?{}(?-u:\b)", regex::escape(pattern)),
         };
         let case_insensitive = smart_ci && mode != GrepMode::Symbol;
-        let literal = (mode == GrepMode::Literal && pattern.is_ascii() && (1..=4096).contains(&pattern.len())).then(|| {
-            if case_insensitive {
-                Literal::folded(pattern.as_bytes())
-            } else {
-                Literal::Exact(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned())
-            }
-        });
+        let short = (1..=4096).contains(&pattern.len());
+        let literal = match mode {
+            GrepMode::Symbol if short => Some(Literal::Definition(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned())),
+            GrepMode::Literal if short && pattern.is_ascii() => Some(match case_insensitive {
+                true => Literal::folded(pattern.as_bytes()),
+                false => Literal::Exact(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned()),
+            }),
+            _ => None,
+        };
         let g = Grep {
             pattern: pattern.to_string(),
             mode,
@@ -1456,7 +1458,14 @@ fn lines_at(g: &Grep, buf: &[u8], starts: impl Iterator<Item = usize>) -> Vec<(u
 /// one of those goes to the regex.
 enum Literal {
     Exact(memchr::memmem::Finder<'static>),
-    Folded { needle: Vec<u8>, pair: (usize, usize), odd: Vec<memchr::memmem::Finder<'static>> },
+    /// A `sym:` name: as a whole word after a declaring keyword on its line
+    /// (the definition regex, with its keyword part compiled once).
+    Definition(memchr::memmem::Finder<'static>),
+    Folded {
+        needle: Vec<u8>,
+        pair: (usize, usize),
+        odd: Vec<memchr::memmem::Finder<'static>>,
+    },
 }
 
 impl Literal {
@@ -1481,22 +1490,44 @@ impl Literal {
         matches!(self, Literal::Folded { odd, .. } if odd.iter().any(|f| f.find(hay).is_some()))
     }
 
-    /// Where its matches start, left to right, not overlapping.
+    /// Where its matches start, left to right.
     fn starts<'a>(&'a self, hay: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
         let len = match self {
-            Literal::Exact(f) => f.needle().len(),
+            Literal::Exact(f) | Literal::Definition(f) => f.needle().len(),
             Literal::Folded { needle, .. } => needle.len(),
         };
         let mut at = 0;
         std::iter::from_fn(move || {
-            let p = match self {
-                Literal::Exact(f) => f.find(hay.get(at..)?).map(|p| at + p),
-                Literal::Folded { needle, pair, .. } => find_folded(hay, at, needle, *pair),
-            }?;
-            at = p + len;
-            Some(p)
+            loop {
+                let p = match self {
+                    Literal::Exact(f) | Literal::Definition(f) => f.find(hay.get(at..)?).map(|p| at + p),
+                    Literal::Folded { needle, pair, .. } => find_folded(hay, at, needle, *pair),
+                }?;
+                if !matches!(self, Literal::Definition(_)) {
+                    at = p + len;
+                    return Some(p);
+                }
+                at = p + 1;
+                if defined_at(hay, p, len) {
+                    return Some(p);
+                }
+            }
         })
     }
+}
+
+/// Is the name at `hay[p..p + len]` defined there: an ASCII word boundary
+/// after it, and before it on its line a declaring keyword, maybe generics,
+/// spaces or `*&`, maybe `mut` (what `sym:`'s regex asks, split at the name)?
+fn defined_at(hay: &[u8], p: usize, len: usize) -> bool {
+    static KEYWORD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let word = |b: Option<&u8>| b.is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_');
+    if word(hay[..p + len].last()) == word(hay.get(p + len)) {
+        return false;
+    }
+    let re = KEYWORD.get_or_init(|| Regex::new(&format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?\z")).unwrap());
+    let line = memchr::memrchr(b'\n', &hay[..p]).map_or(0, |i| i + 1);
+    re.is_match(&hay[line..p])
 }
 
 /// The first place at or after `from` where `hay` holds `needle` (lower
