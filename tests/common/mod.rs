@@ -15,6 +15,13 @@ pub fn root() -> &'static Path {
         assert!(r.starts_with(std::env::temp_dir()) && r != std::env::temp_dir());
         let _ = std::fs::remove_dir_all(&r);
         std::fs::create_dir_all(&r).unwrap();
+        // Statics are never dropped: remove the folder when the process exits.
+        extern "C" fn clean() {
+            if let Some(r) = ROOT.get() {
+                let _ = std::fs::remove_dir_all(r);
+            }
+        }
+        unsafe { libc::atexit(clean) };
         // Set once, before any engine (or other env reader) runs.
         unsafe { std::env::set_var("FSEARCH_ROOT", &r) };
         r

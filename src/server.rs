@@ -261,6 +261,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&r);
             std::fs::create_dir_all(&r).unwrap();
             unsafe { std::env::set_var("FSEARCH_ROOT", &r) };
+            // Statics are never dropped: remove the folder when the process exits.
+            extern "C" fn clean() {
+                if let Some(r) = ROOT.get() {
+                    let _ = std::fs::remove_dir_all(r);
+                }
+            }
+            unsafe { libc::atexit(clean) };
             std::fs::canonicalize(r).unwrap()
         })
     }
