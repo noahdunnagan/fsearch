@@ -1217,6 +1217,12 @@ fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path
                 hits.lock().unwrap().push((i, m));
             }
         }
+        // Don't sit on a big file's worth of buffer between searches.
+        READ_BUF.with_borrow_mut(|b| {
+            if b.capacity() > 256 << 10 {
+                *b = Vec::new();
+            }
+        });
     });
     let mut hits = hits.into_inner().unwrap();
     hits.sort_unstable_by_key(|h| h.0);
@@ -1228,7 +1234,8 @@ fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path
 
 thread_local! {
     /// One read buffer per read-pool thread: a fresh ~1 MB Vec per file
-    /// costs page faults and an munmap every time.
+    /// costs page faults and an munmap every time. Kept only while a search
+    /// runs if it grew past 256 KB.
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
