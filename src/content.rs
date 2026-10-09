@@ -872,6 +872,11 @@ impl Content {
                 s.save_dead(&self.dir);
             }
         }
+        let empty: Vec<u64> = self.segs.iter().filter(|s| s.live_docs == 0).map(|s| s.id).collect();
+        if !empty.is_empty() {
+            self.drop_segments(&empty);
+            self.save_manifest();
+        }
         todo.sort();
         todo
     }
@@ -911,7 +916,12 @@ impl Content {
     /// Tiered merging: 8 segments of the same size tier become one, so
     /// incremental updates never pile up thousands of tiny segments. Returns
     /// the group to merge (ids), capped so a merge's postings stay small.
+    /// First, a segment whose docs were mostly replaced is rewritten alone:
+    /// every query decodes the postings of its dead docs too.
     pub fn merge_plan(&self) -> Option<Vec<u64>> {
+        if let Some(s) = self.segs.iter().find(|s| s.live_docs > 0 && s.live_docs * 2 < s.ndocs) {
+            return Some(vec![s.id]);
+        }
         let tier = |s: &Segment| (s.plen.max(1) as f64).log(4.0) as u32;
         let mut by_tier: HashMap<u32, Vec<&Segment>> = HashMap::new();
         for s in &self.segs {
@@ -933,16 +943,23 @@ impl Content {
         self.segs.iter().filter(|s| ids.contains(&s.id)).collect()
     }
 
-    /// Swap merged segments for their replacement. Only the content worker
-    /// writes, so nothing was tombstoned while the merge ran.
+    /// Swap merged segments for their replacement, where the first of them
+    /// was (a rewritten segment keeps its place in the ranking's tie order).
+    /// Only the content worker writes, so nothing was tombstoned while the
+    /// merge ran.
     pub fn replace(&mut self, ids: &[u64], seg: Segment) {
+        let at = self.segs.iter().position(|s| ids.contains(&s.id)).unwrap_or(self.segs.len());
+        self.drop_segments(ids);
+        self.segs.insert(at, seg);
+        self.save_manifest();
+    }
+
+    fn drop_segments(&mut self, ids: &[u64]) {
         self.segs.retain(|s| !ids.contains(&s.id));
         for id in ids {
             let _ = std::fs::remove_file(seg_path(&self.dir, *id));
             let _ = std::fs::remove_file(dead_path(&self.dir, *id));
         }
-        self.segs.push(seg);
-        self.save_manifest();
     }
 
     /// Candidate docs for a pattern, filtered by the name query: one list
