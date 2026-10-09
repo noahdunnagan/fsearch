@@ -2,7 +2,7 @@
 
 use crate::index::{char_bit, start_bit};
 use crate::live::Live;
-use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
+use crate::walk::{FLAG_HIDDEN, FLAG_SYNTH, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -678,11 +678,15 @@ pub struct Searcher<'a> {
 }
 
 impl Searcher<'_> {
-    /// Entry range to scan, from the `in:` scope.
+    /// Entry range to scan, from the `in:` scope. A graft prefix above home
+    /// was never listed, so it scopes to nothing (home itself is unflagged).
     pub fn scope_range(&self, q: &Query) -> Option<(usize, usize)> {
         let idx = &self.live.base;
         let Some(scope) = &q.scope else { return Some((1, idx.n)) };
         let e = idx.lookup(scope)?;
+        if idx.kind()[e as usize] & FLAG_SYNTH != 0 {
+            return None;
+        }
         let d = idx.dir_of(e)? as usize;
         Some((idx.dir_start()[d] as usize, idx.dir_end()[d] as usize))
     }
@@ -872,12 +876,14 @@ impl Searcher<'_> {
         let idx = &self.live.base;
         let de = idx.dir_entry();
         let en = idx.ent_name();
+        let kd = idx.kind();
         let mut out = MEMO_POOL.lock().unwrap().pop().unwrap_or_default();
         out.clear();
         out.resize(idx.d, DirMemo::default());
         out.par_iter_mut().enumerate().with_min_len(1 << 12).for_each(|(k, slot)| {
             if k > 0 {
-                *slot = DirMemo::own(names, en[de[k] as usize]);
+                // Graft prefixes above home lend no folder matches.
+                *slot = if kd[de[k] as usize] & FLAG_SYNTH != 0 { DirMemo::default() } else { DirMemo::own(names, en[de[k] as usize]) };
             }
         });
         // Fold ancestors in, parents first. A dir's descendants are one
@@ -932,6 +938,10 @@ impl Scan<'_> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind()[i];
+        // Graft prefixes above home were never scanned.
+        if k & FLAG_SYNTH != 0 {
+            return None;
+        }
         if !q.kind_ok(k) {
             return None;
         }
@@ -1018,7 +1028,7 @@ impl Scan<'_> {
     /// The dir memo of `d` (see `dir_tokens`), from its ancestor chain.
     fn memo_of(&self, d: u32, cache: &mut HashMap<u32, DirMemo, crate::index::Fx>) -> DirMemo {
         let idx = &self.live.base;
-        let (de, en, dp) = (idx.dir_entry(), idx.ent_name(), idx.dir_parent());
+        let (de, en, dp, kd) = (idx.dir_entry(), idx.ent_name(), idx.dir_parent(), idx.kind());
         let mut chain = Vec::new();
         let mut k = d;
         let mut acc = loop {
@@ -1032,7 +1042,13 @@ impl Scan<'_> {
             k = dp[k as usize];
         };
         for &k in chain.iter().rev() {
-            acc = DirMemo::own(self.names, en[de[k as usize] as usize]).under(acc);
+            // Graft prefixes above home lend no folder matches.
+            let own = if kd[de[k as usize] as usize] & FLAG_SYNTH != 0 {
+                DirMemo::default()
+            } else {
+                DirMemo::own(self.names, en[de[k as usize] as usize])
+            };
+            acc = own.under(acc);
             cache.insert(k, acc);
         }
         acc

@@ -36,6 +36,9 @@ pub const KIND_OTHER: u8 = 3;
 pub const FLAG_HIDDEN: u8 = 1 << 2;
 /// Directory that is a mount point we did not descend into.
 pub const FLAG_MOUNT: u8 = 1 << 3;
+/// Graft prefix above the scan root (Linux home-only index). Never set on
+/// macOS: only `graft_home_prefix` sets it, which is Linux-only.
+pub const FLAG_SYNTH: u8 = 1 << 4;
 
 #[derive(Clone, Copy)]
 pub struct RawEnt {
@@ -225,10 +228,13 @@ pub fn graft_home_prefix(mut ls: Vec<Listing>, root: &[u8]) -> Vec<Listing> {
     let mut out = Vec::with_capacity(ls.len() + comps.len());
     for (i, comp) in comps.iter().enumerate() {
         let child = if i + 1 < comps.len() { i as u32 + 1 } else { k };
+        // Ancestors above home were never listed; flag them so searches skip
+        // them. Home itself stays plain: it is the real scan root.
+        let kind = if i + 1 < comps.len() { KIND_DIR | FLAG_SYNTH } else { KIND_DIR };
         out.push(Listing {
             id: i as u32,
             names: comp.to_vec(),
-            ents: vec![RawEnt { name_off: 0, name_len: comp.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child }],
+            ents: vec![RawEnt { name_off: 0, name_len: comp.len() as u16, kind, size: 0, mtime: 0, child }],
         });
     }
     out.extend(ls);
@@ -441,5 +447,15 @@ mod tests {
         let out = graft_home_prefix(scan, b"/");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, 0);
+    }
+
+    #[test]
+    fn graft_flags_prefix_not_home() {
+        let scan = vec![listing(0, &[(b"proj", KIND_DIR, NONE)])];
+        let out = graft_home_prefix(scan, b"/tmp/h/h1");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].ents[0].kind & FLAG_SYNTH, FLAG_SYNTH);
+        assert_eq!(out[1].ents[0].kind & FLAG_SYNTH, FLAG_SYNTH);
+        assert_eq!(out[2].ents[0].kind & FLAG_SYNTH, 0);
     }
 }
