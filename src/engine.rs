@@ -148,6 +148,8 @@ impl Engine {
     /// Start indexing in the background and return at once; searches answer
     /// `Err` until the index is loaded (or, on the very first run, built).
     pub fn start(opts: Options) -> Result<Engine, String> {
+        // First: a bad root fails before anything process-wide changes.
+        let root = scan_root()?;
         std::fs::create_dir_all(&opts.dir).map_err(|e| e.to_string())?;
         // One writer per index: a second one would race index writes. The
         // lock dies with the process.
@@ -175,7 +177,7 @@ impl Engine {
             content: RwLock::new(content),
             home: opts.home,
             dir,
-            root: scan_root()?,
+            root,
             wake: tx,
             save_requested: AtomicBool::new(false),
             content_tx: ctx,
