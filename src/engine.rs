@@ -9,7 +9,7 @@ use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
 use crate::walk;
 use std::collections::HashMap;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -79,6 +79,8 @@ struct Shared {
     content: RwLock<Content>,
     home: String,
     dir: PathBuf,
+    /// What is indexed and watched: `/`, or `FSEARCH_ROOT`.
+    root: Vec<u8>,
     /// Wakes the apply loop; an empty batch is a no-op wake-up.
     wake: Sender<Vec<fsevents::Event>>,
     save_requested: AtomicBool,
@@ -161,7 +163,9 @@ impl Engine {
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
         }
-        let dir = opts.dir;
+        // FSEvents reports real paths; a follower spots the owner's writes
+        // by prefix (a temp dir under /var is really under /private/var).
+        let dir = std::fs::canonicalize(&opts.dir).unwrap_or(opts.dir);
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
         let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
@@ -170,6 +174,7 @@ impl Engine {
             content: RwLock::new(content),
             home: opts.home,
             dir,
+            root: scan_root(),
             wake: tx,
             save_requested: AtomicBool::new(false),
             content_tx: ctx,
@@ -202,15 +207,22 @@ impl Engine {
                     b
                 }
                 None if owner => full_build(&s, since),
-                None => {
-                    // The owner is building it; follow once it exists.
-                    let b = wait_for_index(&s.dir);
-                    s.watch(b.event_id);
-                    b
-                }
+                None => match wait_for_index(&s) {
+                    // The owner built it; follow.
+                    Some(b) => {
+                        s.watch(b.event_id);
+                        b
+                    }
+                    // The owner quit before saving one: build it here.
+                    None => {
+                        let since = unsafe { fsevents::FSEventsGetCurrentEventId() };
+                        s.watch(since);
+                        full_build(&s, since)
+                    }
+                },
             };
             *s.live.write().unwrap() = Some(Live::new(base));
-            if owner {
+            if s.owner() {
                 rescan_unskipped(&s);
                 start_content(&s);
             }
@@ -308,7 +320,7 @@ impl Shared {
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
     fn watch(&self, since: u64) {
         self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(since, 0.1, self.wake.clone());
+        let new = fsevents::watch(&self.root, since, 0.1, self.wake.clone());
         *self.stream.lock().unwrap() = Some(new);
     }
 
@@ -366,7 +378,9 @@ const SKIPPED: &str = "skipped";
 
 fn note_skipped(dir: &Path) {
     let mut out = Vec::new();
-    for p in walk::SKIP.get().into_iter().flatten().chain(walk::DENIED.lock().unwrap().iter()) {
+    // DENIED repeats a folder refused again (at startup, on a rescan).
+    let denied = walk::DENIED.lock().unwrap().iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    for p in walk::SKIP.get().into_iter().flatten().chain(denied.iter()) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
@@ -405,10 +419,16 @@ fn rescan_unskipped(shared: &Shared) {
     shared.save_requested.store(true, Ordering::Relaxed);
 }
 
-fn wait_for_index(dir: &Path) -> Index {
+/// The owner's first index, or None once this engine has become the owner.
+fn wait_for_index(s: &Shared) -> Option<Index> {
     loop {
-        if let Some(b) = Index::load(&dir.join("index.bin")) {
-            return b;
+        if let Some(b) = Index::load(&s.dir.join("index.bin")) {
+            return Some(b);
+        }
+        if try_lock(&s.lock) {
+            s.owner.store(true, Ordering::Relaxed);
+            *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+            return None;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -429,6 +449,12 @@ pub fn gated(home: &str) -> Vec<Vec<u8>> {
 /// trying without it fails immediately (no prompt).
 pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+}
+
+/// A change the content index follows: inside home, or a rescanned
+/// folder that holds home.
+fn concerns_home(path: &[u8], tree: bool, home: &[u8]) -> bool {
+    content::in_scope(path, home) || (tree && home.starts_with(path) && (path.ends_with(b"/") || home.get(path.len()) == Some(&b'/')))
 }
 
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
@@ -457,7 +483,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
                 for (d, t) in std::iter::once(first).chain(rx.try_iter()) {
                     for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
                         // Most of the disk's churn (Library, caches) is outside the indexed area.
-                        if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
+                        if concerns_home(&key.0, key.1, &home) {
                             pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                         }
                     }
@@ -530,7 +556,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
 fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
-    let ls = walk::scan(b"/", SCAN_THREADS);
+    let ls = scan_from(&shared.root);
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
@@ -542,6 +568,40 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     // Re-map from the file so the index is clean, evictable page cache
     // rather than anonymous memory.
     Index::load(&path).unwrap_or(idx)
+}
+
+/// The whole disk, unless `FSEARCH_ROOT` names a folder to index instead
+/// (tests: a temp folder rather than `/`).
+fn scan_root() -> Vec<u8> {
+    match std::env::var_os("FSEARCH_ROOT") {
+        Some(r) => std::fs::canonicalize(&r).map_or(r, |c| c.into_os_string()).into_vec(),
+        None => b"/".to_vec(),
+    }
+}
+
+/// Scan from `root`. Below `/`, the folders above it are listed with that
+/// one child each, so index paths stay absolute, as FSEvents reports them.
+fn scan_from(root: &[u8]) -> Vec<walk::Listing> {
+    let mut ls = walk::scan(root, SCAN_THREADS);
+    let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    let k = comps.len() as u32;
+    if k == 0 {
+        return ls;
+    }
+    for l in &mut ls {
+        l.id += k;
+        for e in l.ents.iter_mut().filter(|e| e.child != walk::NONE) {
+            e.child += k;
+        }
+    }
+    let mut path = Vec::new();
+    for (i, c) in (0..).zip(comps) {
+        path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
+        let mtime = crate::live::lstat(&path).map_or(0, |o| o.mtime);
+        let ent = walk::RawEnt { name_off: 0, name_len: c.len() as u16, kind: walk::KIND_DIR, size: 0, mtime, child: i + 1 };
+        ls.push(walk::Listing { id: i, names: c.to_vec(), ents: vec![ent] });
+    }
+    ls
 }
 
 unsafe extern "C" {
@@ -705,4 +765,87 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
 /// Default data dir: `~/Library/Application Support/FSearch`.
 pub fn default_dir(home: &str) -> PathBuf {
     Path::new(home).join("Library/Application Support/FSearch")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Index a temp folder, never `/`.
+    fn root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let r = std::env::temp_dir().join(format!("fsearch-unit-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&r);
+            std::fs::create_dir_all(r.join("home")).unwrap();
+            unsafe { std::env::set_var("FSEARCH_ROOT", &r) };
+            std::fs::canonicalize(r).unwrap()
+        })
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn synced_at(e: &Engine) -> u32 {
+        e.s.live.read().unwrap().as_ref().unwrap().synced_at
+    }
+
+    /// FSEvents losing track of `/` relists only the folders changed since
+    /// the last known-good moment.
+    #[test]
+    fn lost_history_relists_changed_folders() {
+        let r = root();
+        let fut = r.join("future");
+        std::fs::create_dir_all(&fut).unwrap();
+        let later = crate::query::now_secs() + 100_000;
+        let c = std::ffi::CString::new(fut.as_os_str().as_bytes()).unwrap();
+        let tv = [libc::timeval { tv_sec: later as i64, tv_usec: 0 }; 2];
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+        let home = r.join("home").to_string_lossy().into_owned();
+        let e = Engine::start(Options { dir: r.join("data"), home, skip: Some(vec![]) }).unwrap();
+        wait_for("the index", || e.status().ready);
+        wait_for("the replay", || !e.s.replaying.load(Ordering::Relaxed));
+        std::thread::sleep(Duration::from_millis(500));
+        for flags in [KERNEL_DROPPED, USER_DROPPED, 0] {
+            // Pretend we were in sync until well past now, so only `future`
+            // counts as changed.
+            {
+                let mut g = e.s.live.write().unwrap();
+                g.as_mut().unwrap().synced_at = later - 10;
+                let ev = fsevents::Event { path: b"/".to_vec(), flags: MUST_SCAN_SUBDIRS | flags, id: 0 };
+                e.s.wake.send(vec![ev]).unwrap();
+            }
+            wait_for("a relist", || synced_at(&e) <= crate::query::now_secs());
+        }
+    }
+
+    #[test]
+    fn content_follows_home_and_its_ancestors() {
+        let home = b"/Users/me";
+        assert!(concerns_home(b"/Users/me/src", false, home));
+        assert!(concerns_home(b"/Users", true, home));
+        assert!(concerns_home(b"/", true, home));
+        assert!(!concerns_home(b"/Users", false, home));
+        // Not an ancestor, just a name prefix.
+        assert!(!concerns_home(b"/Users/m", true, home));
+    }
+
+    /// Folders refused more than once (a scan, then the startup check) are
+    /// written once.
+    #[test]
+    fn skipped_lists_each_folder_once() {
+        let dir = root().join("skipped-once");
+        std::fs::create_dir_all(&dir).unwrap();
+        walk::DENIED.lock().unwrap().extend([b"/x/a".to_vec(), b"/x/b".to_vec(), b"/x/a".to_vec()]);
+        note_skipped(&dir);
+        walk::DENIED.lock().unwrap().clear();
+        assert_eq!(std::fs::read(dir.join(SKIPPED)).unwrap(), b"/x/a\n/x/b\n");
+        // Unwritable: logged, not fatal.
+        note_skipped(&dir.join("missing"));
+    }
 }

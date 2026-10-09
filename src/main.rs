@@ -239,3 +239,65 @@ fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn check(p: *mut u8, n: usize, fill: u8) {
+        assert!(!p.is_null());
+        for i in [0, n / 2, n - 1] {
+            assert_eq!(unsafe { *p.add(i) }, fill, "byte {i} of {n}");
+        }
+    }
+
+    /// Blocks on either side of the mmap threshold, and moves across it.
+    #[test]
+    fn alloc_round_trips() {
+        let a = Alloc;
+        for (from, to) in [(100, 200), (100, BIG + 5), (BIG + 5, 100), (BIG, 3 * BIG), (3 * BIG, BIG + 1), (BIG - 1, BIG)] {
+            let l = Layout::from_size_align(from, 16).unwrap();
+            unsafe {
+                let p = a.alloc(l);
+                std::ptr::write_bytes(p, 0xab, from);
+                let q = a.realloc(p, l, to);
+                check(q, from.min(to), 0xab);
+                std::ptr::write_bytes(q, 0xcd, to);
+                a.dealloc(q, Layout::from_size_align(to, 16).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_zeroed_and_aligned() {
+        let a = Alloc;
+        for (size, align) in [(64, 8), (BIG, 8), (BIG * 2, 4096), (BIG, 16384), (BIG, 1 << 16), (100, 1 << 16)] {
+            let l = Layout::from_size_align(size, align).unwrap();
+            unsafe {
+                let p = a.alloc_zeroed(l);
+                assert_eq!(p as usize % align, 0, "{size} aligned to {align}");
+                check(p, size, 0);
+                // Big, over-aligned blocks stay with the system allocator,
+                // also when resized.
+                std::ptr::write_bytes(p, 1, size);
+                let q = a.realloc(p, l, size * 2);
+                assert_eq!(q as usize % align, 0);
+                check(q, size, 1);
+                a.dealloc(q, Layout::from_size_align(size * 2, align).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn huge_alloc_fails_cleanly() {
+        let l = Layout::from_size_align(1 << 62, 8).unwrap();
+        unsafe {
+            assert!(Alloc.alloc(l).is_null());
+            let small = Layout::from_size_align(BIG, 8).unwrap();
+            let p = Alloc.alloc(small);
+            // A failed grow leaves the old block alone.
+            assert!(Alloc.realloc(p, small, 1 << 62).is_null());
+            Alloc.dealloc(p, small);
+        }
+    }
+}

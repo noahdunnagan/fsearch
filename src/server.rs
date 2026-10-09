@@ -57,7 +57,8 @@ pub fn stop(dir: &Path) -> Result<(), String> {
             return Ok(());
         }
         if killed.is_none() {
-            killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+            killed =
+                std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1 && p as u32 != std::process::id());
             if let Some(pid) = killed {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
@@ -122,6 +123,10 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
         }
         "search" => {
             let q = parse_request(v, engine.home())?;
+            // A pattern given as its own field (`"grep": "TODO"`).
+            if q.grep.is_some() {
+                return grep(v, engine);
+            }
             let t = Instant::now();
             let found = engine.search(&q)?;
             let took = t.elapsed().as_micros() as u64;
@@ -240,4 +245,261 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
         }
     }
     UnixStream::connect(&sock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Engines here index this temp folder, never `/`.
+    fn root() -> &'static Path {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let r = std::env::temp_dir().join(format!("fss-{}", std::process::id()));
+            assert!(r.parent().is_some_and(|p| p != Path::new("/")));
+            let _ = std::fs::remove_dir_all(&r);
+            std::fs::create_dir_all(&r).unwrap();
+            unsafe { std::env::set_var("FSEARCH_ROOT", &r) };
+            std::fs::canonicalize(r).unwrap()
+        })
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// One engine over a small tree, shared by the request tests.
+    fn engine() -> &'static Engine {
+        static E: OnceLock<Engine> = OnceLock::new();
+        E.get_or_init(|| {
+            let r = root();
+            let home = r.join("home");
+            std::fs::create_dir_all(home.join("proj")).unwrap();
+            std::fs::write(home.join("proj/walrus.txt"), "fn walrus() {}\nthe walrus needle\n").unwrap();
+            std::fs::create_dir_all(r.join("out")).unwrap();
+            std::fs::write(r.join("out/walrus_out.txt"), "outside needle\n").unwrap();
+            std::os::unix::fs::symlink("walrus.txt", home.join("proj/walrus_link")).unwrap();
+            let fifo = std::ffi::CString::new(home.join("proj/walrus_fifo").as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            let e = Engine::start(Options { dir: r.join("data"), home: home.to_string_lossy().into(), skip: Some(vec![]) }).unwrap();
+            wait_for("the index", || e.status().ready);
+            wait_for("content indexing", || e.status().content_docs > 0 && e.status().content_pending == 0);
+            e
+        })
+    }
+
+    fn ask(req: Value) -> Value {
+        respond(&req.to_string(), engine())
+    }
+
+    fn err(req: Value) -> String {
+        let v = ask(req);
+        assert_eq!(v["ok"], false, "{v}");
+        v["error"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn requests() {
+        assert!(respond("{nope", engine())["error"].as_str().unwrap().starts_with("bad json"));
+        assert_eq!(ask(json!({"op": "ping", "id": 7})), json!({"ok": true, "id": 7}));
+        // The id comes back whatever its type, also on errors.
+        assert_eq!(ask(json!({"op": "nope", "id": {"a": [1]}}))["id"], json!({"a": [1]}));
+        assert_eq!(err(json!({"op": "nope"})), "unknown op nope");
+        assert_eq!(ask(json!({"op": "ping"}))["id"], Value::Null);
+        assert_eq!(ask(json!({"op": "save"}))["scheduled"], true);
+        let st = ask(json!({"op": "status"}));
+        assert!(st["ok"] == true && st["entries"].as_u64().unwrap() > 0 && st["owner"] == true, "{st}");
+
+        // Name search; filters may be JSON fields too.
+        let v = ask(json!({"q": "walrus", "id": "a"}));
+        assert_eq!(v["id"], "a");
+        let kinds: Vec<(&str, &str)> = v["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| (h["path"].as_str().unwrap().rsplit('/').next().unwrap(), h["kind"].as_str().unwrap()))
+            .collect();
+        for k in [("walrus.txt", "file"), ("walrus_link", "link"), ("walrus_fifo", "other"), ("walrus_out.txt", "file")] {
+            assert!(kinds.contains(&k), "{kinds:?}");
+        }
+        let v = ask(json!({"q": "walrus", "kind": "link", "limit": 5}));
+        assert_eq!(v["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(ask(json!({"q": "proj", "kind": "dir"}))["hits"][0]["kind"], "dir");
+        assert_eq!(ask(json!({"q": "walrus", "limit": 0}))["hits"], json!([]));
+        assert_eq!(err(json!({"q": "walrus", "limit": "3"})), "limit must be a number");
+        assert_eq!(err(json!({"q": "walrus", "kind": "nope"})), "unknown kind nope");
+        assert!(err(json!({"q": "re:("})).contains("regex"));
+        // Non-string filter values are used as their JSON text.
+        assert_eq!(ask(json!({"q": "walrus", "ext": 7}))["hits"], json!([]));
+        // Not an object: an empty search.
+        assert_eq!(ask(json!([1, 2]))["ok"], true);
+    }
+
+    /// A follower still waiting for its owner's first index.
+    #[test]
+    fn status_before_ready() {
+        let dir = root().join("unready");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::fs::File::create(dir.join("daemon.lock")).unwrap();
+        assert!(try_lock(&f));
+        let home = root().join("home").to_string_lossy().into_owned();
+        let e = Engine::start(Options { dir, home, skip: Some(vec![]) }).unwrap();
+        let v = respond(r#"{"op":"status"}"#, &e);
+        assert!(v["error"].as_str().unwrap().starts_with("indexing"), "{v}");
+        assert!(respond(r#"{"q":"x"}"#, &e)["error"].as_str().unwrap().starts_with("indexing"));
+    }
+
+    #[test]
+    fn huge_limit() {
+        let v = ask(json!({"q": "walrus", "limit": u64::MAX}));
+        assert_eq!(v["ok"], true, "{v}");
+    }
+
+    #[test]
+    fn grep_requests() {
+        let files = |v: &Value| -> Vec<String> {
+            assert_eq!(v["ok"], true, "{v}");
+            v["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect()
+        };
+        let v = ask(json!({"op": "grep", "pattern": "needle"}));
+        assert_eq!((v["source"].as_str(), files(&v)), (Some("index"), vec!["walrus.txt".to_string()]));
+        assert_eq!(v["files"][0]["matches"][0], json!({"line": 2, "text": "the walrus needle"}));
+        assert_eq!(files(&ask(json!({"op": "grep", "pattern": "need.e", "mode": "regex"}))), ["walrus.txt"]);
+        assert_eq!(files(&ask(json!({"op": "grep", "pattern": "walrus", "mode": "symbol"}))), ["walrus.txt"]);
+        assert_eq!(files(&ask(json!({"op": "grep", "pattern": "need.e", "mode": "literal"}))), Vec::<String>::new());
+        assert_eq!(err(json!({"op": "grep", "pattern": "x", "mode": "fuzzy"})), "unknown mode fuzzy");
+        assert_eq!(err(json!({"op": "grep"})), "grep needs a pattern");
+        assert!(err(json!({"op": "grep", "pattern": "(", "mode": "regex"})).contains("regex"));
+        // From the query language, in a search.
+        assert_eq!(files(&ask(json!({"q": "grep:needle"}))), ["walrus.txt"]);
+        assert_eq!(files(&ask(json!({"q": "regex:ne+dle", "per_file": 1, "budget_ms": 0}))), ["walrus.txt"]);
+        // Outside home: a scan of the files the name index picks.
+        let out = root().join("out");
+        let v = ask(json!({"op": "grep", "pattern": "needle", "in": out.to_str().unwrap(), "budget_ms": 5000}));
+        assert_eq!((v["source"].as_str(), files(&v)), (Some("scan"), vec!["walrus_out.txt".to_string()]));
+    }
+
+    /// Every filter key may be a JSON field, `grep` included: a search
+    /// that names a pattern is a content search.
+    #[test]
+    fn grep_as_a_json_field() {
+        let v = ask(json!({"q": "walrus", "grep": "needle"}));
+        assert_eq!(v["source"], "index", "{v}");
+        assert_eq!(v["files"][0]["matches"][0]["line"], 2);
+    }
+
+    #[test]
+    fn serves_a_socket() {
+        let dir = root().join("srv");
+        let home = root().join("home").to_string_lossy().into_owned();
+        {
+            let (dir, home) = (dir.clone(), home.clone());
+            std::thread::spawn(move || serve(dir, home));
+        }
+        wait_for("the socket", || UnixStream::connect(socket_path(&dir)).is_ok());
+        assert_eq!(std::fs::read_to_string(dir.join("socket.lock")).unwrap(), std::process::id().to_string());
+        // A second daemon on the same dir gives way, leaving the pid alone.
+        serve(dir.clone(), home);
+        assert_eq!(std::fs::read_to_string(dir.join("socket.lock")).unwrap(), std::process::id().to_string());
+
+        let s = connect(&dir).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        write!(w, "\n  \n{}\n{}\n", json!({"op": "ping", "id": 1}), json!({"op": "status", "id": 2})).unwrap();
+        r.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"ok": true, "id": 1}));
+        line.clear();
+        r.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], 2);
+        // Not ready yet, or ready: either way an answer, not a hang.
+        assert!(v["ok"] == true || v["error"].as_str().unwrap().starts_with("indexing"), "{v}");
+        // Closing the write side ends the connection.
+        w.shutdown(std::net::Shutdown::Write).unwrap();
+        line.clear();
+        assert_eq!(r.read_line(&mut line).unwrap(), 0);
+        // Bad UTF-8 drops the connection.
+        let mut s = UnixStream::connect(socket_path(&dir)).unwrap();
+        s.write_all(b"\xff\xfe\n").unwrap();
+        line.clear();
+        assert_eq!(BufReader::new(s).read_line(&mut line).unwrap(), 0);
+    }
+
+    #[test]
+    fn serve_gives_up_without_a_usable_dir() {
+        let f = root().join("not-a-dir");
+        std::fs::write(&f, "").unwrap();
+        serve(f.join("x"), String::new());
+        // The engine can't take its lock file.
+        let d = root().join("bad-engine");
+        std::fs::create_dir_all(d.join("daemon.lock")).unwrap();
+        serve(d.clone(), String::new());
+        assert!(!socket_path(&d).exists());
+    }
+
+    /// Run alone by `holder`: lock `FSEARCH_TEST_HOLD` like a daemon, with
+    /// our pid in it, and wait to be killed.
+    #[test]
+    #[ignore]
+    fn lock_holder() {
+        let Some(p) = std::env::var_os("FSEARCH_TEST_HOLD") else { return };
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(p).unwrap();
+        assert!(try_lock(&f));
+        write!(f, "{}", std::process::id()).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    fn holder(lock: &Path) -> std::process::Child {
+        let c = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::tests::lock_holder", "--ignored", "--nocapture"])
+            .env("FSEARCH_TEST_HOLD", lock)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = c.id().to_string();
+        wait_for("the holder", || std::fs::read_to_string(lock).is_ok_and(|s| s == pid));
+        c
+    }
+
+    #[test]
+    fn stop_kills_the_lock_holder() {
+        let dir = root().join("stop1");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing there, or nothing holding it: nothing to do.
+        assert_eq!(stop(&dir), Ok(()));
+        std::fs::write(dir.join("socket.lock"), "1").unwrap();
+        assert_eq!(stop(&dir), Ok(()));
+
+        let mut c = holder(&dir.join("socket.lock"));
+        let t = Instant::now();
+        let r = stop(&dir);
+        let _ = c.kill();
+        assert_eq!(r, Ok(()));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// The lock's holder hasn't written its pid yet, and the file still
+    /// names a stale pid that is now ours: never signal ourselves.
+    #[test]
+    fn stop_never_signals_itself() {
+        let dir = root().join("stop2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock(&held));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(held);
+        });
+        assert_eq!(stop(&dir), Ok(()));
+    }
 }
