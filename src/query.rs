@@ -1,6 +1,6 @@
 //! Name search: parse a query, scan the index in parallel, rank, top-k.
 
-use crate::index::{BM_FIRST, BM_SECOND, BM_START, CLASSES, Index, char_bit, start_bit};
+use crate::index::{BM_FIRST, BM_SECOND, BM_START, CLASSES, Index, ZONE, Zone, char_bit, start_bit};
 use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
@@ -1300,20 +1300,39 @@ impl Scan<'_> {
     /// One sequential pass over every entry in `lo..hi`.
     fn full(&self, lo: usize, hi: usize, memo: Option<&[DirMemo]>) -> Vec<Hit> {
         let idx = &self.live.base;
-        let (ent_name, parent) = (idx.ent_name(), idx.parent());
+        let (ent_name, parent, zones) = (idx.ent_name(), idx.parent(), idx.zones());
         let dense = self.names.dense(idx);
-        top_k(hi - lo, self.q.limit, hi - lo, |r, top| {
-            let (mut pbuf, re) = (Vec::new(), self.q.path_re.clone());
-            for i in lo + r.start..lo + r.end {
-                let s = dense[ent_name[i] as usize];
-                if s.flags & NF_OK == 0 {
+        let q = self.q;
+        // Runs of entries none of which passes the size/mtime/kind filters
+        // are skipped whole.
+        let filtered = q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX);
+        let zone_ok = |z: &Zone| {
+            crate::index::dec_size(z.max_size) >= q.size.0
+                && z.max_mtime >= q.mtime.0
+                && z.min_mtime <= q.mtime.1
+                && q.kind.is_none_or(|k| z.kinds & (1 << k) != 0 || (q.apps && z.kinds & (1 << KIND_LINK) != 0))
+        };
+        top_k(hi - lo, q.limit, hi - lo, |r, top| {
+            let (mut pbuf, re) = (Vec::new(), q.path_re.clone());
+            let (mut a, b) = (lo + r.start, lo + r.end);
+            while a < b {
+                let end = ((a / ZONE + 1) * ZONE).min(b);
+                if filtered && !zone_ok(&zones[a / ZONE]) {
+                    a = end;
                     continue;
                 }
-                let nh = NameHit { score: s.score, bits: s.bits, flags: s.flags, best: [0; 4] };
-                let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
-                if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf, re.as_ref()) {
-                    top.push(k);
+                for i in a..end {
+                    let s = dense[ent_name[i] as usize];
+                    if s.flags & NF_OK == 0 {
+                        continue;
+                    }
+                    let nh = NameHit { score: s.score, bits: s.bits, flags: s.flags, best: [0; 4] };
+                    let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
+                    if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf, re.as_ref()) {
+                        top.push(k);
+                    }
                 }
+                a = end;
             }
         })
     }

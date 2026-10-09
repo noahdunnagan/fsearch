@@ -39,8 +39,9 @@ enum Sec {
     NameEntsOff,
     NameEnts,
     NamePrior,
+    Zones,
 }
-const NSEC: usize = 17;
+const NSEC: usize = 18;
 
 pub struct Index {
     map: Mmap,
@@ -53,6 +54,7 @@ pub struct Index {
     /// Words per name bitmap (64 names each), and all bitmaps' words.
     pub words: usize,
     bits_len: usize,
+    zones_len: usize,
     /// FSEvents id the index is current as of; replay starts here.
     pub event_id: u64,
     /// Wall-clock second the index is known complete as of (0: unknown).
@@ -113,6 +115,8 @@ impl Index {
     // Per distinct name, the highest location prior among the folders
     // holding it: bounds what any entry with the name can score.
     sec!(name_prior, Sec::NamePrior, i8, u);
+    // Per ZONE entries: what a filter on size, mtime or kind can skip.
+    sec!(zones, Sec::Zones, Zone, zones_len);
 
     /// Name bitmap `b` (see `BM_FIRST` and on): bit `k % 64` of word `k / 64`
     /// is set when name `k` has the property.
@@ -397,6 +401,7 @@ impl Index {
             name_prior[k as usize] = name_prior[k as usize].max(prior[parent[i] as usize]);
         }
         put(Sec::NamePrior, as_bytes(&name_prior));
+        put(Sec::Zones, as_bytes(&zones(&kind[..n], &enc, &mtime[..n])));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
@@ -416,6 +421,7 @@ impl Index {
             names_len,
             words,
             bits_len: words * NBITMAPS,
+            zones_len: n.div_ceil(ZONE),
             event_id: event_id as u64,
             synced_at: synced_at as u32,
             off,
@@ -505,7 +511,39 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
 
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
     let (n4, d4, u4) = (n * 4, d * 4, (u + 1) * 4);
-    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u]
+    let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
+    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, z]
+}
+
+/// Entries per `Zone`.
+pub const ZONE: usize = 1024;
+
+/// A run of ZONE entries at a glance: entries matching a size, mtime or
+/// kind filter cluster (a folder's big files, the recently modified), so
+/// a pass over every entry skips most runs whole.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Zone {
+    /// Largest `size_raw` (its encoding keeps order).
+    pub max_size: u32,
+    pub min_mtime: u32,
+    pub max_mtime: u32,
+    /// Bit `kind & 3` for every kind present.
+    pub kinds: u32,
+}
+
+pub(crate) fn zones(kind: &[u8], size: &[u32], mtime: &[u32]) -> Vec<Zone> {
+    (0..kind.len().div_ceil(ZONE))
+        .map(|z| {
+            let r = z * ZONE..((z + 1) * ZONE).min(kind.len());
+            Zone {
+                max_size: size[r.clone()].iter().copied().max().unwrap_or(0),
+                min_mtime: mtime[r.clone()].iter().copied().min().unwrap_or(0),
+                max_mtime: mtime[r.clone()].iter().copied().max().unwrap_or(0),
+                kinds: kind[r].iter().fold(0, |m, &k| m | 1 << (k & 3)),
+            }
+        })
+        .collect()
 }
 
 /// Sizes in 4 bytes: exact below 2 GiB, 2 MiB granularity above.
