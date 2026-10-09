@@ -38,8 +38,9 @@ enum Sec {
     DirParent,
     NameEntsOff,
     NameEnts,
+    NamePrior,
 }
-const NSEC: usize = 16;
+const NSEC: usize = 17;
 
 pub struct Index {
     map: Mmap,
@@ -61,6 +62,7 @@ pub struct Index {
     off: [usize; NSEC],
     plan: std::sync::OnceLock<MemoPlan>,
     counts: std::sync::OnceLock<[u32; CLASSES]>,
+    top_prior: std::sync::OnceLock<i8>,
 }
 
 /// How to fold per-dir data down the tree in parallel (see `memo_plan`).
@@ -108,6 +110,9 @@ impl Index {
     // query visits only these instead of every entry on disk.
     sec!(name_ents_off, Sec::NameEntsOff, u32, u1);
     sec!(name_ents, Sec::NameEnts, u32, n);
+    // Per distinct name, the highest location prior among the folders
+    // holding it: bounds what any entry with the name can score.
+    sec!(name_prior, Sec::NamePrior, i8, u);
 
     /// Name bitmap `b` (see `BM_FIRST` and on): bit `k % 64` of word `k / 64`
     /// is set when name `k` has the property.
@@ -120,6 +125,11 @@ impl Index {
         self.counts.get_or_init(|| {
             std::array::from_fn(|c| self.bitmap(BM_FIRST + c).iter().zip(self.bitmap(BM_SECOND + c)).map(|(a, b)| (a | b).count_ones()).sum())
         })
+    }
+
+    /// The highest `name_prior`.
+    pub fn top_prior(&self) -> i8 {
+        *self.top_prior.get_or_init(|| self.name_prior().iter().copied().max().unwrap_or(0))
     }
 
     pub fn uname(&self, id: u32) -> &[u8] {
@@ -382,6 +392,11 @@ impl Index {
         put(Sec::DirParent, as_bytes(&dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>()));
         put(Sec::NameEntsOff, as_bytes(&ne_off));
         put(Sec::NameEnts, as_bytes(&ne));
+        let mut name_prior = vec![i8::MIN; u];
+        for (i, &k) in ent_name.iter().enumerate().skip(1) {
+            name_prior[k as usize] = name_prior[k as usize].max(prior[parent[i] as usize]);
+        }
+        put(Sec::NamePrior, as_bytes(&name_prior));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
@@ -407,6 +422,7 @@ impl Index {
             map,
             plan: std::sync::OnceLock::new(),
             counts: std::sync::OnceLock::new(),
+            top_prior: std::sync::OnceLock::new(),
         })
     }
 
@@ -450,6 +466,7 @@ impl Index {
         }
         std::hint::black_box(sum);
         self.class_counts();
+        self.top_prior();
     }
 }
 
@@ -487,7 +504,8 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
-    [u.div_ceil(64) * NBITMAPS * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4, (u + 1) * 4, n * 4]
+    let (n4, d4, u4) = (n * 4, d * 4, (u + 1) * 4);
+    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u]
 }
 
 /// Sizes in 4 bytes: exact below 2 GiB, 2 MiB granularity above.

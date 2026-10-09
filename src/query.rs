@@ -56,6 +56,14 @@ impl Token {
     }
 }
 
+/// A name `Searcher::ranked` scored, and the bound on its entries' scores.
+struct Cand {
+    bound: i32,
+    k: u32,
+    score: i16,
+    flags: u8,
+}
+
 /// A value alone on its cache line: per-thread scratch that is written in a
 /// hot loop must not share a line with another thread's.
 #[derive(Clone, Copy)]
@@ -783,6 +791,8 @@ const INLINE_WORDS: usize = 4096;
 /// Entry scoring with at most this many entries to visit runs on the
 /// calling thread.
 const INLINE_VISITS: usize = 4096;
+/// One-token searches expected to match this many names go `ranked`.
+const RANKED_MIN: f64 = 100_000.0;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -808,6 +818,10 @@ impl Searcher<'_> {
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
         let Some((lo, hi)) = self.scope_range(q) else { return Vec::new() };
+        if let Some(t) = self.rankable(q) {
+            let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then(|| self.scope_names(lo, hi));
+            return self.ranked(q, t, lo, hi, scope.as_deref());
+        }
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
         // Step 1: every name-only predicate, once per distinct name (~2M)
@@ -821,6 +835,147 @@ impl Searcher<'_> {
         }
         let memo = if s.need_dirs { Some(scored.memo.get_or_init(|| self.dir_tokens(&scored.names))) } else { None };
         s.full(lo, hi, memo.map(|m| m.as_slice()))
+    }
+
+    /// The query's token if `ranked` can answer it: one fuzzy token, no
+    /// filter on the entries themselves, and broad enough to be worth it
+    /// (going by how many names have each of its char classes).
+    fn rankable<'q>(&self, q: &'q Query) -> Option<&'q Token> {
+        let [t] = &q.tokens[..] else { return None };
+        if t.negate
+            || t.mode != Mode::Fuzzy
+            || q.kind.is_some()
+            || q.size != (0, u64::MAX)
+            || q.mtime != (0, u32::MAX)
+            || q.path_re.is_some()
+            || q.limit == 0
+        {
+            return None;
+        }
+        let (counts, u) = (self.live.base.class_counts(), self.live.base.u as f64);
+        let est = (0..CLASSES).filter(|&c| t.mask & (1 << c) != 0).fold(u, |e, c| e * counts[c] as f64 / u);
+        (est >= RANKED_MIN).then_some(t)
+    }
+
+    /// A broad one-token search ("a", "de"): its top `limit` comes from a few
+    /// dozen of the million names it matches. Names are visited in falling
+    /// order of a bound on their entries' scores (the name's score, the best
+    /// location prior among its folders, the best rank tweak), stopping when
+    /// no name left can beat the limit-th entry. Up front only the names with
+    /// a word starting like the token are scored: the rest cannot get the
+    /// placement bonus, score at most 24 per char + 8, and are only read if
+    /// that bound could still make it.
+    fn ranked(&self, q: &Query, t: &Token, lo: usize, hi: usize, within: Option<&NameSet>) -> Vec<Hit> {
+        let idx = &self.live.base;
+        let (prior, ne_off, ne, name_off) = (idx.name_prior(), idx.name_ents_off(), idx.name_ents(), idx.name_off());
+        let tb = TokenBits::new(idx, t);
+        let start = idx.bitmap(BM_START + crate::index::start_hash(t.text[0]));
+        let space = char_bit(b' ').trailing_zeros() as usize;
+        let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
+        let (dot, app) = (idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP));
+        let tweak = |flags: u8| 10 + if flags & NF_APP != 0 { 25 } else { 0 } - if flags & NF_DOT != 0 { 8 } else { 0 };
+        // Name k (bit i of word w): its hit and the bound on its entries.
+        let score = |w: usize, i: u32, (_, clean, typo): (u64, u64, u64), re: Option<&regex::bytes::Regex>| -> Option<Cand> {
+            let k = w * 64 + i as usize;
+            let name = idx.uname(k as u32);
+            let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
+            let s = token_score(name, t.known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced), t)?;
+            if !(q.exts.is_empty() || ext_ok(name, &q.exts)) || re.is_some_and(|re| !re.is_match(name)) {
+                return None;
+            }
+            let score = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let flags = name_flags(name) | NF_OK;
+            Some(Cand { bound: score as i32 + prior[k] as i32 + tweak(flags), k: k as u32, score, flags })
+        };
+        // The names `pick` selects from each word (given the token's word)
+        // and `bound` lets through, scored.
+        let gather = |pick: &(dyn Fn(usize, u64) -> u64 + Sync), bound: &(dyn Fn(usize, u32) -> bool + Sync)| -> Vec<Cand> {
+            (0..idx.words.div_ceil(CHUNK_WORDS))
+                .into_par_iter()
+                .flat_map_iter(|c| {
+                    let (re, mut out) = (q.name_re.clone(), Vec::new());
+                    for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.words) {
+                        if within.is_some_and(|s| s.bits[w] == 0) {
+                            continue;
+                        }
+                        let x = tb.word(w);
+                        let mut m = pick(w, x.0) & within.map_or(!0, |s| s.bits[w]);
+                        while m != 0 {
+                            let i = m.trailing_zeros();
+                            m &= m - 1;
+                            if bound(w, i)
+                                && let Some(h) = score(w, i, x, re.as_ref())
+                            {
+                                out.push(h);
+                            }
+                        }
+                    }
+                    out
+                })
+                .collect()
+        };
+        let scan = Scan {
+            q,
+            live: self.live,
+            names: &NameTable::new(Vec::new(), Vec::new(), Vec::new(), 0, false),
+            npos: 1,
+            need_dirs: false,
+            now: now_secs(),
+        };
+        let entries = |k: u32| &ne[ne_off[k as usize] as usize..ne_off[k as usize + 1] as usize];
+        let visit = |names: &[Cand]| {
+            top_k(names.len(), q.limit, names.iter().map(|x| entries(x.k).len()).sum(), |r, top| {
+                let mut pbuf = Vec::new();
+                for c in &names[r] {
+                    let nh = NameHit { score: c.score, bits: 1, flags: c.flags, best: [0; 4] };
+                    for &e in entries(c.k).iter().filter(|&&e| (lo..hi).contains(&(e as usize))) {
+                        if let Some(key) = scan.score(e as usize, nh, DirMemo::default(), top.floor, &mut pbuf, None) {
+                            top.push(key);
+                        }
+                    }
+                }
+            })
+        };
+        let best = |mut hits: Vec<Hit>| {
+            hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.idx.cmp(&b.idx)));
+            hits.truncate(q.limit);
+            let floor = if hits.len() < q.limit { i32::MIN } else { hits[q.limit - 1].score };
+            (hits, floor)
+        };
+        // First the highest-bound names holding a few times `limit` entries,
+        // then the rest of those that can still beat the floor they set.
+        let bin = |b: i32| (b.clamp(-1023, 1024) + 1023) as usize;
+        let a = gather(&|w, fits| fits & start[w], &|_, _| true);
+        let mut per_bin = vec![0usize; 2048];
+        for x in &a {
+            per_bin[bin(x.bound)] += entries(x.k).len();
+        }
+        let mut acc = 0;
+        let cut = (0..2048).rev().find(|&b| {
+            acc += per_bin[b];
+            acc >= 4 * q.limit
+        });
+        let (first, rest): (Vec<_>, Vec<_>) = a.into_iter().partition(|x| bin(x.bound) >= cut.unwrap_or(0));
+        let (hits, floor) = best(visit(&first));
+        let more: Vec<_> = rest.into_iter().filter(|x| x.bound >= floor).collect();
+        let (hits, floor) = best(hits.into_iter().chain(visit(&more)).collect());
+        // Names no word of which starts like the token get no placement
+        // bonus; unless an app's (+25) beats the floor, most are out unread.
+        let plain = 24 * t.text.len() as i32 + 8 + idx.top_prior() as i32;
+        let only: &[u64] = match floor {
+            f if f > plain + tweak(NF_APP) => return hits,
+            f if f > plain + tweak(0) => app,
+            _ => &[],
+        };
+        let pick = |w: usize, fits: u64| fits & !start[w] & only.get(w).copied().unwrap_or(!0);
+        let bound = |w: usize, i: u32| {
+            let k = w * 64 + i as usize;
+            let len = (name_off[k + 1] - name_off[k]) as i32;
+            let flags = if dot[w] >> i & 1 != 0 { NF_DOT } else { 0 } | if app[w] >> i & 1 != 0 { NF_APP } else { 0 };
+            plain - idx.top_prior() as i32 - len.min(80) / 3 + prior[k] as i32 + tweak(flags) >= floor
+        };
+        let rest: Vec<_> = gather(&pick, &bound).into_iter().filter(|x| x.bound >= floor).collect();
+        best(hits.into_iter().chain(visit(&rest)).collect()).0
     }
 
     /// The name table for this query: cached for a repeat of the last one
