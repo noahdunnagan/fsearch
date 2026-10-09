@@ -719,19 +719,22 @@ impl TopK {
 
 /// Top `k` over `0..n` items: a few contiguous pieces per thread, each with
 /// its own heap, then one selection over their survivors (merging heaps
-/// pairwise costs more than the scan when `k` is large).
-fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
-    let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
-    let step = n.div_ceil(pieces).max(1);
-    let tops: Vec<TopK> = (0..pieces)
-        .into_par_iter()
-        .map(|p| {
-            let mut top = TopK::new(k);
-            visit((p * step).min(n)..((p + 1) * step).min(n), &mut top);
-            top.cut();
-            top
-        })
-        .collect();
+/// pairwise costs more than the scan when `k` is large). Up to INLINE_VISITS
+/// entries to `visit` in all take less time than waking threads.
+fn top_k(n: usize, k: usize, visits: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
+    let piece = |r: std::ops::Range<usize>| {
+        let mut top = TopK::new(k);
+        visit(r, &mut top);
+        top.cut();
+        top
+    };
+    let tops: Vec<TopK> = if visits <= INLINE_VISITS {
+        vec![piece(0..n)]
+    } else {
+        let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
+        let step = n.div_ceil(pieces).max(1);
+        (0..pieces).into_par_iter().map(|p| piece((p * step).min(n)..((p + 1) * step).min(n))).collect()
+    };
     // A full piece's k-th best already bounds the overall k-th from below.
     let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
     let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
@@ -754,8 +757,15 @@ fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
 /// Below this many entries carrying a matching name, a query visits just
 /// those entries (via the name -> entries list) instead of every entry.
 const SELECTIVE: usize = 60_000;
-/// Name ids per parallel chunk when scoring names (a multiple of 64).
-const NAME_CHUNK: usize = 1 << 14;
+/// Bitset words (64 name ids each) per chunk of a name table: the unit of
+/// parallel scoring and of hit storage (so a chunk's rank fits a u16).
+const CHUNK_WORDS: usize = 256;
+/// Restricted scoring with at most this many words to look at runs on the
+/// calling thread.
+const INLINE_WORDS: usize = 4096;
+/// Entry scoring with at most this many entries to visit runs on the
+/// calling thread.
+const INLINE_VISITS: usize = 4096;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -785,11 +795,11 @@ impl Searcher<'_> {
         let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
         // Step 1: every name-only predicate, once per distinct name (~2M)
         // rather than once per entry (~7.5M); reused while you type.
-        let scored = self.names(q, &pos, &neg);
+        let scored = self.names(q, &pos, &neg, lo, hi);
         let s = Scan { q, live: self.live, names: &scored.names, npos: pos.len(), need_dirs: pos.len() > 1 || !neg.is_empty(), now: now_secs() };
         // Step 2: score entries. Few candidates: just the entries carrying a
         // matching name. Many: one sequential pass over every entry.
-        if scored.names.ok_entries <= SELECTIVE && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed) {
+        if scored.names.ok_entries <= SELECTIVE && !scored.names.all && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed) {
             return s.selective(lo, hi);
         }
         let memo = if s.need_dirs { Some(scored.memo.get_or_init(|| self.dir_tokens(&scored.names))) } else { None };
@@ -799,31 +809,63 @@ impl Searcher<'_> {
     /// The name table for this query: cached for a repeat of the last one
     /// (the second, longer page of results), narrowed from the last one when
     /// this query only extends it (typing), else scored from scratch.
-    fn names(&self, q: &Query, pos: &[&Token], neg: &[&Token]) -> std::sync::Arc<Scored> {
-        let key = NameKey::of(q);
-        let prev = self.live.names_cache.0.lock().unwrap().clone();
+    fn names(&self, q: &Query, pos: &[&Token], neg: &[&Token], lo: usize, hi: usize) -> std::sync::Arc<Scored> {
+        // A small `in:` scope scores just the names found in it.
+        let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then_some((lo, hi));
+        let key = NameKey::of(q, scope);
+        let prev = self.live.names_cache.last.lock().unwrap().clone();
         if let Some(p) = &prev
             && p.key == key
         {
             return p.clone();
         }
         let from = prev.as_ref().filter(|p| key.narrows(&p.key)).map(|p| &p.names);
+        let within = scope.filter(|_| from.is_none()).map(|(lo, hi)| self.scope_names(lo, hi));
         let scored = std::sync::Arc::new(Scored {
             at: std::time::Instant::now(),
             key,
-            names: self.score_names(q, pos, neg, from),
+            names: self.score_names(q, pos, neg, from, within.as_deref()),
             memo: std::sync::OnceLock::new(),
         });
-        *self.live.names_cache.0.lock().unwrap() = Some(scored.clone());
+        *self.live.names_cache.last.lock().unwrap() = Some(scored.clone());
         scored
     }
 
-    /// Score distinct names against the query's name-only predicates: every
-    /// name, or only the ones `from` matched. Matches come back sparse (plus
-    /// a 256 KB membership bitset), so a selective query never touches a
-    /// table the size of the name count.
-    fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token], from: Option<&NameTable>) -> NameTable {
+    /// Bitset of the names of entries `lo..hi` (a folder's subtree) and of
+    /// the folder and its ancestors, whose names folder tokens match. The
+    /// last one is kept: searches in a folder tend to come in a row.
+    fn scope_names(&self, lo: usize, hi: usize) -> std::sync::Arc<NameSet> {
+        let mut cache = self.live.names_cache.scope.lock().unwrap();
+        if let Some((r, set)) = &*cache
+            && *r == (lo, hi)
+        {
+            return set.clone();
+        }
         let idx = &self.live.base;
+        let (en, de, dp) = (idx.ent_name(), idx.dir_entry(), idx.dir_parent());
+        let mut bits = vec![0u64; idx.words];
+        let mut set = |k: u32| bits[k as usize >> 6] |= 1 << (k & 63);
+        for &k in &en[lo..hi] {
+            set(k);
+        }
+        let mut d = if lo < hi { idx.parent()[lo] } else { 0 };
+        while d != 0 {
+            set(en[de[d as usize] as usize]);
+            d = dp[d as usize];
+        }
+        let set = std::sync::Arc::new(NameSet::new(bits));
+        *cache = Some(((lo, hi), set.clone()));
+        set
+    }
+
+    /// Score distinct names against the query's name-only predicates: every
+    /// name, or only the ones `from` matched and `within` holds.
+    fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token], from: Option<&NameTable>, within: Option<&NameSet>) -> NameTable {
+        let idx = &self.live.base;
+        if pos.is_empty() && neg.is_empty() && q.exts.is_empty() && q.name_re.is_none() {
+            // Every name passes with score 0; only its flags differ.
+            return NameTable::new(Vec::new(), Vec::new(), Vec::new(), idx.n, true);
+        }
         let ne_off = idx.name_ents_off();
         let toks: Vec<TokenBits> = pos.iter().chain(neg).map(|t| TokenBits::new(idx, t)).collect();
         let space = char_bit(b' ').trailing_zeros() as usize;
@@ -861,56 +903,56 @@ impl Searcher<'_> {
             }
             (ok || h.bits != 0 || h.flags & NF_NEG != 0).then_some(h)
         };
-        // Each chunk of name ids writes its own slice of the bitset and of a
-        // reused dense table. Slots without their bit set are never read, so
-        // the table is never cleared (and never page-faulted in again).
-        let mut bits = vec![0u64; idx.words];
-        let mut dense = DENSE_POOL.lock().unwrap().pop().filter(|d| d.len() == idx.u).unwrap_or_else(|| vec![NameHit::NONE; idx.u]);
-        let counts: Vec<(usize, usize)> = dense
-            .par_chunks_mut(NAME_CHUNK)
-            .zip(bits.par_chunks_mut(NAME_CHUNK / 64))
-            .enumerate()
-            .map(|(c, (slots, words))| {
-                let a = c * NAME_CHUNK;
-                let (mut n, mut ok) = (0usize, 0usize);
-                let mut per = vec![Line((0, 0, 0)); toks.len()];
-                for (wi, word) in words.iter_mut().enumerate() {
-                    let w = a / 64 + wi;
-                    let mut cand = from.map_or(!0, |f| f.bits[w]);
-                    if cand == 0 {
-                        continue;
-                    }
-                    let mut any = 0;
-                    for (p, tb) in per.iter_mut().zip(&toks) {
-                        p.0 = tb.word(w);
-                        any |= p.0.0;
-                    }
-                    // With no positive token every name is a candidate.
-                    cand &= if pos.is_empty() { !0 >> (64 - (idx.u - w * 64).min(64)) } else { any };
-                    while cand != 0 {
-                        let i = cand.trailing_zeros();
-                        cand &= cand - 1;
-                        let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
-                        let k = w * 64 + i as usize;
-                        if let Some(h) = score_one(k, i, &per, spaced, &mut ok) {
-                            slots[k - a] = h;
-                            *word |= 1 << i;
-                            n += 1;
-                        }
+        // One chunk of name ids: its words of the bitset and rank, and its
+        // hits in id order (into a spare buffer).
+        let chunk = |c: usize, bits: &mut [u64], rank: &mut [u16], mut hits: Vec<NameHit>| -> (Vec<NameHit>, usize) {
+            let mut ok = 0;
+            if from.is_some_and(|f| f.hits[c].is_empty()) || within.is_some_and(|s| !s.any[c]) {
+                return (hits, ok);
+            }
+            let mut per = vec![Line((0, 0, 0)); toks.len()];
+            for (wi, (word, r)) in bits.iter_mut().zip(rank.iter_mut()).enumerate() {
+                *r = hits.len() as u16;
+                let w = c * CHUNK_WORDS + wi;
+                let mut cand = from.map_or(!0, |f| f.bits[w]) & within.map_or(!0, |s| s.bits[w]);
+                if cand == 0 {
+                    continue;
+                }
+                let mut any = 0;
+                for (p, tb) in per.iter_mut().zip(&toks) {
+                    p.0 = tb.word(w);
+                    any |= p.0.0;
+                }
+                // With no positive token every name is a candidate.
+                cand &= if pos.is_empty() { !0 >> (64 - (idx.u - w * 64).min(64)) } else { any };
+                while cand != 0 {
+                    let i = cand.trailing_zeros();
+                    cand &= cand - 1;
+                    let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
+                    if let Some(h) = score_one(w * 64 + i as usize, i, &per, spaced, &mut ok) {
+                        hits.push(h);
+                        *word |= 1 << i;
                     }
                 }
-                (n, ok)
-            })
-            .collect();
-        let ok_entries = counts.iter().map(|c| c.1).sum();
-        let total: usize = counts.iter().map(|c| c.0).sum();
-        let mut t = NameTable { bits, sparse: Vec::new(), dense: Some(dense), ok_entries };
-        if total <= 1 << 16 {
-            // Few matches: keep a compact copy and give the big table back.
-            t.sparse = t.iter().collect();
-            DENSE_POOL.lock().unwrap().push(t.dense.take().unwrap());
-        }
-        t
+            }
+            (hits, ok)
+        };
+        let mut bits = vec![0u64; idx.words];
+        let mut rank = vec![0u16; idx.words];
+        // A few hundred words to look at take less time than waking threads.
+        let few = from.map_or(within.map(|s| s.words), |f| Some(f.len)).is_some_and(|n| n <= INLINE_WORDS);
+        let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
+        spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
+        let out: Vec<(Vec<NameHit>, usize)> = if few {
+            let chunks = bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare);
+            chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h)).collect()
+        } else {
+            let chunks = bits.par_chunks_mut(CHUNK_WORDS).zip(rank.par_chunks_mut(CHUNK_WORDS)).zip(spare);
+            chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h)).collect()
+        };
+        let ok_entries = out.iter().map(|c| c.1).sum();
+        let hits: Vec<Vec<NameHit>> = out.into_iter().map(|c| c.0).collect();
+        NameTable::new(bits, rank, hits, ok_entries, false)
     }
 
     /// The overlay (entries added since the last compaction) has no dir
@@ -922,6 +964,9 @@ impl Searcher<'_> {
         // A hit needs some positive token in its own name.
         let cands: Vec<(&Vec<u8>, &crate::live::OEnt)> =
             self.live.over.iter().filter(|(_, o)| pos.is_empty() || pos.iter().any(|t| t.fits(o.mask))).collect();
+        if cands.is_empty() {
+            return Vec::new();
+        }
         // Overlay entries cluster in a few busy folders: match each folder's
         // components once per folder, not per entry.
         let mut hits: Vec<Hit> = cands
@@ -1062,10 +1107,15 @@ impl Scan<'_> {
     fn full(&self, lo: usize, hi: usize, memo: Option<&[DirMemo]>) -> Vec<Hit> {
         let idx = &self.live.base;
         let (ent_name, parent) = (idx.ent_name(), idx.parent());
-        top_k(hi - lo, self.q.limit, |r, top| {
+        let dense = self.names.dense(idx);
+        top_k(hi - lo, self.q.limit, hi - lo, |r, top| {
             let mut pbuf = Vec::new();
             for i in lo + r.start..lo + r.end {
-                let Some(nh) = self.names.get(ent_name[i]).filter(|h| h.flags & NF_OK != 0) else { continue };
+                let s = dense[ent_name[i] as usize];
+                if s.flags & NF_OK == 0 {
+                    continue;
+                }
+                let nh = NameHit { score: s.score, bits: s.bits, flags: s.flags, best: [0; 4] };
                 let m = memo.map_or(DirMemo::default(), |m| m[parent[i] as usize]);
                 if let Some(k) = self.score(i, nh, m, top.floor, &mut pbuf) {
                     top.push(k);
@@ -1080,7 +1130,7 @@ impl Scan<'_> {
         let idx = &self.live.base;
         let (ne_off, ne, parent) = (idx.name_ents_off(), idx.name_ents(), idx.parent());
         let ok: Vec<(u32, NameHit)> = self.names.iter().filter(|(_, h)| h.flags & NF_OK != 0).collect();
-        top_k(ok.len(), self.q.limit, |r, top| {
+        top_k(ok.len(), self.q.limit, self.names.ok_entries, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             for &(id, nh) in &ok[r] {
                 for &e in &ne[ne_off[id as usize] as usize..ne_off[id as usize + 1] as usize] {
@@ -1131,14 +1181,17 @@ struct NameKey {
     tokens: Vec<(Vec<u8>, Mode, bool)>,
     exts: Vec<Vec<u8>>,
     name_re: Option<String>,
+    /// The entry range whose names alone were scored, if not all.
+    scope: Option<(usize, usize)>,
 }
 
 impl NameKey {
-    fn of(q: &Query) -> NameKey {
+    fn of(q: &Query, scope: Option<(usize, usize)>) -> NameKey {
         NameKey {
             tokens: q.tokens.iter().map(|t| (t.text.clone(), t.mode, t.negate)).collect(),
             exts: q.exts.clone(),
             name_re: q.name_re.as_ref().map(|r| r.as_str().to_string()),
+            scope,
         }
     }
 
@@ -1147,6 +1200,7 @@ impl NameKey {
     fn narrows(&self, prev: &NameKey) -> bool {
         self.exts == prev.exts
             && self.name_re == prev.name_re
+            && self.scope == prev.scope
             && self.tokens.len() == prev.tokens.len()
             && self.tokens.iter().any(|t| !t.2)
             && self.tokens.iter().zip(&prev.tokens).all(|(a, b)| {
@@ -1185,16 +1239,22 @@ impl Drop for Scored {
 
 /// Lives with the index it was scored against (`Live`).
 #[derive(Default)]
-pub struct NameCache(std::sync::Mutex<Option<std::sync::Arc<Scored>>>);
+pub struct NameCache {
+    last: std::sync::Mutex<Option<std::sync::Arc<Scored>>>,
+    /// The last `in:` scope's names (see `Searcher::scope_names`).
+    #[allow(clippy::type_complexity)]
+    scope: std::sync::Mutex<Option<((usize, usize), std::sync::Arc<NameSet>)>>,
+}
 
 impl NameCache {
     /// Drop the cached table and spare buffers once searching has stopped:
     /// tens of MB after a broad query, worth keeping only while typing.
     pub fn trim_if_idle(&self, idle: std::time::Duration) {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.last.lock().unwrap();
         if g.as_ref().is_some_and(|s| s.at.elapsed() > idle) {
             *g = None;
             drop(g);
+            *self.scope.lock().unwrap() = None;
             trim_pools();
         }
     }
@@ -1231,62 +1291,148 @@ impl DirMemo {
     }
 }
 
-/// Spare dense name tables (24 MB each on this disk), so a broad query
-/// doesn't page-fault a fresh one in.
-static DENSE_POOL: std::sync::Mutex<Vec<Vec<NameHit>>> = std::sync::Mutex::new(Vec::new());
+/// Spare hit buffers, one per name table chunk (tens of MB after a broad
+/// query), so the next broad query doesn't page-fault fresh ones in.
+static HIT_POOL: std::sync::Mutex<Vec<Vec<NameHit>>> = std::sync::Mutex::new(Vec::new());
 
 /// Free the spare buffers searches keep for speed (after a quiet spell).
 pub fn trim_pools() {
+    HIT_POOL.lock().unwrap().clear();
     DENSE_POOL.lock().unwrap().clear();
     MEMO_POOL.lock().unwrap().clear();
 }
+
+/// Spare `NameTable::dense` views (8.9 MB on this disk).
+static DENSE_POOL: std::sync::Mutex<Vec<Vec<Short>>> = std::sync::Mutex::new(Vec::new());
 
 impl Drop for NameTable {
     fn drop(&mut self) {
         if let Some(d) = self.dense.take() {
             let mut pool = DENSE_POOL.lock().unwrap();
-            if pool.len() < 2 {
+            if pool.is_empty() {
                 pool.push(d);
             }
         }
+        let mut pool = HIT_POOL.lock().unwrap();
+        if pool.is_empty() {
+            *pool = std::mem::take(&mut self.hits);
+            pool.iter_mut().for_each(Vec::clear);
+        }
     }
 }
 
+/// Scored names: which ones (`bits`), and their hits stored per chunk of
+/// CHUNK_WORDS words in id order, `rank[w]` counting the chunk's hits
+/// before word w. Lookups are O(1) and the table is as small as its hits.
 struct NameTable {
     bits: Vec<u64>,
-    sparse: Vec<(u32, NameHit)>,
-    dense: Option<Vec<NameHit>>,
+    rank: Vec<u16>,
+    hits: Vec<Vec<NameHit>>,
+    len: usize,
     /// Entries carrying a name that passes as a match (NF_OK).
     ok_entries: usize,
+    /// Every name, unscored (no token or name filter): only `dense` works.
+    all: bool,
+    /// For a pass over every entry: each name's `Short` (zero if absent), a
+    /// direct index with a quarter of a hit's bytes.
+    dense: std::sync::OnceLock<Vec<Short>>,
+}
+
+/// What an entry's score needs of its name's hit.
+#[derive(Clone, Copy, Default)]
+struct Short {
+    score: i16,
+    bits: u8,
+    flags: u8,
 }
 
 impl NameTable {
+    fn new(bits: Vec<u64>, rank: Vec<u16>, hits: Vec<Vec<NameHit>>, ok_entries: usize, all: bool) -> NameTable {
+        let len = hits.iter().map(Vec::len).sum();
+        NameTable { bits, rank, hits, len, ok_entries, all, dense: std::sync::OnceLock::new() }
+    }
+
+    /// The `dense` view, built on first use.
+    fn dense(&self, idx: &Index) -> &[Short] {
+        self.dense.get_or_init(|| {
+            let mut d = DENSE_POOL.lock().unwrap().pop().unwrap_or_default();
+            d.resize(idx.words * 64, Short::default());
+            let flags = [idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP)];
+            d.par_chunks_mut(CHUNK_WORDS * 64).enumerate().for_each(|(c, out)| {
+                out.fill(Short::default());
+                let base = c * CHUNK_WORDS * 64;
+                if self.all {
+                    for (j, o) in out.iter_mut().enumerate() {
+                        let (w, i) = ((base + j) / 64, j % 64);
+                        let f = |b: &[u64], nf: u8| if b[w] >> i & 1 != 0 { nf } else { 0 };
+                        o.flags = NF_OK | f(flags[0], NF_DOT) | f(flags[1], NF_APP);
+                    }
+                    return;
+                }
+                let hits = self.hits[c].iter();
+                let words = self.bits[c * CHUNK_WORDS..].iter().take(CHUNK_WORDS);
+                let ids = words.enumerate().flat_map(|(wi, &b)| {
+                    let mut b = b;
+                    std::iter::from_fn(move || {
+                        (b != 0).then(|| {
+                            let j = wi * 64 + b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            j
+                        })
+                    })
+                });
+                for (j, h) in ids.zip(hits) {
+                    out[j] = Short { score: h.score, bits: h.bits, flags: h.flags };
+                }
+            });
+            d
+        })
+    }
+
     #[inline(always)]
     fn get(&self, id: u32) -> Option<NameHit> {
-        if self.bits[id as usize >> 6] & (1 << (id & 63)) == 0 {
+        let (w, i) = (id as usize >> 6, id & 63);
+        let b = self.bits[w];
+        if b >> i & 1 == 0 {
             return None;
         }
-        match &self.dense {
-            Some(d) => Some(d[id as usize]),
-            None => self.sparse.binary_search_by_key(&id, |e| e.0).ok().map(|k| self.sparse[k].1),
-        }
+        let r = self.rank[w] as usize + (b & ((1 << i) - 1)).count_ones() as usize;
+        Some(self.hits[w / CHUNK_WORDS][r])
     }
 
     /// Every name in the table, ascending.
-    fn iter(&self) -> Box<dyn Iterator<Item = (u32, NameHit)> + '_> {
-        match &self.dense {
-            None => Box::new(self.sparse.iter().copied()),
-            Some(d) => Box::new(self.bits.iter().enumerate().flat_map(move |(w, &b)| {
+    fn iter(&self) -> impl Iterator<Item = (u32, NameHit)> + '_ {
+        self.hits.iter().enumerate().filter(|(_, hits)| !hits.is_empty()).flat_map(move |(c, hits)| {
+            let words = self.bits[c * CHUNK_WORDS..].iter().take(CHUNK_WORDS);
+            let ids = words.enumerate().flat_map(move |(wi, &b)| {
                 let mut b = b;
+                let base = ((c * CHUNK_WORDS + wi) * 64) as u32;
                 std::iter::from_fn(move || {
                     (b != 0).then(|| {
-                        let id = w as u32 * 64 + b.trailing_zeros();
+                        let id = base + b.trailing_zeros();
                         b &= b - 1;
-                        (id, d[id as usize])
+                        id
                     })
                 })
-            })),
-        }
+            });
+            ids.zip(hits.iter().copied())
+        })
+    }
+}
+
+/// A set of name ids, and which chunks of it are not empty.
+struct NameSet {
+    bits: Vec<u64>,
+    any: Vec<bool>,
+    /// Non-zero words.
+    words: usize,
+}
+
+impl NameSet {
+    fn new(bits: Vec<u64>) -> NameSet {
+        let any = bits.chunks(CHUNK_WORDS).map(|c| c.iter().any(|&b| b != 0)).collect();
+        let words = bits.iter().filter(|&&b| b != 0).count();
+        NameSet { bits, any, words }
     }
 }
 
@@ -1298,10 +1444,6 @@ struct NameHit {
     flags: u8,
     /// Per-token score, first 4 tokens (for the folder memo).
     best: [i16; 4],
-}
-
-impl NameHit {
-    const NONE: NameHit = NameHit { score: 0, bits: 0, flags: 0, best: [0; 4] };
 }
 
 const NF_OK: u8 = 1;
