@@ -991,9 +991,10 @@ impl Content {
             }
             v
         };
-        // A small scope is searched sooner on this thread than by waking
-        // the pool's (each parallel step costs ~0.1 ms when they sleep).
-        if work.iter().map(|(_, docs)| docs.len()).sum::<usize>() < 100_000 { work.iter().map(one).collect() } else { par_claim(&work, one) }
+        // About a lane per 50k docs to search: a small index is done on this
+        // thread before a helper would wake.
+        let docs: usize = work.iter().map(|(_, docs)| docs.len()).sum();
+        par_claim(&work, (docs / 50_000).clamp(1, work.len().max(1)), one)
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
@@ -1032,14 +1033,13 @@ type Ranked = (u64, u32, u32);
 /// Candidates ranked in the first round.
 const FIRST: usize = 512;
 
-/// `items.iter().map(f).collect()` on the current rayon pool: each thread
-/// claims the next item, and this one starts at once, so it never waits on
-/// a thread still waking up (one that does finds nothing left).
-fn par_claim<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// `items.iter().map(f).collect()` on `lanes` lanes (see `run_lanes`): each
+/// claims the next item.
+fn par_claim<T: Sync, R: Send>(items: &[T], lanes: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let next = AtomicUsize::new(0);
     let out = std::sync::Mutex::new(Vec::with_capacity(items.len()));
-    let work = || {
+    run_lanes(lanes, &|| {
         let mut mine = Vec::new();
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -1047,16 +1047,107 @@ fn par_claim<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R
             mine.push((i, f(x)));
         }
         out.lock().unwrap().extend(mine);
-    };
-    rayon::scope(|s| {
-        for _ in 1..rayon::current_num_threads() {
-            s.spawn(|_| work());
-        }
-        work();
     });
     let mut out = out.into_inner().unwrap();
     out.sort_unstable_by_key(|r| r.0);
     out.into_iter().map(|r| r.1).collect()
+}
+
+/// One search's lanes, shared with the helper threads.
+struct Lanes {
+    n: usize,
+    next: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicUsize,
+    panicked: std::sync::atomic::AtomicBool,
+    /// The search's job, its lifetime erased: it is only run for a lane
+    /// claimed below `n`, and `run_lanes` returns after all of those end.
+    job: *const (dyn Fn() + Sync),
+}
+
+// Safety: `job` is Sync and outlives every call (see the field).
+unsafe impl Send for Lanes {}
+unsafe impl Sync for Lanes {}
+
+impl Lanes {
+    fn work(&self) {
+        use std::sync::atomic::Ordering::*;
+        while self.next.fetch_add(1, Relaxed) < self.n {
+            let job = std::panic::AssertUnwindSafe(|| unsafe { (*self.job)() });
+            if std::panic::catch_unwind(job).is_err() {
+                self.panicked.store(true, Relaxed);
+            }
+            self.done.fetch_add(1, Release);
+        }
+    }
+}
+
+/// Threads that help searches: the latest search's lanes, and a bell.
+struct Helpers {
+    latest: std::sync::Mutex<(u64, Option<std::sync::Arc<Lanes>>)>,
+    bell: std::sync::Condvar,
+}
+
+fn helpers() -> &'static Helpers {
+    static H: std::sync::OnceLock<&'static Helpers> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let h: &'static Helpers = Box::leak(Box::new(Helpers { latest: Default::default(), bell: Default::default() }));
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get()).max(SCAN_READERS);
+        for i in 1..n {
+            let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
+                // Someone is waiting: keep off the slow cores and out of the
+                // throttled IO tiers, and never download iCloud placeholders.
+                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                crate::no_materialize();
+                let mut seen = 0;
+                loop {
+                    let lanes = {
+                        let mut g = h.latest.lock().unwrap();
+                        while g.0 == seen {
+                            g = h.bell.wait(g).unwrap();
+                        }
+                        seen = g.0;
+                        g.1.clone()
+                    };
+                    if let Some(l) = lanes {
+                        l.work();
+                    }
+                }
+            });
+            if spawned.is_err() {
+                break;
+            }
+        }
+        h
+    })
+}
+
+/// Run `job` on `n` lanes at once, this thread taking lanes too, and return
+/// when all are done. A lane goes to whichever thread claims it first, so
+/// this never waits on a helper still waking up (~0.1 ms when they sleep):
+/// one that wakes late finds no lane left.
+fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+    if n <= 1 {
+        return job();
+    }
+    let h = helpers();
+    let job: *const (dyn Fn() + Sync + '_) = job;
+    // Safety: see `Lanes::job`; the wait below is what makes it hold.
+    let job: *const (dyn Fn() + Sync + 'static) = unsafe { std::mem::transmute(job) };
+    let lanes = std::sync::Arc::new(Lanes { n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panicked: AtomicBool::new(false), job });
+    {
+        let mut g = h.latest.lock().unwrap();
+        g.0 += 1;
+        g.1 = Some(lanes.clone());
+    }
+    for _ in 1..n {
+        h.bell.notify_one();
+    }
+    lanes.work();
+    while lanes.done.load(Acquire) < n {
+        std::thread::yield_now();
+    }
+    assert!(!lanes.panicked.load(Relaxed), "a search lane panicked");
 }
 
 /// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
@@ -1188,7 +1279,9 @@ pub struct GrepResult {
     pub complete: bool,
 }
 
-/// Threads reading candidates: the read pool's and the searching one.
+/// Threads reading candidates (the searching one and helpers): file opens on
+/// this Mac stop scaling past ~4 (Endpoint Security clients tax every open;
+/// measured on hot files: 7.5 us/file at 4 threads, 9 at 8, 14 at 12).
 const READERS: usize = 4;
 /// Folders outside the index (`in:/etc`) are read with more threads: their
 /// files are mostly small and not in the page cache, so reads wait on the
@@ -1196,7 +1289,7 @@ const READERS: usize = 4;
 const SCAN_READERS: usize = 8;
 
 /// Run `f` with this thread never downloading iCloud placeholders (as the
-/// read pool's threads), then restore its policy.
+/// helper threads), then restore its policy.
 fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
     unsafe extern "C" {
         fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
@@ -1210,27 +1303,6 @@ fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
         unsafe { setiopolicy_np(3, 1, prior) };
     }
     r
-}
-
-/// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
-/// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
-/// 16), so candidate reads get their own small pool: one for indexed docs,
-/// a wider one for scans.
-fn read_pool(readers: usize) -> &'static rayon::ThreadPool {
-    static POOLS: [std::sync::OnceLock<rayon::ThreadPool>; 2] = [const { std::sync::OnceLock::new() }; 2];
-    POOLS[(readers > READERS) as usize].get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(readers - 1)
-            .thread_name(|i| format!("fsearch-read-{i}"))
-            .start_handler(|_| {
-                // Someone is waiting on these reads: keep them off the slow
-                // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
-                crate::no_materialize()
-            })
-            .build()
-            .unwrap()
-    })
 }
 
 pub struct FileMatches {
@@ -1281,14 +1353,7 @@ fn verify_from<'a>(
             }
         });
     };
-    // This thread reads too, from the start: the pool's threads take ~0.1
-    // ms to wake when they sleep.
-    read_pool(readers).in_place_scope(|sc| {
-        for _ in 1..readers {
-            sc.spawn(|_| work());
-        }
-        without_materializing(work);
-    });
+    without_materializing(|| run_lanes(readers, &work));
     let mut hits = hits.into_inner().unwrap();
     hits.sort_unstable_by_key(|h| h.0);
     hits.truncate(limit);
