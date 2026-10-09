@@ -108,8 +108,8 @@ impl Index {
     sec!(dir_end, Sec::DirEnd, u32, d);
     sec!(dir_prior, Sec::DirPrior, i8, d);
     sec!(dir_parent, Sec::DirParent, u32, d);
-    // Per distinct name, the entries carrying it (ascending): a selective
-    // query visits only these instead of every entry on disk.
+    // Per distinct name, the entries carrying it (best location prior
+    // first): a selective query visits only these instead of every entry.
     sec!(name_ents_off, Sec::NameEntsOff, u32, u1);
     sec!(name_ents, Sec::NameEnts, u32, n);
     // Per distinct name, the highest location prior among the folders
@@ -394,6 +394,9 @@ impl Index {
         put(Sec::DirEnd, as_bytes(&end));
         put(Sec::DirPrior, as_bytes(&prior));
         put(Sec::DirParent, as_bytes(&dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>()));
+        // Each name's entries best location prior first (then ascending): a
+        // search visiting them can stop at the first that cannot make it.
+        ne.par_sort_unstable_by_key(|&e| (ent_name[e as usize], std::cmp::Reverse(prior[parent[e as usize] as usize]), e));
         put(Sec::NameEntsOff, as_bytes(&ne_off));
         put(Sec::NameEnts, as_bytes(&ne));
         let mut name_prior = vec![i8::MIN; u];

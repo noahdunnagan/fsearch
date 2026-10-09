@@ -963,12 +963,17 @@ impl Searcher<'_> {
             now: now_secs(),
         };
         let entries = |k: u32| &ne[ne_off[k as usize] as usize..ne_off[k as usize + 1] as usize];
+        let (parent, dir_prior) = (idx.parent(), idx.dir_prior());
         let visit = |names: &[Cand]| {
             top_k(names.len(), q.limit, names.iter().map(|x| entries(x.k).len()).sum(), |r, top| {
                 let mut pbuf = Vec::new();
                 for c in &names[r] {
                     let nh = NameHit { score: c.score, bits: 1, flags: c.flags, best: [0; 4] };
                     for &e in entries(c.k).iter().filter(|&&e| (lo..hi).contains(&(e as usize))) {
+                        // Entries come best prior first: the rest cannot make it either.
+                        if key(c.score as i32 + dir_prior[parent[e as usize] as usize] as i32 + tweak(c.flags), 0) <= top.floor {
+                            break;
+                        }
                         if let Some(key) = scan.score(e as usize, nh, DirMemo::default(), top.floor, &mut pbuf, None) {
                             top.push(key);
                         }
