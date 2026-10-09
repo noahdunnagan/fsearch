@@ -1009,11 +1009,11 @@ impl Content {
         // rank those first, and the rest only if reading gets that far.
         let t = std::time::Instant::now();
         let best = take_best(&mut per);
-        let (mut r, done) = verify_from(g, best.len(), filt.limit, t, |i| path(&best[i]));
+        let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
         if r.files.len() < filt.limit && done == best.len() && best.len() < total {
             let mut rest: Vec<Ranked> = per.concat();
             rest.par_sort_unstable();
-            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), t, |i| path(&rest[i]));
+            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), READERS, t, |i| path(&rest[i]));
             r.files.extend(more.files);
             r.read += more.read;
             r.complete = more.complete;
@@ -1189,6 +1189,10 @@ pub struct GrepResult {
 
 /// Threads reading candidates: the read pool's and the searching one.
 const READERS: usize = 4;
+/// Folders outside the index (`in:/etc`) are read with more threads: their
+/// files are mostly small and not in the page cache, so reads wait on the
+/// disk more than on the open() tax.
+const SCAN_READERS: usize = 8;
 
 /// Run `f` with this thread never downloading iCloud placeholders (as the
 /// read pool's threads), then restore its policy.
@@ -1209,12 +1213,13 @@ fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
 
 /// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
 /// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
-/// 16), so candidate reads get their own small pool.
-fn read_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
+/// 16), so candidate reads get their own small pool: one for indexed docs,
+/// a wider one for scans.
+fn read_pool(readers: usize) -> &'static rayon::ThreadPool {
+    static POOLS: [std::sync::OnceLock<rayon::ThreadPool>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    POOLS[(readers > READERS) as usize].get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(READERS - 1)
+            .num_threads(readers - 1)
             .thread_name(|i| format!("fsearch-read-{i}"))
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
@@ -1238,13 +1243,20 @@ pub struct FileMatches {
 /// the next unread candidate, so the files read are always a prefix of the
 /// ranking and reading stops as soon as the `limit`th match is in.
 pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
-    verify_from(g, paths.len(), limit, std::time::Instant::now(), |i| Some(paths[i].as_ref())).0
+    verify_from(g, paths.len(), limit, SCAN_READERS, std::time::Instant::now(), |i| Some(paths[i].as_ref())).0
 }
 
-/// `verify` over `n` candidates, `path(i)` giving the i-th, or None if the
-/// index already rules it out; the budget counts from `t`. Also returns how
-/// many candidates it got through.
-fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path: impl Fn(usize) -> Option<&'a [u8]> + Sync) -> (GrepResult, usize) {
+/// `verify` over `n` candidates with `readers` threads, `path(i)` giving the
+/// i-th, or None if the index already rules it out; the budget counts from
+/// `t`. Also returns how many candidates it got through.
+fn verify_from<'a>(
+    g: &Grep,
+    n: usize,
+    limit: usize,
+    readers: usize,
+    t: std::time::Instant,
+    path: impl Fn(usize) -> Option<&'a [u8]> + Sync,
+) -> (GrepResult, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, found, read) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let hits = std::sync::Mutex::new(Vec::new());
@@ -1270,8 +1282,8 @@ fn verify_from<'a>(g: &Grep, n: usize, limit: usize, t: std::time::Instant, path
     };
     // This thread reads too, from the start: the pool's threads take ~0.1
     // ms to wake when they sleep.
-    read_pool().in_place_scope(|sc| {
-        for _ in 1..READERS {
+    read_pool(readers).in_place_scope(|sc| {
+        for _ in 1..readers {
             sc.spawn(|_| work());
         }
         without_materializing(work);
