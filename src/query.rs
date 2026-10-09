@@ -52,6 +52,9 @@ fn takes_typos(text: &[u8], mode: Mode) -> bool {
 pub struct Query {
     pub tokens: Vec<Token>,
     pub kind: Option<u8>,
+    /// `type:app`: a folder kind also takes symlinks, since the system apps
+    /// in /Applications link into the cryptex (/Applications/Safari.app).
+    pub apps: bool,
     pub exts: Vec<Vec<u8>>,
     pub scope: Option<Vec<u8>>,
     pub size: (u64, u64),
@@ -140,6 +143,7 @@ impl Query {
                 for t in v.split(',') {
                     if t == "app" {
                         self.kind = Some(KIND_DIR);
+                        self.apps = true;
                         self.exts.push(b"app".to_vec());
                         continue;
                     }
@@ -187,6 +191,14 @@ impl Query {
         Query { grep: None, ..self.clone() }
     }
 
+    #[inline(always)]
+    pub fn kind_ok(&self, kind: u8) -> bool {
+        match self.kind {
+            None => true,
+            Some(want) => kind & 3 == want || (self.apps && kind & 3 == KIND_LINK),
+        }
+    }
+
     /// Does a full path pass every filter and token? Returns the match score.
     /// Used where there is no dir memo: the overlay and content-search docs.
     pub fn match_path(&self, path: &[u8], kind: u8, size: u64, mtime: u32) -> Option<i32> {
@@ -204,7 +216,7 @@ impl Query {
         let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
         let name = &path[cut + 1..];
         if name.is_empty()
-            || self.kind.is_some_and(|k| kind & 3 != k)
+            || !self.kind_ok(kind)
             || (!self.exts.is_empty() && !ext_ok(name, &self.exts))
             || size < self.size.0
             || size > self.size.1
@@ -920,7 +932,7 @@ impl Scan<'_> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind()[i];
-        if q.kind.is_some_and(|want| k & 3 != want) {
+        if !q.kind_ok(k) {
             return None;
         }
         if q.size != (0, u64::MAX) {
