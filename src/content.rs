@@ -1416,22 +1416,64 @@ fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-/// What a regex fragment tells us: either a small set of exact strings it
-/// can match, or just a trigram query every match must satisfy.
+/// What a regex fragment tells us about its matches, as small sets of
+/// (case-folded) strings: every match is one of `exact`, starts with one of
+/// `prefix` and ends with one of `suffix` (None: no small such set); and
+/// every doc holding a match satisfies `q`.
 struct Info {
-    exact: Option<Vec<Vec<u8>>>,
+    exact: Option<Set>,
+    prefix: Option<Set>,
+    suffix: Option<Set>,
     q: TQ,
 }
 
+type Set = Vec<Vec<u8>>;
+
 const MAX_EXACT: usize = 16;
 
-/// What a fragment's exact set requires of a doc (All when there is no set,
-/// or a string in it is too short to have a trigram).
-fn exact_query(set: Option<Vec<Vec<u8>>>) -> TQ {
-    match set {
-        Some(set) if set.iter().all(|s| s.len() >= 3) => TQ::Or(set.iter().map(|s| literal_plan(s)).collect()),
-        _ => TQ::All,
+impl Info {
+    fn exact(set: Set) -> Info {
+        Info { exact: Some(set.clone()), prefix: Some(set.clone()), suffix: Some(set), q: TQ::All }
     }
+
+    fn any() -> Info {
+        Info { exact: None, prefix: None, suffix: None, q: TQ::All }
+    }
+
+    /// All it says about a doc, as one trigram query.
+    fn query(self) -> TQ {
+        match self.exact {
+            Some(_) => and(self.q, exact_query(self.exact)),
+            None => and(and(self.q, exact_query(self.prefix)), exact_query(self.suffix)),
+        }
+    }
+}
+
+/// Every string of `a` followed by one of `b`, if that's few enough.
+fn cross(a: &Option<Set>, b: &Option<Set>) -> Option<Set> {
+    let (a, b) = (a.as_ref()?, b.as_ref()?);
+    if a.len() * b.len() > MAX_EXACT {
+        return None;
+    }
+    let mut set: Set = a.iter().flat_map(|x| b.iter().map(move |y| [x.as_slice(), y].concat())).collect();
+    set.sort();
+    set.dedup();
+    Some(set)
+}
+
+/// What a set of strings requires of a doc: one of them (All when there is
+/// no set, or a string in it is too short to have a trigram). Trigrams all
+/// of them share are required once, not per string.
+fn exact_query(set: Option<Set>) -> TQ {
+    let Some(set) = set.filter(|set| set.iter().all(|s| s.len() >= 3)) else { return TQ::All };
+    let tris: Vec<Vec<u32>> = set.iter().map(|s| trigrams_small(s)).collect();
+    let common: Vec<u32> = tris[0].iter().copied().filter(|t| tris.iter().all(|ts| ts.binary_search(t).is_ok())).collect();
+    let rest: Vec<TQ> = tris.iter().map(|ts| TQ::And(ts.iter().filter(|t| !common.contains(t)).map(|&t| TQ::Tri(t)).collect())).collect();
+    let mut q = TQ::And(common.into_iter().map(TQ::Tri).collect());
+    if rest.iter().all(|r| !matches!(r, TQ::And(v) if v.is_empty())) {
+        q = and(q, TQ::Or(rest));
+    }
+    q
 }
 
 fn and(a: TQ, b: TQ) -> TQ {
@@ -1450,78 +1492,94 @@ fn and(a: TQ, b: TQ) -> TQ {
 }
 
 fn info(h: &Hir) -> Info {
-    let all = || Info { exact: None, q: TQ::All };
     match h.kind() {
-        HirKind::Empty | HirKind::Look(_) => Info { exact: Some(vec![Vec::new()]), q: TQ::All },
-        HirKind::Literal(l) => Info { exact: Some(vec![l.0.iter().map(|&b| fold(b)).collect()]), q: TQ::All },
-        HirKind::Class(c) => {
-            // Up to 8 members: each is an exact string.
-            let mut set: Vec<Vec<u8>> = match c {
-                Class::Unicode(u) => {
-                    u.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|ch| ch.to_string().bytes().map(fold).collect()).collect()
-                }
-                Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|x| vec![fold(x)]).collect(),
-            };
-            if set.len() > 8 {
-                return all();
-            }
-            set.sort();
-            set.dedup();
-            Info { exact: Some(set), q: TQ::All }
-        }
+        HirKind::Empty | HirKind::Look(_) => Info::exact(vec![Vec::new()]),
+        HirKind::Literal(l) => Info::exact(vec![l.0.iter().map(|&b| fold(b)).collect()]),
+        HirKind::Class(c) => class(c),
         HirKind::Capture(c) => info(&c.sub),
         HirKind::Repetition(r) => {
             if r.min == 0 {
-                return all();
+                return Info::any();
             }
             let i = info(&r.sub);
             if r.min == 1 && r.max == Some(1) {
                 return i;
             }
-            // At least one copy must appear.
-            Info { exact: None, q: and(i.q, exact_query(i.exact)) }
+            // At least one copy, which starts it; one ends it.
+            Info { q: and(i.q, exact_query(i.exact)), exact: None, prefix: i.prefix, suffix: i.suffix }
         }
-        HirKind::Concat(hs) => {
-            let mut cur = Info { exact: Some(vec![Vec::new()]), q: TQ::All };
-            for h in hs {
-                let n = info(h);
-                cur = match (cur.exact, n.exact) {
-                    (Some(a), Some(b)) if a.len() * b.len() <= MAX_EXACT => {
-                        let mut set: Vec<Vec<u8>> = a.iter().flat_map(|x| b.iter().map(move |y| [x.as_slice(), y].concat())).collect();
-                        set.sort();
-                        set.dedup();
-                        Info { exact: Some(set), q: and(cur.q, n.q) }
-                    }
-                    (a, b) => {
-                        let q = and(and(cur.q, exact_query(a)), n.q);
-                        match b {
-                            Some(b) if b.len() <= MAX_EXACT => Info { exact: Some(b), q },
-                            b => Info { exact: None, q: and(q, exact_query(b)) },
-                        }
-                    }
-                };
-            }
-            cur
-        }
+        HirKind::Concat(hs) => hs.iter().map(info).fold(Info::exact(vec![Vec::new()]), concat),
         HirKind::Alternation(hs) => {
             let parts: Vec<Info> = hs.iter().map(info).collect();
-            if parts.iter().all(|p| p.exact.is_some()) {
-                let mut set: Vec<Vec<u8>> = parts.iter().flat_map(|p| p.exact.clone().unwrap()).collect();
+            let union = |f: fn(&Info) -> &Option<Set>| {
+                let mut set = Set::new();
+                for p in &parts {
+                    set.extend(f(p).clone()?);
+                }
                 set.sort();
                 set.dedup();
-                if set.len() <= MAX_EXACT {
-                    return Info { exact: Some(set), q: TQ::All };
-                }
+                (set.len() <= MAX_EXACT).then_some(set)
+            };
+            let (exact, prefix, suffix) = (union(|p| &p.exact), union(|p| &p.prefix), union(|p| &p.suffix));
+            if exact.is_some() {
+                return Info { exact, prefix, suffix, q: TQ::All };
             }
-            let ors: Vec<TQ> = parts.into_iter().map(|p| and(p.q, exact_query(p.exact))).collect();
-            if ors.iter().any(|q| matches!(q, TQ::All)) { all() } else { Info { exact: None, q: TQ::Or(ors) } }
+            let ors: Vec<TQ> = parts.into_iter().map(Info::query).collect();
+            let q = if ors.iter().any(|q| matches!(q, TQ::All)) { TQ::All } else { TQ::Or(ors) };
+            Info { exact, prefix, suffix, q }
         }
     }
 }
 
+/// Up to 8 members are each an exact string; with more, their first bytes,
+/// if few (`\s`: tab to CR, space, and four UTF-8 lead bytes), start it.
+fn class(c: &Class) -> Info {
+    let mut set: Set = match c {
+        Class::Unicode(u) => {
+            u.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|ch| ch.to_string().bytes().map(fold).collect()).collect()
+        }
+        Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|x| vec![fold(x)]).collect(),
+    };
+    if set.len() <= 8 {
+        set.sort();
+        set.dedup();
+        return Info::exact(set);
+    }
+    let lead = |c: char| c.to_string().as_bytes()[0];
+    let mut first: Vec<u8> = match c {
+        Class::Unicode(u) => u.ranges().iter().flat_map(|r| lead(r.start())..=lead(r.end())).map(fold).collect(),
+        Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).map(fold).collect(),
+    };
+    first.sort();
+    first.dedup();
+    Info { prefix: (first.len() <= MAX_EXACT).then(|| first.into_iter().map(|b| vec![b]).collect()), ..Info::any() }
+}
+
+/// `a` then `b`. A match holds a's suffix right before b's prefix; that
+/// pairing is carried up in the prefix or suffix when one side is exact,
+/// else required here.
+fn concat(a: Info, b: Info) -> Info {
+    let exact = cross(&a.exact, &b.exact);
+    let ab_prefix = a.exact.as_ref().and(cross(&a.exact, &b.prefix));
+    let ab_suffix = b.exact.as_ref().and(cross(&a.suffix, &b.exact));
+    let mut q = and(a.q, b.q);
+    if exact.is_none() && ab_prefix.is_none() && ab_suffix.is_none() {
+        q = match cross(&a.suffix, &b.prefix) {
+            Some(j) => and(q, exact_query(Some(j))),
+            None => {
+                let sa = if a.exact.is_none() { exact_query(a.suffix.clone()) } else { TQ::All };
+                let pb = if b.exact.is_none() { exact_query(b.prefix.clone()) } else { TQ::All };
+                and(and(q, sa), pb)
+            }
+        };
+    }
+    let prefix = if a.exact.is_some() { ab_prefix.or(a.exact) } else { a.prefix };
+    let suffix = if b.exact.is_some() { ab_suffix.or(b.exact) } else { b.suffix };
+    Info { exact, prefix, suffix, q }
+}
+
 fn regex_plan(h: &Hir) -> TQ {
-    let i = info(h);
-    and(i.q, exact_query(i.exact))
+    info(h).query()
 }
 
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
