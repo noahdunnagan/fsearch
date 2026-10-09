@@ -165,7 +165,12 @@ impl Index {
         let mut chain = [0u32; 256];
         let mut k = 0;
         let mut e = i as u32;
-        while e != 0 && k < chain.len() {
+        while e != 0 {
+            if k == chain.len() {
+                // Deeper than the buffer: the rest of the way up first.
+                self.path(e as usize, out);
+                break;
+            }
             chain[k] = e;
             k += 1;
             e = self.dir_entry()[self.parent()[e as usize] as usize];
@@ -353,6 +358,11 @@ impl Index {
 
     fn from_map(map: Mmap) -> Option<Index> {
         let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
+        // Each count takes at least a byte per item, so a corrupt header
+        // can't make the section sizes below overflow.
+        if [n, d, u, names_len].iter().any(|&c| c > map.len()) {
+            return None;
+        }
         let (off, total) = layout(&section_lens(n, d, u, names_len));
         if map.len() < total {
             return None;
@@ -558,5 +568,294 @@ fn prior_adjust(name: &[u8], depth: u8) -> i32 {
         b"folders" | b"Containers" | b"Group Containers" => -10,
         b"Application Support" => -5,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::walk::tests::Tmp;
+    use crate::walk::{FLAG_HIDDEN, KIND_FILE, KIND_LINK, RawEnt};
+
+    const F: u8 = KIND_FILE;
+    const D: u8 = KIND_DIR;
+
+    /// A listing from (name, kind, size, child listing id or NONE).
+    pub(crate) fn lst(id: u32, ents: &[(&[u8], u8, u64, u32)]) -> Listing {
+        let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+        for (k, &(name, kind, size, child)) in ents.iter().enumerate() {
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime: 1000 + k as u32, child });
+            l.names.extend_from_slice(name);
+        }
+        l
+    }
+
+    fn sample() -> Index {
+        let ls = vec![
+            lst(0, &[(b"b.txt", F, 10, NONE), (b"Users", D, 0, 1), (b"Applications", D, 0, 2), (b"a", F | FLAG_HIDDEN, 3 << 30, NONE)]),
+            lst(1, &[(b"me", D, 0, 3)]),
+            lst(3, &[(b"notes.txt", F, 7, NONE), (b"Library", D, 0, 4), (b"X.app", D, 0, NONE), (b"\xff\xfe", F, 1, NONE)]),
+            lst(4, &[]),
+            lst(2, &[(b"Foo.app", D, 0, 5), (b"ln", KIND_LINK, 4, NONE)]),
+            lst(5, &[(b"notes.txt", F, 8, NONE)]),
+            // Unreachable: nothing points at it.
+            lst(9, &[(b"ghost", F, 1, NONE)]),
+        ];
+        Index::build(ls, 42, 77, b"/Users/me")
+    }
+
+    fn all_paths(idx: &Index) -> Vec<Vec<u8>> {
+        let mut p = Vec::new();
+        (0..idx.n)
+            .map(|i| {
+                idx.path(i, &mut p);
+                p.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_layout_and_lookup() {
+        let idx = sample();
+        assert_eq!((idx.n, idx.d, idx.event_id, idx.synced_at), (13, 6, 42, 77));
+        let paths = all_paths(&idx);
+        assert_eq!(paths[0], b"/");
+        assert!(!paths.iter().any(|p| p.ends_with(b"ghost")));
+        for (i, p) in paths.iter().enumerate() {
+            assert_eq!(idx.lookup(p), Some(i as u32), "{}", String::from_utf8_lossy(p));
+        }
+        assert_eq!(idx.lookup(b""), Some(0));
+        assert_eq!(idx.lookup(b"//Users//me/"), idx.lookup(b"/Users/me"));
+        assert_eq!(idx.lookup(b"/users/ME/NOTES.txt"), idx.lookup(b"/Users/me/notes.txt"));
+        assert_eq!(idx.lookup(b"/Users/me/notes"), None);
+        assert_eq!(idx.lookup(b"/Users/mee"), None);
+        assert_eq!(idx.lookup(b"/b.txt/x"), None, "a file has no children");
+        assert_eq!(idx.lookup(b"/Users/me/X.app/y"), None, "a dir without a listing has none either");
+        assert_eq!(idx.lookup(b"/Users/me/\xff\xfe").map(|e| idx.name(e as usize)), Some(&b"\xff\xfe"[..]));
+
+        let a = idx.lookup(b"/a").unwrap() as usize;
+        assert_eq!((idx.kind()[a], idx.size_of(a)), (F | FLAG_HIDDEN, 3 << 30));
+        let n = idx.lookup(b"/Applications/Foo.app/notes.txt").unwrap() as usize;
+        assert_eq!((idx.size_of(n), idx.mtime()[n]), (8, 1000));
+
+        // Children blocks are sorted and contiguous; parent/dir tables agree.
+        for d in 0..idx.d as u32 {
+            let r = idx.children(d);
+            assert!(r.clone().zip(r.clone().skip(1)).all(|(x, y)| idx.name(x) < idx.name(y)));
+            for c in r {
+                assert_eq!(idx.parent()[c], d);
+            }
+            assert_eq!(idx.dir_of(idx.dir_entry()[d as usize]), Some(d));
+            if d > 0 {
+                assert_eq!(idx.dir_parent()[d as usize], idx.parent()[idx.dir_entry()[d as usize] as usize]);
+            }
+        }
+        assert_eq!(idx.dir_of(idx.lookup(b"/b.txt").unwrap()), None);
+        assert_eq!(idx.dir_of(idx.lookup(b"/Users/me/X.app").unwrap()), None);
+
+        // Subtree ranges: /Users/me's range is exactly the entries under it.
+        let me = idx.dir_of(idx.lookup(b"/Users/me").unwrap()).unwrap();
+        let (s, e) = (idx.dir_start()[me as usize] as usize, idx.dir_end()[me as usize] as usize);
+        let under: Vec<usize> = (0..idx.n).filter(|&i| paths[i].starts_with(b"/Users/me/")).collect();
+        assert_eq!(under, (s..e).collect::<Vec<_>>());
+        let lib = idx.dir_of(idx.lookup(b"/Users/me/Library").unwrap()).unwrap();
+        assert_eq!(idx.descendants(me), lib..lib + 1);
+        assert_eq!(idx.descendants(0), 1..idx.d as u32);
+        assert!(idx.children(lib).is_empty());
+
+        // Interned names: both notes.txt share one id, entries listed ascending.
+        let id = idx.ent_name()[n];
+        let o = idx.name_ents_off();
+        let ents = &idx.name_ents()[o[id as usize] as usize..o[id as usize + 1] as usize];
+        assert_eq!(ents.len(), 2);
+        assert!(ents[0] < ents[1]);
+        assert_eq!(idx.uname(id), b"notes.txt");
+        assert_eq!(idx.name_mask()[id as usize], name_mask(b"notes.txt"));
+        assert_eq!(o[idx.u] as usize, idx.n);
+        assert!(idx.bytes() >= HDR);
+        idx.prefault();
+    }
+
+    #[test]
+    fn priors() {
+        let idx = sample();
+        let prior = |p: &[u8]| idx.dir_prior()[idx.dir_of(idx.lookup(p).unwrap()).unwrap() as usize];
+        assert_eq!(prior(b"/"), 0);
+        assert_eq!(prior(b"/Users"), 0);
+        assert_eq!(prior(b"/Users/me"), 15, "entering home");
+        assert_eq!(prior(b"/Users/me/Library"), -5);
+        assert_eq!(prior(b"/Applications"), 10);
+        assert_eq!(prior(b"/Applications/Foo.app"), -15);
+        // No home: nothing is boosted.
+        let idx = Index::build(vec![lst(0, &[(b"Users", D, 0, 1)]), lst(1, &[(b"me", D, 0, 2)]), lst(2, &[])], 0, 0, b"");
+        assert_eq!(idx.dir_prior(), [0, 0, 0]);
+
+        assert_eq!(prior_adjust(b"System", 1), -40);
+        assert_eq!(prior_adjust(b"anything", 1), -35);
+        assert_eq!(prior_adjust(b"Volumes", 1), -10);
+        assert_eq!(prior_adjust(b"Library", 1), -25);
+        assert_eq!(prior_adjust(b"opt", 1), -25);
+        assert_eq!(prior_adjust(b"Applications", 3), 30);
+        assert_eq!(prior_adjust(b"Foo.FRAMEWORK", 3), -20);
+        assert_eq!(prior_adjust(b".framework", 3), -25, "a bare extension is a dotfile, not a bundle");
+        assert_eq!(prior_adjust(b".git", 3), -25);
+        assert_eq!(prior_adjust(b"node_modules", 3), -30);
+        assert_eq!(prior_adjust(b"Caches", 3), -20);
+        assert_eq!(prior_adjust(b"Library", 3), -20);
+        assert_eq!(prior_adjust(b"target", 3), -12);
+        assert_eq!(prior_adjust(b"Containers", 3), -10);
+        assert_eq!(prior_adjust(b"Application Support", 3), -5);
+        assert_eq!(prior_adjust(b"src", 3), 0);
+        // Clamped at -100 however deep the penalties stack.
+        let mut ls: Vec<Listing> = (0..10u32).map(|k| lst(k, &[(b"node_modules", D, 0, k + 1)])).collect();
+        ls.push(lst(10, &[]));
+        let idx = Index::build(ls, 0, 0, b"");
+        assert_eq!(*idx.dir_prior().iter().min().unwrap(), -100);
+    }
+
+    #[test]
+    fn size_encoding() {
+        for s in [0, 1, 4096, (1 << 31) - 1] {
+            assert_eq!(dec_size(enc_size(s)), s);
+        }
+        assert_eq!(dec_size(enc_size(1 << 31)), 1 << 31);
+        // 2 MiB granularity above 2 GiB, rounding down.
+        let s = (5u64 << 30) + 12345;
+        assert_eq!(dec_size(enc_size(s)), 5 << 30);
+        // Saturates instead of wrapping; re-encoding is stable.
+        assert_eq!(dec_size(enc_size(u64::MAX)), ((1u64 << 31) - 1) << 21);
+        for s in [0, 77, 1 << 31, (9 << 30) + 1, u64::MAX] {
+            assert_eq!(enc_size(dec_size(enc_size(s))), enc_size(s));
+        }
+        assert!(enc_size(3 << 31) > enc_size((1 << 31) - 1), "order preserved across the switch");
+    }
+
+    #[test]
+    fn masks() {
+        assert_eq!(char_mask(b"aZ9.-_ \xc3!"), 1 | 1 << 25 | 1 << 35 | 1 << 36 | 1 << 37 | 1 << 38 | 1 << 39 | 1 << 40);
+        assert_eq!(char_bit(b'A'), char_bit(b'a'));
+        assert_eq!(name_mask(b""), 0);
+        assert_eq!(name_mask(b"."), char_bit(b'.') | start_bit(b'.'));
+        assert_eq!(name_mask(b".bashrc"), char_mask(b".bashrc") | start_bit(b'b'));
+        assert_eq!(name_mask(b"My file"), char_mask(b"My file") | start_bit(b'm') | start_bit(b'f'));
+        assert_eq!(start_bit(b'M'), start_bit(b'm'));
+        assert!((0..=255u8).all(|b| start_bit(b) >= 1 << 41));
+    }
+
+    #[test]
+    fn fx_hasher() {
+        use std::hash::{BuildHasher, Hasher};
+        let h = |b: &[u8]| {
+            let mut s = Fx.build_hasher();
+            s.write(b);
+            s.finish()
+        };
+        assert_ne!(h(b"abcdefghij"), h(b"abcdefghik"));
+        assert_eq!(h(b"same"), h(b"same"));
+    }
+
+    #[test]
+    fn memo_plan_covers_every_dir() {
+        // Root -> big (5000 empty dirs) and small (a chain of three).
+        let mut ls = vec![lst(0, &[(b"big", D, 0, 1), (b"small", D, 0, 2)]), lst(2, &[(b"s1", D, 0, 3)]), lst(3, &[(b"s2", D, 0, 4)]), lst(4, &[])];
+        let names: Vec<Vec<u8>> = (0..5000).map(|k| format!("d{k:04}").into_bytes()).collect();
+        let kids: Vec<(&[u8], u8, u64, u32)> = names.iter().enumerate().map(|(k, n)| (n.as_slice(), D, 0, 10 + k as u32)).collect();
+        ls.push(lst(1, &kids));
+        ls.extend((0..5000).map(|k| lst(10 + k, &[])));
+        let idx = Index::build(ls, 0, 0, b"");
+        assert_eq!(idx.d, 5005);
+        let p = idx.memo_plan();
+        let mut seen = vec![0u32; idx.d];
+        for &c in &p.upper {
+            seen[c as usize] += 1;
+        }
+        for (c, r) in &p.chunks {
+            assert_eq!(idx.descendants(*c), r.clone());
+            for k in r.clone() {
+                seen[k as usize] += 1;
+            }
+        }
+        assert_eq!(seen[0], 0);
+        assert!(seen[1..].iter().all(|&s| s == 1));
+        assert!(p.chunks.windows(2).all(|w| w[0].1.start < w[1].1.start));
+        assert!(std::ptr::eq(p, idx.memo_plan()), "computed once");
+    }
+
+    #[test]
+    fn deep_paths() {
+        // Deeper than path()'s fixed ancestor buffer (256).
+        let mut ls: Vec<Listing> = (0..300u32).map(|k| lst(k, &[(b"d", D, 0, k + 1)])).collect();
+        ls.push(lst(300, &[(b"leaf", F, 1, NONE)]));
+        let idx = Index::build(ls, 0, 0, b"");
+        let mut want = b"/d".repeat(300);
+        want.extend_from_slice(b"/leaf");
+        let leaf = idx.lookup(&want).unwrap();
+        let mut p = Vec::new();
+        idx.path(leaf as usize, &mut p);
+        assert_eq!(p, want);
+    }
+
+    #[test]
+    fn save_load() {
+        let t = Tmp::new("idx");
+        let idx = sample();
+        let path = t.p("index.bin");
+        assert_eq!(Index::saved_event_id(&path), None);
+        assert!(Index::load(&path).is_none());
+        idx.save(&path).unwrap();
+        assert!(!t.p("index.tmp").exists());
+        assert_eq!(Index::saved_event_id(&path), Some(42));
+        let back = Index::load(&path).unwrap();
+        assert_eq!((back.n, back.d, back.u, back.event_id, back.synced_at), (idx.n, idx.d, idx.u, 42, 77));
+        assert_eq!(all_paths(&back), all_paths(&idx));
+        assert_eq!(back.size_raw(), idx.size_raw());
+        assert_eq!(back.dir_prior(), idx.dir_prior());
+        assert_eq!(back.name_ents(), idx.name_ents());
+        assert_eq!(back.bytes(), idx.bytes());
+        // A loaded index saves again byte for byte.
+        back.save(&t.p("again.bin")).unwrap();
+        assert_eq!(std::fs::read(t.p("again.bin")).unwrap(), std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn load_rejects_bad_files() {
+        let t = Tmp::new("bad");
+        sample().save(&t.p("good")).unwrap();
+        let good = std::fs::read(t.p("good")).unwrap();
+        let try_load = |bytes: &[u8]| {
+            std::fs::write(t.p("f"), bytes).unwrap();
+            (Index::load(&t.p("f")).is_some(), Index::saved_event_id(&t.p("f")))
+        };
+        assert_eq!(try_load(&good), (true, Some(42)));
+        assert_eq!(try_load(b""), (false, None));
+        assert_eq!(try_load(&good[..40]), (false, None));
+        assert_eq!(try_load(&good[..HDR]), (false, Some(42)), "header only");
+        assert_eq!(try_load(&good[..good.len() - 1]), (false, Some(42)), "truncated");
+        let mut wrong = good.clone();
+        wrong[7] = b'6';
+        assert_eq!(try_load(&wrong), (false, None), "old format version");
+        // Counts so large the section sizes overflow must not wrap into a
+        // layout that "fits" the file.
+        for n in [u64::MAX, u64::MAX / 4 + 1, 1 << 62, 1 << 61] {
+            for field in [8, 16, 24, 32] {
+                let mut huge = good.clone();
+                huge[field..field + 8].copy_from_slice(&n.to_le_bytes());
+                assert!(!try_load(&huge).0, "field {field} = {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn build_from_scan() {
+        let t = Tmp::new("bscan");
+        t.file("x/y/z.txt", 3);
+        t.file("x/w", 0);
+        t.dir("e");
+        let idx = Index::build(crate::walk::scan(t.bytes(), 2), 0, 0, b"");
+        let mut got = all_paths(&idx);
+        got.sort();
+        let want: Vec<&[u8]> = vec![b"/", b"/e", b"/x", b"/x/w", b"/x/y", b"/x/y/z.txt"];
+        assert_eq!(got, want);
+        assert_eq!(idx.size_of(idx.lookup(b"/x/y/z.txt").unwrap() as usize), 3);
     }
 }
