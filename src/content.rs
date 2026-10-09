@@ -978,28 +978,32 @@ pub struct FileMatches {
     pub lines: Vec<(usize, String)>,
 }
 
-/// Read candidates in rank order, in parallel batches, until `limit` files
-/// have matched or the time budget is spent (best-ranked results first, so a
-/// cut-short search still returns the ones you most likely wanted).
+/// Read candidates in rank order until `limit` files have matched or the
+/// time budget is spent (best-ranked results first, so a cut-short search
+/// still returns the ones you most likely wanted). Each read thread claims
+/// the next unread candidate, so the files read are always a prefix of the
+/// ranking and reading stops as soon as the `limit`th match is in.
 pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let t = std::time::Instant::now();
-    let mut r = GrepResult { candidates: paths.len(), ..Default::default() };
-    let mut at = 0;
-    let mut batch = 64;
-    while at < paths.len() && r.files.len() < limit {
-        if g.budget.is_some_and(|b| t.elapsed() > b) {
-            break;
+    let (next, found) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let hits = std::sync::Mutex::new(Vec::new());
+    read_pool().broadcast(|_| {
+        while found.load(Relaxed) < limit && g.budget.is_none_or(|b| t.elapsed() <= b) {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(p) = paths.get(i) else { return };
+            if let Some(m) = match_file(g, p.as_ref()) {
+                found.fetch_add(1, Relaxed);
+                hits.lock().unwrap().push((i, m));
+            }
         }
-        let end = (at + batch).min(paths.len());
-        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref())).collect());
-        r.read += end - at;
-        r.files.extend(found.into_iter().flatten());
-        at = end;
-        batch = (batch * 2).min(1024);
-    }
-    r.complete = at >= paths.len() || r.files.len() >= limit;
-    r.files.truncate(limit);
-    r
+    });
+    let mut hits = hits.into_inner().unwrap();
+    hits.sort_unstable_by_key(|h| h.0);
+    hits.truncate(limit);
+    let read = next.into_inner().min(paths.len());
+    let complete = read == paths.len() || hits.len() >= limit;
+    GrepResult { files: hits.into_iter().map(|h| h.1).collect(), candidates: paths.len(), read, complete }
 }
 
 thread_local! {
