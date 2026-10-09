@@ -212,6 +212,7 @@ impl Engine {
             };
             *s.live.write().unwrap() = Some(Live::new(base));
             if owner {
+                rescan_unskipped(&s);
                 start_content(&s);
             }
             apply_loop(&s, rx);
@@ -352,8 +353,54 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
     s.owner.store(true, Ordering::Relaxed);
     log("took over the index from a previous owner");
     *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+    rescan_unskipped(s);
     start_content(s);
     true
+}
+
+/// Next to index.bin: the folders it lacks for want of access, one per
+/// line (skipped, or refused by macOS).
+const SKIPPED: &str = "skipped";
+
+fn note_skipped(dir: &Path) {
+    let mut out = Vec::new();
+    for p in walk::SKIP.get().into_iter().flatten().chain(walk::DENIED.lock().unwrap().iter()) {
+        out.extend_from_slice(p);
+        out.push(b'\n');
+    }
+    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+        log(format!("save failed: {e}"));
+    }
+}
+
+/// Full Disk Access granted since the save: the folders it lacked stay
+/// missing, since no FSEvents replay brings them back. Rescan them like a
+/// must-scan-subdirs event would; ones still refused carry over to the next
+/// save. (A save from before this was recorded rescans the gated folders.)
+fn rescan_unskipped(shared: &Shared) {
+    let was: Vec<Vec<u8>> = match std::fs::read(shared.dir.join(SKIPPED)) {
+        Ok(b) => b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect(),
+        Err(_) => gated(&shared.home),
+    };
+    let mut now = Vec::new();
+    for path in was {
+        if walk::blocked(&path) {
+            continue;
+        }
+        let readable = std::fs::read_dir(std::ffi::OsStr::from_bytes(&path)).map_or_else(|e| e.raw_os_error() != Some(libc::EPERM), |_| true);
+        if readable {
+            now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 });
+        } else {
+            walk::DENIED.lock().unwrap().push(path);
+        }
+    }
+    if now.is_empty() {
+        return;
+    }
+    log(format!("rescanning {} folders the saved index lacked", now.len()));
+    let _ = shared.wake.send(now);
+    // Saved soon, so the next start doesn't rescan them again.
+    shared.save_requested.store(true, Ordering::Relaxed);
 }
 
 fn wait_for_index(dir: &Path) -> Index {
@@ -487,6 +534,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
     }
+    note_skipped(&shared.dir);
     log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
     release_memory();
     // Re-map from the file so the index is clean, evictable page cache
@@ -516,6 +564,7 @@ fn compact(shared: &Shared) {
     if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
     }
+    note_skipped(&shared.dir);
     let idx = Index::load(&path).unwrap_or(idx);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));

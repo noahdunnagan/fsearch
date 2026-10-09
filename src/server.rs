@@ -52,7 +52,7 @@ pub fn stop(dir: &Path) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
     let mut killed = None;
-    for _ in 0..50 {
+    for _ in 0..300 {
         if try_lock(&lock) {
             return Ok(());
         }

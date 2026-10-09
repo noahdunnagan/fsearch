@@ -188,9 +188,12 @@ fn install(login: bool) {
     server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache.
-    let _ = std::fs::remove_file(&bin);
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    // path can be SIGKILLed by the code-signing cache. Copy then rename, so
+    // reinstalling from the installed copy works too.
+    let tmp = bin.with_extension("new");
+    std::fs::copy(std::env::current_exe().unwrap(), &tmp)
+        .and_then(|_| std::fs::rename(&tmp, &bin))
+        .unwrap_or_else(|e| die(&format!("copy: {e}")));
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
