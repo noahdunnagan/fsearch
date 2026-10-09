@@ -1915,7 +1915,9 @@ mod tests {
         assert_eq!(find(&l, "main limit:1").len(), 1);
         assert!(find(&l, "main limit:0").is_empty());
         assert_eq!(find(&l, "'main limit:18446744073709551615").len(), 3);
-        assert_eq!(find(&l, "type:app").len(), 2, "symlinked apps are not kind:dir");
+        // Symlinked apps count too (system apps link into the cryptex).
+        assert_eq!(find(&l, "type:app").len(), 3);
+        assert!(find(&l, "type:app").contains(&"/Applications/Notes.app".to_string()));
     }
 
     #[test]
