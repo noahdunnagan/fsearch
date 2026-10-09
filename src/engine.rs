@@ -184,7 +184,7 @@ impl Engine {
         let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
             Some(b) if b.event_id != 0 => b.event_id,
-            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
+            _ => fsevents::current_id(),
         };
         if owner {
             // Watch before scanning so nothing that changes mid-scan is
