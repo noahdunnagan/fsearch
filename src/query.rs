@@ -823,7 +823,7 @@ const INLINE_WORDS: usize = 4096;
 /// calling thread.
 const INLINE_VISITS: usize = 4096;
 /// One-token searches expected to match this many names go `ranked`.
-const RANKED_MIN: f64 = 100_000.0;
+const RANKED_MIN: f64 = 20_000.0;
 /// `driven` tries a token expected to match at most this many names.
 const DRIVEN_NAMES: f64 = 20_000.0;
 
@@ -851,9 +851,11 @@ impl Searcher<'_> {
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
         let Some((lo, hi)) = self.scope_range(q) else { return Vec::new() };
-        if let Some(t) = self.rankable(q) {
+        if let Some(t) = self.rankable(q, lo, hi) {
             let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then(|| self.scope_names(lo, hi));
-            return self.ranked(q, t, lo, hi, scope.as_deref());
+            if let Some(hits) = self.ranked(q, t, lo, hi, scope.as_deref()) {
+                return hits;
+            }
         }
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
@@ -877,19 +879,20 @@ impl Searcher<'_> {
         s.full(lo, hi, memo.map(|m| m.as_slice()))
     }
 
-    /// The query's token if `ranked` can answer it: one fuzzy token, no
-    /// filter on the entries themselves, and broad enough to be worth it
-    /// (going by how many names have each of its char classes).
-    fn rankable<'q>(&self, q: &'q Query) -> Option<&'q Token> {
-        let [t] = &q.tokens[..] else { return None };
-        if t.negate
-            || t.mode != Mode::Fuzzy
-            || q.kind.is_some()
-            || q.size != (0, u64::MAX)
-            || q.mtime != (0, u32::MAX)
-            || q.path_re.is_some()
-            || q.limit == 0
-        {
+    /// The query's token if `ranked` can answer it: one fuzzy token (and any
+    /// negated ones), no filter on the entries themselves, and broad enough
+    /// to be worth it (going by how many names have each of its classes).
+    fn rankable<'q>(&self, q: &'q Query, lo: usize, hi: usize) -> Option<&'q Token> {
+        let mut pos = q.tokens.iter().filter(|t| !t.negate);
+        let (Some(t), None) = (pos.next(), pos.next()) else { return None };
+        if t.mode != Mode::Fuzzy || q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX) || q.path_re.is_some() || q.limit == 0 {
+            return None;
+        }
+        // Typing on from a table (the last query was narrow): narrowing it
+        // is cheaper.
+        let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then_some((lo, hi));
+        let key = NameKey::of(q, scope);
+        if self.live.names_cache.last.lock().unwrap().as_ref().is_some_and(|p| key.narrows(&p.key)) {
             return None;
         }
         let (counts, u) = (self.live.base.class_counts(), self.live.base.u as f64);
@@ -905,7 +908,10 @@ impl Searcher<'_> {
     /// a word starting like the token are scored: the rest cannot get the
     /// placement bonus, score at most 24 per char + 8, and are only read if
     /// that bound could still make it.
-    fn ranked(&self, q: &Query, t: &Token, lo: usize, hi: usize, within: Option<&NameSet>) -> Vec<Hit> {
+    /// None if it turns out narrow (fewer than `limit` hits among the names
+    /// scored up front): then a name table, which typing can narrow from,
+    /// costs about the same.
+    fn ranked(&self, q: &Query, t: &Token, lo: usize, hi: usize, within: Option<&NameSet>) -> Option<Vec<Hit>> {
         let idx = &self.live.base;
         let (prior, ne_off, ne, name_off) = (idx.name_prior(), idx.name_ents_off(), idx.name_ents(), idx.name_off());
         let tb = TokenBits::new(idx, t);
@@ -914,13 +920,15 @@ impl Searcher<'_> {
         let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
         let (dot, app) = (idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP));
         let tweak = |flags: u8| 10 + if flags & NF_APP != 0 { 25 } else { 0 } - if flags & NF_DOT != 0 { 8 } else { 0 };
+        let neg: Vec<&Token> = q.tokens.iter().filter(|t| t.negate).collect();
         // Name k (bit i of word w): its hit and the bound on its entries.
         let score = |w: usize, i: u32, (_, clean, typo): (u64, u64, u64), re: Option<&regex::bytes::Regex>| -> Option<Cand> {
             let k = w * 64 + i as usize;
             let name = idx.uname(k as u32);
             let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
             let s = token_score(name, t.known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced), t)?;
-            if !(q.exts.is_empty() || ext_ok(name, &q.exts)) || re.is_some_and(|re| !re.is_match(name)) {
+            if !(q.exts.is_empty() || ext_ok(name, &q.exts)) || re.is_some_and(|re| !re.is_match(name)) || neg.iter().any(|t| token_matches(name, t))
+            {
                 return None;
             }
             let score = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -963,16 +971,39 @@ impl Searcher<'_> {
             now: now_secs(),
         };
         let entries = |k: u32| &ne[ne_off[k as usize] as usize..ne_off[k as usize + 1] as usize];
-        let (parent, dir_prior) = (idx.parent(), idx.dir_prior());
+        let (parent, dir_prior, de, dp, en) = (idx.parent(), idx.dir_prior(), idx.dir_entry(), idx.dir_parent(), idx.ent_name());
+        // Whether a folder on the path to dir `d` has a negated token's name.
+        let negated = |d: u32, cache: &mut HashMap<u32, bool, crate::index::Fx>| {
+            let mut chain = Vec::new();
+            let mut k = d;
+            let mut out = loop {
+                if k == 0 {
+                    break false;
+                }
+                if let Some(&b) = cache.get(&k) {
+                    break b;
+                }
+                chain.push(k);
+                k = dp[k as usize];
+            };
+            for &k in chain.iter().rev() {
+                out = out || neg.iter().any(|t| token_matches(idx.uname(en[de[k as usize] as usize]), t));
+                cache.insert(k, out);
+            }
+            out
+        };
         let visit = |names: &[Cand]| {
             top_k(names.len(), q.limit, names.iter().map(|x| entries(x.k).len()).sum(), |r, top| {
-                let mut pbuf = Vec::new();
+                let (mut pbuf, mut cache) = (Vec::new(), HashMap::default());
                 for c in &names[r] {
                     let nh = NameHit { score: c.score, bits: 1, flags: c.flags, best: [0; 4] };
                     for &e in entries(c.k).iter().filter(|&&e| (lo..hi).contains(&(e as usize))) {
                         // Entries come best prior first: the rest cannot make it either.
                         if key(c.score as i32 + dir_prior[parent[e as usize] as usize] as i32 + tweak(c.flags), 0) <= top.floor {
                             break;
+                        }
+                        if !neg.is_empty() && negated(parent[e as usize], &mut cache) {
+                            continue;
                         }
                         if let Some(key) = scan.score(e as usize, nh, DirMemo::default(), top.floor, &mut pbuf, None) {
                             top.push(key);
@@ -1004,11 +1035,14 @@ impl Searcher<'_> {
         let (hits, floor) = best(visit(&first));
         let more: Vec<_> = rest.into_iter().filter(|x| x.bound >= floor).collect();
         let (hits, floor) = best(hits.into_iter().chain(visit(&more)).collect());
+        if floor == i32::MIN {
+            return None;
+        }
         // Names no word of which starts like the token get no placement
         // bonus; unless an app's (+25) beats the floor, most are out unread.
         let plain = 24 * t.text.len() as i32 + 8 + idx.top_prior() as i32;
         let only: &[u64] = match floor {
-            f if f > plain + tweak(NF_APP) => return hits,
+            f if f > plain + tweak(NF_APP) => return Some(hits),
             f if f > plain + tweak(0) => app,
             _ => &[],
         };
@@ -1020,7 +1054,7 @@ impl Searcher<'_> {
             plain - idx.top_prior() as i32 - len.min(80) / 3 + prior[k] as i32 + tweak(flags) >= floor
         };
         let rest: Vec<_> = gather(&pick, &bound).into_iter().filter(|x| x.bound >= floor).collect();
-        best(hits.into_iter().chain(visit(&rest)).collect()).0
+        Some(best(hits.into_iter().chain(visit(&rest)).collect()).0)
     }
 
     /// Several tokens: a hit has each in its own name or in a folder above
