@@ -108,6 +108,26 @@ pub fn watch(root: &std::path::Path, since: u64, _latency: f64, tx: Sender<Vec<E
                                 }
                                 for path in evt.paths {
                                     let path_bytes = path.as_os_str().as_encoded_bytes().to_vec();
+                                    // Dropped watches must go: inotify lets go
+                                    // of a watched dir on remove/rename-out,
+                                    // but the set would keep it forever, leak
+                                    // the descriptor and skip the re-watch on
+                                    // recreate. The set stays prefix-closed,
+                                    // so a missing entry means no descendant
+                                    // entry either; only scan on a hit.
+                                    if matches!(
+                                        evt.kind,
+                                        EventKind::Remove(_)
+                                            | EventKind::Modify(notify::event::ModifyKind::Name(
+                                                notify::event::RenameMode::From | notify::event::RenameMode::Both
+                                            ))
+                                    ) && watched.contains(&path)
+                                    {
+                                        for w in watched.iter().filter(|w| w.starts_with(&path)).cloned().collect::<Vec<_>>() {
+                                            let _ = watcher.unwatch(&w);
+                                            watched.remove(&w);
+                                        }
+                                    }
                                     // New dirs need their own watches (`NonRecursive`
                                     // parents do not extend). Fresh dirs arrive as
                                     // Create, moved-in trees as Modify(Name).
@@ -333,6 +353,33 @@ mod tests {
         let sub_bytes = root.join("ok").join("sub").as_os_str().as_encoded_bytes().to_vec();
         let got = collect_until(&rx, &|e| e.path == sub_bytes, Duration::from_secs(5));
         assert!(got.iter().any(|e| e.path == sub_bytes), "new-dir update never converged: {got:?}");
+        teardown(&root);
+    }
+
+    #[test]
+    fn delete_recreate_reconverges() {
+        let root = fixture("recreate");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _stream = watch(&root, 0, 0.1, tx);
+        let got = collect_until(&rx, &|e| e.flags & HISTORY_DONE != 0, Duration::from_secs(5));
+        assert!(got.iter().any(|e| e.flags & HISTORY_DONE != 0), "no HISTORY_DONE; batches: {got:?}");
+
+        // Remove a watched dir, let the removal propagate, then recreate
+        // it. The recreated dir must reconverge (re-watched).
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        // Drain removal batches so the recreate is a distinct step.
+        while rx.try_recv().is_ok() {}
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        // Drain the recreate batch itself: liveness means writes *inside*
+        // the recreated dir converge afterwards, not just the re-add relist.
+        while rx.try_recv().is_ok() {}
+        std::fs::write(root.join("sub").join("deep.txt"), b"d").unwrap();
+        let sub_bytes = root.join("sub").as_os_str().as_encoded_bytes().to_vec();
+        let got = collect_until(&rx, &|e| e.path == sub_bytes, Duration::from_secs(8));
+        assert!(got.iter().any(|e| e.path == sub_bytes), "recreated dir never reconverged (stale watch?): {got:?}");
         teardown(&root);
     }
 
