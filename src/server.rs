@@ -45,16 +45,24 @@ pub fn serve(dir: PathBuf, home: String) {
 /// let go of the socket lock. One already on its way out (say, after a
 /// launchd bootout) is just waited for.
 pub fn stop(dir: &Path) -> Result<(), String> {
+    stop_within(dir, Duration::from_secs(30))
+}
+
+fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
-    let mut killed = None;
-    for _ in 0..300 {
+    let me = std::process::id() as i32;
+    let (mut killed, mut stale) = (None, false);
+    for _ in 0..timeout.as_millis().div_ceil(100) {
         if try_lock(&lock) {
             return Ok(());
         }
         if killed.is_none() {
-            killed =
-                std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1 && p as u32 != std::process::id());
+            // Our own pid: left by an earlier daemon, and the holder hasn't
+            // written its own yet. Never signal ourselves; read again.
+            let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+            stale = pid == Some(me);
+            killed = pid.filter(|&p| p != me);
             if let Some(pid) = killed {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
@@ -63,6 +71,9 @@ pub fn stop(dir: &Path) -> Result<(), String> {
     }
     Err(match killed {
         Some(pid) => format!("daemon {pid} did not exit"),
+        None if stale => {
+            format!("socket.lock holds a stale pid ({me}, this process); the daemon holding the lock never recorded its own: stop it by hand")
+        }
         None => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
 }
@@ -491,6 +502,21 @@ mod tests {
 
     /// The lock's holder hasn't written its pid yet, and the file still
     /// names a stale pid that is now ours: never signal ourselves.
+    /// A stale pid that is now ours, with someone else still holding the
+    /// lock: say so, rather than claim no pid was recorded.
+    #[test]
+    fn stop_names_a_stale_pid_that_is_ours() {
+        let dir = root().join("stop3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock(&held));
+        let err = stop_within(&dir, Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("stale") && err.contains(&std::process::id().to_string()), "{err}");
+        drop(held);
+    }
+
     #[test]
     fn stop_never_signals_itself() {
         let dir = root().join("stop2");
