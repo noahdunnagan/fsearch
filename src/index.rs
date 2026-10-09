@@ -7,8 +7,9 @@
 //! not a filter.
 //!
 //! Names are interned: 7.5M entries share ~2M distinct names, so each name
-//! is stored once with its char mask, and queries score unique names, not
-//! entries.
+//! is stored once, and queries score unique names, not entries. Which names
+//! can match a query is answered 64 names at a time from per-class bitmaps
+//! (see `name_bits`) before any name is read.
 
 use crate::walk::{KIND_DIR, Listing, NONE};
 use memmap2::{Mmap, MmapMut};
@@ -17,11 +18,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX007";
+const MAGIC: &[u8; 8] = b"FSIDX008";
 
 #[derive(Clone, Copy)]
 enum Sec {
-    NameMask,
+    NameBits,
     NameOff,
     Names,
     EntName,
@@ -48,6 +49,9 @@ pub struct Index {
     pub u: usize,
     names_len: usize,
     u1: usize,
+    /// Words per name bitmap (64 names each), and all bitmaps' words.
+    pub words: usize,
+    bits_len: usize,
     /// FSEvents id the index is current as of; replay starts here.
     pub event_id: u64,
     /// Wall-clock second the index is known complete as of (0: unknown).
@@ -56,6 +60,7 @@ pub struct Index {
     pub synced_at: u32,
     off: [usize; NSEC],
     plan: std::sync::OnceLock<MemoPlan>,
+    counts: std::sync::OnceLock<[u32; CLASSES]>,
 }
 
 /// How to fold per-dir data down the tree in parallel (see `memo_plan`).
@@ -79,8 +84,9 @@ macro_rules! sec {
 pub(crate) use sec;
 
 impl Index {
-    // Per distinct name: char mask, offset into `names` (u + 1 entries).
-    sec!(name_mask, Sec::NameMask, u64, u);
+    // Per distinct name: the name bitmaps (see `bitmap`), offset into
+    // `names` (u + 1 entries).
+    sec!(name_bits, Sec::NameBits, u64, bits_len);
     sec!(name_off, Sec::NameOff, u32, u1);
     sec!(names, Sec::Names, u8, names_len);
     // Per entry: its name id, kind (walk::KIND_* | walk::FLAG_*), dir id of
@@ -102,6 +108,19 @@ impl Index {
     // query visits only these instead of every entry on disk.
     sec!(name_ents_off, Sec::NameEntsOff, u32, u1);
     sec!(name_ents, Sec::NameEnts, u32, n);
+
+    /// Name bitmap `b` (see `BM_FIRST` and on): bit `k % 64` of word `k / 64`
+    /// is set when name `k` has the property.
+    pub fn bitmap(&self, b: usize) -> &[u64] {
+        &self.name_bits()[b * self.words..][..self.words]
+    }
+
+    /// How many names have each char class: a query checks rare ones first.
+    pub fn class_counts(&self) -> &[u32; CLASSES] {
+        self.counts.get_or_init(|| {
+            std::array::from_fn(|c| self.bitmap(BM_FIRST + c).iter().zip(self.bitmap(BM_SECOND + c)).map(|(a, b)| (a | b).count_ones()).sum())
+        })
+    }
 
     pub fn uname(&self, id: u32) -> &[u8] {
         let o = self.name_off();
@@ -279,8 +298,24 @@ impl Index {
         }
         let u = ids.len();
         drop(ids);
-        let mut umask = vec![0u64; u];
-        umask.par_iter_mut().enumerate().for_each(|(k, m)| *m = name_mask(&unames[uoff[k] as usize..uoff[k + 1] as usize]));
+        let words = u.div_ceil(64);
+        // Each 64-name block's word of every bitmap, then transposed so each
+        // bitmap is contiguous.
+        let mut by_block = vec![0u64; words * NBITMAPS];
+        by_block.par_chunks_mut(NBITMAPS).enumerate().for_each(|(w, out)| {
+            for k in w * 64..(w * 64 + 64).min(u) {
+                for b in name_bitmaps(&unames[uoff[k] as usize..uoff[k + 1] as usize]) {
+                    out[b] |= 1 << (k % 64);
+                }
+            }
+        });
+        let mut ubits = vec![0u64; words * NBITMAPS];
+        ubits.par_chunks_mut(words).enumerate().for_each(|(b, out)| {
+            for (w, o) in out.iter_mut().enumerate() {
+                *o = by_block[w * NBITMAPS + b];
+            }
+        });
+        drop(by_block);
         let enc: Vec<u32> = size[..n].iter().map(|&s| enc_size(s)).collect();
         // Entries grouped by name (counting sort keeps them ascending).
         let mut ne_off = vec![0u32; u + 1];
@@ -331,7 +366,7 @@ impl Index {
         let (off, total) = layout(&section_lens(n, d, u, unames.len()));
         let mut m = MmapMut::map_anon(total).expect("anon map");
         let mut put = |s: Sec, v: &[u8]| m[off[s as usize]..][..v.len()].copy_from_slice(v);
-        put(Sec::NameMask, as_bytes(&umask));
+        put(Sec::NameBits, as_bytes(&ubits));
         put(Sec::NameOff, as_bytes(&uoff));
         put(Sec::Names, &unames);
         put(Sec::EntName, as_bytes(&ent_name));
@@ -354,6 +389,7 @@ impl Index {
     fn from_map(map: Mmap) -> Option<Index> {
         let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
         let (off, total) = layout(&section_lens(n, d, u, names_len));
+        let words = u.div_ceil(64);
         if map.len() < total {
             return None;
         }
@@ -363,11 +399,14 @@ impl Index {
             u,
             u1: u + 1,
             names_len,
+            words,
+            bits_len: words * NBITMAPS,
             event_id: event_id as u64,
             synced_at: synced_at as u32,
             off,
             map,
             plan: std::sync::OnceLock::new(),
+            counts: std::sync::OnceLock::new(),
         })
     }
 
@@ -402,7 +441,7 @@ impl Index {
     /// rest (sizes, mtimes, dir tables) page in on demand.
     pub fn prefault(&self) {
         let mut sum = 0u8;
-        for s in [Sec::NameMask, Sec::NameOff, Sec::Names, Sec::EntName, Sec::Kind, Sec::Parent] {
+        for s in [Sec::NameBits, Sec::NameOff, Sec::Names, Sec::EntName, Sec::Kind, Sec::Parent] {
             let start = self.off[s as usize];
             let end = self.off.get(s as usize + 1).copied().unwrap_or(self.map.len());
             for i in (start..end).step_by(16 * 1024) {
@@ -410,6 +449,7 @@ impl Index {
             }
         }
         std::hint::black_box(sum);
+        self.class_counts();
     }
 }
 
@@ -447,7 +487,7 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
-    [u * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4, (u + 1) * 4, n * 4]
+    [u.div_ceil(64) * NBITMAPS * 8, (u + 1) * 4, names_len, n * 4, n, n * 4, n * 4, n * 4, d * 4, d * 4, d * 4, d * 4, d, d * 4, (u + 1) * 4, n * 4]
 }
 
 /// Sizes in 4 bytes: exact below 2 GiB, 2 MiB granularity above.
@@ -502,7 +542,39 @@ pub fn name_mask(s: &[u8]) -> u64 {
 /// The `name_mask` bit for a word starting with `b` (bits 41..64).
 #[inline]
 pub fn start_bit(b: u8) -> u64 {
-    1 << (41 + b.to_ascii_lowercase() % 23)
+    1 << (CLASSES + start_hash(b))
+}
+
+#[inline]
+pub fn start_hash(b: u8) -> usize {
+    (b.to_ascii_lowercase() % 23) as usize
+}
+
+/// Char classes (`char_bit`).
+pub const CLASSES: usize = 41;
+/// Name bitmaps, per char class: names with that class in their first half
+/// (`BM_FIRST + class`), in their second half (`BM_SECOND + class`). A
+/// query's chars must appear in order, so a name can only match if some
+/// prefix of the query fits its first half and the rest its second half.
+pub const BM_FIRST: usize = 0;
+pub const BM_SECOND: usize = CLASSES;
+/// Names with a word starting with a letter of this `start_bit` hash.
+pub const BM_START: usize = 2 * CLASSES;
+/// Names starting with a dot; names ending in ".app".
+pub const BM_DOT: usize = BM_START + 23;
+pub const BM_APP: usize = BM_DOT + 1;
+pub const NBITMAPS: usize = BM_APP + 1;
+
+/// The bitmaps (see `BM_FIRST` and on) a name is in.
+fn name_bitmaps(s: &[u8]) -> impl Iterator<Item = usize> {
+    let (a, b) = s.split_at(s.len() / 2);
+    let class = |m: u64, base: usize| (0..CLASSES).filter(move |c| m & (1 << c) != 0).map(move |c| base + c);
+    let starts = name_mask(s) >> CLASSES;
+    class(char_mask(a), BM_FIRST)
+        .chain(class(char_mask(b), BM_SECOND))
+        .chain((0..23).filter(move |h| starts & (1 << h) != 0).map(|h| BM_START + h))
+        .chain(s.first().is_some_and(|&c| c == b'.').then_some(BM_DOT))
+        .chain(s.ends_with(b".app").then_some(BM_APP))
 }
 
 #[inline]
