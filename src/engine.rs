@@ -321,7 +321,11 @@ impl Shared {
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
     fn watch(&self, since: u64) {
         self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(&self.root, since, 0.1, self.wake.clone());
+        // The data dir too when it's outside the root: a follower spots the
+        // owner's saves by their events.
+        let dir = self.dir.as_os_str().as_bytes();
+        let paths: &[&[u8]] = if crate::live::is_ancestor(&self.root, dir) { &[&self.root] } else { &[&self.root, dir] };
+        let new = fsevents::watch(paths, since, 0.1, self.wake.clone());
         *self.stream.lock().unwrap() = Some(new);
     }
 
@@ -684,6 +688,12 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     ));
 }
 
+/// FSEvents lost track of the whole watched root (dropped events, or no
+/// history back to our save).
+fn lost_track(e: &fsevents::Event, root: &[u8]) -> bool {
+    e.flags & MUST_SCAN_SUBDIRS != 0 && crate::live::normalize(&e.path) == root
+}
+
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
@@ -698,20 +708,27 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
+        // Only the root is indexed; a data dir outside it is watched for the above.
+        events.retain(|e| e.flags & HISTORY_DONE != 0 || crate::live::is_ancestor(&shared.root, &e.path));
         if !events.is_empty() {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
             let (mut max_id, mut root_flags) = (0, 0);
             for e in events {
                 max_id = max_id.max(e.id);
-                if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
+                // Recovered like `/`: Live answers it with a relist of what
+                // changed, not a rescan of the whole root.
+                let path = if lost_track(&e, &shared.root) {
                     root_flags |= e.flags;
-                }
+                    b"/".to_vec()
+                } else {
+                    e.path
+                };
                 if e.flags & HISTORY_DONE != 0 {
                     log("replay done");
                     shared.replaying.store(false, Ordering::Relaxed);
                     continue;
                 }
-                *dirs.entry(crate::live::normalize(&e.path)).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
+                *dirs.entry(crate::live::normalize(&path)).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
             }
             let mut rebuild = false;
             let mut trees = Vec::new();
@@ -841,11 +858,24 @@ mod tests {
             {
                 let mut g = e.s.live.write().unwrap();
                 g.as_mut().unwrap().synced_at = later - 10;
-                let ev = fsevents::Event { path: b"/".to_vec(), flags: MUST_SCAN_SUBDIRS | flags, id: 0 };
+                // Lost history is reported for the watched root.
+                let ev = fsevents::Event { path: e.s.root.clone(), flags: MUST_SCAN_SUBDIRS | flags, id: 0 };
                 e.s.wake.send(vec![ev]).unwrap();
             }
             wait_for("a relist", || synced_at(&e) <= crate::query::now_secs());
         }
+    }
+
+    /// Under `FSEARCH_ROOT`, lost history is reported for the root, not `/`.
+    #[test]
+    fn lost_track_is_reported_for_the_watched_root() {
+        let ev = |p: &[u8], flags| fsevents::Event { path: p.to_vec(), flags, id: 0 };
+        assert!(lost_track(&ev(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED), b"/"));
+        assert!(lost_track(&ev(b"/tmp/r", MUST_SCAN_SUBDIRS | KERNEL_DROPPED), b"/tmp/r"));
+        assert!(lost_track(&ev(b"/tmp/r/", MUST_SCAN_SUBDIRS), b"/tmp/r"));
+        assert!(!lost_track(&ev(b"/tmp/r/sub", MUST_SCAN_SUBDIRS), b"/tmp/r"));
+        assert!(!lost_track(&ev(b"/tmp/r", 0), b"/tmp/r"));
+        assert!(!lost_track(&ev(b"/", MUST_SCAN_SUBDIRS), b"/tmp/r"));
     }
 
     #[test]

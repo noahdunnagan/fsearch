@@ -81,13 +81,13 @@ impl Drop for Stream {
     }
 }
 
-/// Watch `root` (normally `/`) from `since` (an event id). Batches of
+/// Watch `paths` (normally just `/`) from `since` (an event id). Batches of
 /// directory-level events arrive on `tx` until the returned stream is dropped.
-pub fn watch(root: &[u8], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
-    let root = std::ffi::CString::new(root).expect("root has no NUL");
+pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+    let paths: Vec<_> = paths.iter().map(|p| std::ffi::CString::new(*p).expect("path has no NUL")).collect();
     unsafe {
-        let root = CFStringCreateWithCString(std::ptr::null(), root.as_ptr(), 0x0800_0100);
-        let arr = CFArrayCreate(std::ptr::null(), &root, 1, &kCFTypeArrayCallBacks as *const c_void);
+        let cf: Vec<*const c_void> = paths.iter().map(|p| CFStringCreateWithCString(std::ptr::null(), p.as_ptr(), 0x0800_0100)).collect();
+        let arr = CFArrayCreate(std::ptr::null(), cf.as_ptr(), cf.len() as isize, &kCFTypeArrayCallBacks as *const c_void);
         // The sender is leaked: a callback may still be in flight when the
         // stream stops, and streams are replaced rarely.
         let ctx = Context {

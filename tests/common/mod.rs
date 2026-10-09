@@ -63,6 +63,24 @@ impl Drop for Scratch {
     }
 }
 
+/// A folder outside the index root, removed on drop.
+pub struct Outside(pub PathBuf);
+
+impl Outside {
+    pub fn new(tag: &str) -> Outside {
+        let p = std::env::temp_dir().join(format!("fsearch-out-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Outside(std::fs::canonicalize(p).unwrap())
+    }
+}
+
+impl Drop for Outside {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Poll `f` until it holds; panics with `what` after `secs`.
 pub fn wait_for(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
     let t = Instant::now();

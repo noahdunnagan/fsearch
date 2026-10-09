@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Scratch, hold_lock, real, saved, wait_for};
+use common::{Outside, Scratch, hold_lock, real, root, saved, wait_for};
 use fsearch::{Engine, Grep, GrepMode, Options, Query};
 use std::path::{Path, PathBuf};
 
@@ -115,6 +115,34 @@ fn restart_loads_the_saved_index_and_replays() {
 /// A follower reads the owner's index, picks up its saves promptly (even
 /// when its dir is given through a symlink, as temp dirs are), and takes
 /// over when the owner lets go.
+/// A data dir outside the indexed root still gets events: a follower sees
+/// the owner's save there without waiting for its fallback check.
+#[test]
+fn follower_follows_a_data_dir_outside_the_root() {
+    let s = Scratch::new();
+    let home = s.mkdir("home");
+    s.write("home/yakfile", "");
+    let owner = start(&s.path("data"), &home);
+    ready(&owner);
+
+    let out = Outside::new("follower-data");
+    assert!(!out.0.starts_with(root()));
+    std::fs::copy(s.path("data/index.bin"), out.0.join("index.bin")).unwrap();
+    let _held = hold_lock(&out.0.join("daemon.lock"));
+    let f = start(&out.0, &home);
+    ready(&f);
+    assert!(!f.status().owner);
+
+    let b = s.write("home/elkfile", "");
+    wait_for(10, "the owner's update", || finds(&owner, "elkfile", &b));
+    saved(&s.path("data"), || owner.save());
+    let want = fsearch::index::Index::load(&s.path("data/index.bin")).unwrap().n;
+    let tmp = out.0.join("index.tmp");
+    std::fs::copy(s.path("data/index.bin"), &tmp).unwrap();
+    std::fs::rename(&tmp, out.0.join("index.bin")).unwrap();
+    wait_for(5, "the follower to reload", || f.status().entries == want);
+}
+
 #[test]
 fn follower_follows_then_takes_over() {
     let s = Scratch::new();
