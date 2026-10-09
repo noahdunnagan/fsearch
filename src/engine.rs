@@ -82,9 +82,8 @@ struct Shared {
     /// Wakes the apply loop; an empty batch is a no-op wake-up.
     wake: Sender<Vec<fsevents::Event>>,
     save_requested: AtomicBool,
-    /// (dirs, trees) for the content worker to re-sync.
-    content_tx: Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
-    content_rx: Mutex<Option<Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>>>,
+    content_tx: Sender<Resync>,
+    content_rx: Mutex<Option<Receiver<Resync>>>,
     content_pending: AtomicUsize,
     /// Holding `lock`: this engine writes the index files. Another process
     /// may own them (the daemon, an app); then this one follows: it reads
@@ -295,6 +294,9 @@ impl Engine {
     }
 }
 
+/// (dirs, trees) for the content worker to re-sync.
+type Resync = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
 
 impl Shared {
@@ -382,7 +384,7 @@ pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
-fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
+fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
@@ -437,7 +439,7 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
             content::wants(live, &home, &dirs, &trees)
         };
         let todo = shared.content.write().unwrap().diff(wants);
-        if todo.len() == 0 {
+        if todo.is_empty() {
             continue;
         }
         let n = todo.len();
