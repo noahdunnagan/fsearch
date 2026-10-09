@@ -344,6 +344,9 @@ impl Docs {
     pub fn len(&self) -> usize {
         self.items.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
     fn sort(&mut self) {
         let buf = &self.buf;
         self.items.sort_by(|a, b| buf[a.0 as usize..(a.0 + a.1) as usize].cmp(&buf[b.0 as usize..(b.0 + b.1) as usize]));
@@ -583,7 +586,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let mtime: Vec<u32> = docs.iter().map(|d| d.mtime).collect();
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
-    by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(&docs[b as usize].path));
+    by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
 
     let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len()));
     let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64]);
@@ -1017,7 +1020,7 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
         let mut lines = Vec::new();
         let (mut line_no, mut counted) = (1usize, 0usize);
         let mut last_line_start = usize::MAX;
-        for m in g.re.find_iter(&buf) {
+        for m in g.re.find_iter(buf) {
             line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
             counted = m.start();
             let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
