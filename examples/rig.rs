@@ -3,7 +3,9 @@
 //! identical output.
 //!
 //!   rig gen <snap dir> <corpus.json>            sample queries from the index
-//!   rig run <snap dir> <corpus.json> <out.json> time them
+//!   rig run <snap dir> <corpus.json> <out.json> [kinds]   time them
+//!
+//! kinds: comma-separated subset of name,idle,typing,grep (default all).
 //!
 //! `<snap dir>` holds `index.bin` and `content/` (APFS clones of the live
 //! ones, so the daemon keeps running untouched). Compare builds with
@@ -22,8 +24,8 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     match a.first().map(String::as_str) {
         Some("gen") => gen_corpus(Path::new(&a[1]), &a[2]),
-        Some("run") => run(Path::new(&a[1]), &a[2], &a[3]),
-        _ => eprintln!("usage: rig gen <snap> <corpus.json> | rig run <snap> <corpus.json> <out.json>"),
+        Some("run") => run(Path::new(&a[1]), &a[2], &a[3], a.get(4).map_or("name,idle,typing,grep", String::as_str)),
+        _ => eprintln!("usage: rig gen <snap> <corpus.json> | rig run <snap> <corpus.json> <out.json> [kinds]"),
     }
 }
 
@@ -199,7 +201,8 @@ fn grep_search(live: &Live, content: &Content, pool: &rayon::ThreadPool, q: &str
     (h, r.read)
 }
 
-fn run(snap: &Path, corpus: &str, out: &str) {
+fn run(snap: &Path, corpus: &str, out: &str, kinds: &str) {
+    let want = |k: &str| kinds.split(',').any(|x| x == k);
     let corpus: Value = serde_json::from_str(&std::fs::read_to_string(corpus).unwrap()).unwrap();
     let home = home();
     let t = Instant::now();
@@ -227,7 +230,7 @@ fn run(snap: &Path, corpus: &str, out: &str) {
     for (_, q) in &names {
         name_search(&live, &pool, q, &home);
     }
-    for _ in 0..7 {
+    for _ in 0..if want("name") { 7 } else { 0 } {
         for (cat, q) in &names {
             let t = Instant::now();
             let d = name_search(&live, &pool, q, &home);
@@ -235,7 +238,7 @@ fn run(snap: &Path, corpus: &str, out: &str) {
         }
     }
     // After an idle spell the daemon has dropped its cache and spare buffers.
-    for _ in 0..3 {
+    for _ in 0..if want("idle") { 3 } else { 0 } {
         for (cat, q) in &names {
             live.names_cache.trim_if_idle(Duration::ZERO);
             let t = Instant::now();
@@ -244,7 +247,7 @@ fn run(snap: &Path, corpus: &str, out: &str) {
         }
     }
     // Typing: each keystroke is a query; the run's total is what you wait.
-    for _ in 0..5 {
+    for _ in 0..if want("typing") { 5 } else { 0 } {
         for run in corpus["typing"].as_array().unwrap() {
             live.names_cache.trim_if_idle(Duration::ZERO);
             let keys: Vec<&str> = run.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
@@ -257,10 +260,10 @@ fn run(snap: &Path, corpus: &str, out: &str) {
     }
     let greps: Vec<(String, String)> =
         corpus["grep"].as_array().unwrap().iter().map(|v| (v["cat"].as_str().unwrap().into(), v["q"].as_str().unwrap().into())).collect();
-    for (_, q) in &greps {
+    for (_, q) in greps.iter().filter(|_| want("grep")) {
         grep_search(&live, &content, &pool, q, &home, None);
     }
-    for _ in 0..5 {
+    for _ in 0..if want("grep") { 5 } else { 0 } {
         for (cat, q) in &greps {
             let t = Instant::now();
             let (d, _) = grep_search(&live, &content, &pool, q, &home, None);
