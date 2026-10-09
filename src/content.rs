@@ -955,17 +955,6 @@ fn has_upper(pattern: &str, mode: GrepMode) -> bool {
     }
 }
 
-/// The regex folds case beyond ASCII (É/é); the index folds only ASCII. So
-/// a case-insensitive search can't demand trigrams with non-ASCII bytes.
-fn ascii_only(q: TQ) -> TQ {
-    match q {
-        TQ::Tri(t) if t < 1 << 24 && t & 0x80_8080 != 0 => TQ::All,
-        TQ::And(v) => TQ::And(v.into_iter().map(ascii_only).collect()),
-        TQ::Or(v) => TQ::Or(v.into_iter().map(ascii_only).collect()),
-        q => q,
-    }
-}
-
 impl Grep {
     pub fn new(pattern: &str, mode: GrepMode) -> Result<Grep, String> {
         let ci = mode != GrepMode::Symbol && !has_upper(pattern, mode);
@@ -989,14 +978,19 @@ impl Grep {
     }
 
     fn plan(&self) -> TQ {
-        let q = match self.mode {
+        match self.mode {
             // Exactly the docs that define it (plus rare hash collisions,
             // which reading the file weeds out).
             GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => TQ::Tri(symbol_key(self.pattern.as_bytes())),
-            GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
-            GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
-        };
-        if self.ci { ascii_only(q) } else { q }
+            GrepMode::Literal | GrepMode::Symbol if !self.ci => literal_plan(self.pattern.as_bytes()),
+            // Folded the way the regex folds: beyond ASCII (É/é, and k to
+            // the Kelvin sign), where the index folds only ASCII, each letter
+            // is a small class of exact alternatives.
+            _ => {
+                let src = if self.mode == GrepMode::Regex { self.pattern.clone() } else { regex::escape(&self.pattern) };
+                regex_syntax::ParserBuilder::new().case_insensitive(self.ci).build().parse(&src).map_or(TQ::All, |h| regex_plan(&h))
+            }
+        }
     }
 }
 
@@ -1614,6 +1608,26 @@ mod tests {
         // Case-sensitive: exact bytes, full plan.
         assert_eq!(names(&c, "Émile", GrepMode::Literal), NONE_FOUND);
         assert_eq!(names(&c, "ÉMILE", GrepMode::Literal), ["a.txt"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// ASCII letters fold to non-ASCII too: `k` to the Kelvin sign (U+212A),
+    /// `s` to the long s (U+017F). The regex matches them, so the plan must
+    /// let those files through.
+    #[test]
+    fn case_insensitive_ascii_folds_to_non_ascii() {
+        let root = scratch("kelvin");
+        let (c, _) = index(&root, &[("k.txt", "\u{212A}ELVIN scale\n".as_bytes()), ("s.txt", "the \u{17F}un\n".as_bytes())]);
+        assert_eq!(names(&c, "kelvin", GrepMode::Literal), ["k.txt"]);
+        assert_eq!(names(&c, "kelvin", GrepMode::Regex), ["k.txt"]);
+        assert_eq!(names(&c, "the sun", GrepMode::Literal), ["s.txt"]);
+        // Still selective: folding doesn't fall back to reading every file.
+        for (pat, mode) in
+            [("hello world", GrepMode::Literal), ("kelvin", GrepMode::Literal), ("fn \\w+_main", GrepMode::Regex), ("émile", GrepMode::Literal)]
+        {
+            let plan = Grep::new(pat, mode).unwrap().plan();
+            assert!(!matches!(plan, TQ::All), "{pat}: {plan:?}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
