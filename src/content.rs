@@ -485,6 +485,7 @@ struct Split {
     docs: Vec<SplitDoc>,
 }
 
+/// Where one doc's runs are in its split.
 struct SplitDoc {
     i: usize,
     text: bool,
@@ -1560,10 +1561,10 @@ fn cross(a: &Option<Set>, b: &Option<Set>) -> Option<Set> {
 }
 
 /// What a set of strings requires of a doc: one of them (All when there is
-/// no set, or a string in it is too short to have a trigram). Trigrams all
-/// of them share are required once, not per string.
+/// no set, it is empty, or a string in it is too short to have a trigram).
+/// Trigrams all of them share are required once, not per string.
 fn exact_query(set: Option<Set>) -> TQ {
-    let Some(set) = set.filter(|set| set.iter().all(|s| s.len() >= 3)) else { return TQ::All };
+    let Some(set) = set.filter(|set| !set.is_empty() && set.iter().all(|s| s.len() >= 3)) else { return TQ::All };
     let tris: Vec<Vec<u32>> = set.iter().map(|s| trigrams_small(s)).collect();
     let common: Vec<u32> = tris[0].iter().copied().filter(|t| tris.iter().all(|ts| ts.binary_search(t).is_ok())).collect();
     let rest: Vec<TQ> = tris.iter().map(|ts| TQ::And(ts.iter().filter(|t| !common.contains(t)).map(|&t| TQ::Tri(t)).collect())).collect();
