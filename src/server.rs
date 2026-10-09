@@ -277,8 +277,8 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
         });
     }
     cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(30));
+    for _ in 0..1500 {
+        std::thread::sleep(Duration::from_millis(2));
         if let Ok(s) = UnixStream::connect(&sock) {
             return Ok(s);
         }

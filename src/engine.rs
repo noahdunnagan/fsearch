@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 // Every search scans the whole overlay (~1 ms per 100k entries), and a
@@ -76,6 +76,9 @@ pub struct Engine {
 
 struct Shared {
     live: RwLock<Option<Live>>,
+    /// A saved index is still being read in: searches wait for it rather
+    /// than answer "indexing".
+    loading: (Mutex<bool>, Condvar),
     content: RwLock<Content>,
     home: String,
     dir: PathBuf,
@@ -177,8 +180,9 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
 }
 
 impl Engine {
-    /// Start indexing in the background and return at once; searches answer
-    /// `Err` until the index is loaded (or, on the very first run, built).
+    /// Start indexing in the background and return at once. Searches wait
+    /// while a saved index loads, and answer `Err` while the very first run
+    /// builds one.
     pub fn start(opts: Options) -> Result<Engine, String> {
         std::fs::create_dir_all(&opts.dir).map_err(|e| e.to_string())?;
         // One writer per index: a second one would race index writes. The
@@ -200,8 +204,10 @@ impl Engine {
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
         let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
+        let base = Index::load(&dir.join("index.bin"));
         let shared = Arc::new(Shared {
             live: RwLock::new(None),
+            loading: (Mutex::new(base.is_some()), Condvar::new()),
             content: RwLock::new(content),
             home: opts.home,
             dir,
@@ -216,7 +222,6 @@ impl Engine {
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
         });
-        let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
             Some(b) if b.event_id != 0 => b.event_id,
             _ => fsevents::current_id(),
@@ -245,6 +250,8 @@ impl Engine {
                 }
             };
             *s.live.write().unwrap() = Some(Live::new(base));
+            *s.loading.0.lock().unwrap() = false;
+            s.loading.1.notify_all();
             if owner {
                 rescan_unskipped(&s);
                 start_content(&s);
@@ -277,7 +284,7 @@ impl Engine {
     /// Name search.
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
         WARM_UNTIL.store(0, Ordering::Relaxed);
-        let g = self.s.live.read().unwrap();
+        let g = self.s.live();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
         Ok(search_pool()
@@ -314,7 +321,7 @@ impl Engine {
         // Pick files under the lock, read them after releasing it: reading can
         // be slow and a waiting writer would stall every other query.
         let paths = {
-            let l = self.s.live.read().unwrap();
+            let l = self.s.live();
             let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
@@ -354,6 +361,12 @@ type Resync = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
 
 impl Shared {
+    fn live(&self) -> RwLockReadGuard<'_, Option<Live>> {
+        let (loading, cv) = &self.loading;
+        drop(cv.wait_while(loading.lock().unwrap(), |l| *l).unwrap());
+        self.live.read().unwrap()
+    }
+
     fn owner(&self) -> bool {
         self.owner.load(Ordering::Relaxed)
     }
