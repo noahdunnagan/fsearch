@@ -109,16 +109,12 @@ fn respond(line: &str, engine: &Engine) -> Value {
 
 fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
     let op = v.get("op").and_then(Value::as_str).unwrap_or("search");
-    let is_grep = op == "grep"
-        || (op == "search"
-            && v.get("q").and_then(Value::as_str).is_some_and(|q| ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| q.contains(k))));
     match op {
         "ping" => Ok(json!({"ok": true})),
         "save" => {
             engine.save();
             Ok(json!({"ok": true, "scheduled": true}))
         }
-        _ if is_grep => grep(v, engine),
         "status" => {
             let s = engine.status();
             if !s.ready {
@@ -128,11 +124,12 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
             v["ok"] = true.into();
             Ok(v)
         }
-        "search" => {
+        "search" | "grep" => {
             let q = parse_request(v, engine.home())?;
-            // A pattern given as its own field (`"grep": "TODO"`).
-            if q.grep.is_some() {
-                return grep(v, engine);
+            // Content search when asked for, or when the query names a
+            // pattern (`grep:` in `q`, or a `"grep"` field).
+            if op == "grep" || q.grep.is_some() {
+                return grep(v, q, engine);
             }
             let t = Instant::now();
             let found = engine.search(&q)?;
@@ -158,8 +155,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
 /// Content search. The pattern comes from `pattern` (+ `mode`) or from a
 /// `grep:`/`regex:`/`sym:` filter in `q`; the rest of the query narrows
 /// which files are read.
-fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
-    let mut q = parse_request(v, engine.home())?;
+fn grep(v: &Value, mut q: Query, engine: &Engine) -> Result<Value, String> {
     let mode = match v.get("mode").and_then(Value::as_str) {
         Some("regex") => GrepMode::Regex,
         Some("symbol") => GrepMode::Symbol,
@@ -425,6 +421,16 @@ mod tests {
         let v = ask(json!({"q": "walrus", "grep": "needle"}));
         assert_eq!(v["source"], "index", "{v}");
         assert_eq!(v["files"][0]["matches"][0]["line"], 2);
+    }
+
+    /// A filter keyword inside another value is not a content search: the
+    /// parsed query decides, not a substring of `q`.
+    #[test]
+    fn keyword_inside_a_value_is_a_name_search() {
+        let v = ask(json!({"q": "walrus path:a/regex:b"}));
+        assert!(v["hits"].is_array(), "{v}");
+        let v = ask(json!({"q": "walrus re:content:"}));
+        assert!(v["hits"].is_array(), "{v}");
     }
 
     #[test]
