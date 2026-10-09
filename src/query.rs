@@ -225,6 +225,10 @@ impl Query {
         {
             return None;
         }
+        if self.tokens.is_empty() {
+            let re_ok = self.name_re.as_ref().is_none_or(|re| re.is_match(name)) && self.path_re.as_ref().is_none_or(|re| re.is_match(path));
+            return re_ok.then_some(0);
+        }
         // A hit needs some token in its own name; most paths fail here,
         // before the folders are looked at.
         let mut pos = self.tokens.iter().filter(|t| !t.negate).peekable();
@@ -263,11 +267,11 @@ impl Query {
     /// How the folders of a path (`/a/b` for `/a/b/name`) match the tokens:
     /// the best score per positive token, and whether a negated one hits.
     pub fn dir_match(&self, dirs: &[u8]) -> DirMatch {
-        let comps: Vec<&[u8]> = dirs.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let comps = || dirs.split(|&b| b == b'/').filter(|c| !c.is_empty());
         let mut d = DirMatch { negated: false, best: [None; 8] };
-        d.negated = self.tokens.iter().any(|t| t.negate && comps.iter().any(|c| token_matches(c, t)));
+        d.negated = self.tokens.iter().any(|t| t.negate && comps().any(|c| token_matches(c, t)));
         for (t, tok) in self.tokens.iter().filter(|t| !t.negate).enumerate() {
-            d.best[t] = comps.iter().filter_map(|c| token_score(c, !0, tok)).max();
+            d.best[t] = comps().filter_map(|c| token_score(c, !0, tok)).max();
         }
         d
     }

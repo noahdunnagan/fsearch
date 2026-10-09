@@ -819,25 +819,24 @@ impl Content {
 
     /// Candidate docs for a pattern, filtered by the name query.
     fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<(usize, u32)> {
-        let mut out: Vec<(usize, u32)> = self
+        // Your files before dot-dirs/logs, then most recently modified first;
+        // ties in segment, then doc order. Packed so the sort compares ints.
+        let mut out: Vec<(u64, u32, u32)> = self
             .segs
             .par_iter()
             .enumerate()
             .flat_map_iter(|(si, s)| {
                 let ids = eval(s, plan).unwrap_or_else(|| (0..s.ndocs as u32).collect());
+                let (rank, mtime) = (s.rank(), s.mtime());
                 ids.into_iter()
-                    .filter(move |&d| !s.is_dead(d) && s.rank()[d as usize] != NOT_TEXT)
-                    .filter(move |&d| filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], s.mtime()[d as usize]).is_some())
-                    .map(move |d| (si, d))
+                    .filter(move |&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
+                    .filter(move |&d| filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                    .map(move |d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
                     .collect::<Vec<_>>()
             })
             .collect();
-        // Your files before dot-dirs/logs, then most recently modified first.
-        out.sort_by_key(|&(si, d)| {
-            let s = &self.segs[si];
-            std::cmp::Reverse((s.rank()[d as usize], s.mtime()[d as usize]))
-        });
-        out
+        out.par_sort_unstable();
+        out.into_iter().map(|(_, si, d)| (si as usize, d)).collect()
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
