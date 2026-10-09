@@ -21,7 +21,10 @@ fn names(e: &Engine, q: &str) -> Vec<PathBuf> {
 }
 
 fn finds(e: &Engine, q: &str, p: &Path) -> bool {
-    let p = std::fs::canonicalize(p).unwrap_or(p.into());
+    // Resolve the folder, which outlives the file: a deleted file's own
+    // canonicalize fails, and the unresolved /var path would "not be found"
+    // before the engine has even seen the delete.
+    let p = std::fs::canonicalize(p.parent().unwrap()).unwrap().join(p.file_name().unwrap());
     names(e, q).contains(&p)
 }
 
