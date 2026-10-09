@@ -170,12 +170,21 @@ impl Segment {
         out
     }
 
-    fn postings(&self, tri: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        if let Ok(k) = self.tri_key().binary_search(&tri) {
-            self.list_into(k, &mut out);
-        }
-        out
+    fn list(&self, tri: u32) -> Option<List<'_>> {
+        let k = self.tri_key().binary_search(&tri).ok()?;
+        let o = self.tri_off();
+        let bytes = &self.post()[(o[k] & !BITSET) as usize..(o[k + 1] & !BITSET) as usize];
+        Some(if o[k] & BITSET != 0 { List::Bits(bytes) } else { List::Var(bytes) })
+    }
+
+    /// The live docs under `prefix` lie in this doc id range (exactly, for a
+    /// segment built from sorted paths; a superset after a merge).
+    fn doc_range(&self, prefix: &[u8]) -> std::ops::Range<u32> {
+        let bp = self.by_path();
+        let a = bp.partition_point(|&d| self.path(d) < prefix);
+        let z = a + bp[a..].partition_point(|&d| self.path(d).starts_with(prefix));
+        let (lo, hi) = bp[a..z].iter().fold((u32::MAX, 0), |(lo, hi), &d| (lo.min(d), hi.max(d + 1)));
+        lo.min(hi)..hi
     }
 
     fn list_into(&self, k: usize, out: &mut Vec<u32>) {
@@ -653,6 +662,19 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
+/// Does the name query let every indexed doc through (no scope, words,
+/// extensions, ranges or patterns)? Then it needn't be checked per doc.
+fn passes_every_doc(q: &Query) -> bool {
+    q.scope.is_none()
+        && q.tokens.is_empty()
+        && q.kind_ok(KIND_FILE)
+        && q.exts.is_empty()
+        && q.size == (0, u64::MAX)
+        && q.mtime == (0, u32::MAX)
+        && q.name_re.is_none()
+        && q.path_re.is_none()
+}
+
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.
 fn doc_rank(path: &[u8]) -> i8 {
     let mut r = 0i8;
@@ -819,18 +841,23 @@ impl Content {
 
     /// Candidate docs for a pattern, filtered by the name query.
     fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<(usize, u32)> {
+        // A scope narrows each segment to the doc range holding its paths.
+        let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
+        let check = !passes_every_doc(filt);
         // Your files before dot-dirs/logs, then most recently modified first;
         // ties in segment, then doc order. Packed so the sort compares ints.
         let mut out: Vec<(u64, u32, u32)> = self
             .segs
             .par_iter()
             .enumerate()
+            .filter(|(_, s)| s.live_docs > 0)
             .flat_map_iter(|(si, s)| {
-                let ids = eval(s, plan).unwrap_or_else(|| (0..s.ndocs as u32).collect());
+                let docs = prefix.as_ref().map_or(0..s.ndocs as u32, |p| s.doc_range(p));
+                let ids = if docs.is_empty() { Vec::new() } else { eval(s, plan, docs.clone()).unwrap_or_else(|| docs.collect()) };
                 let (rank, mtime) = (s.rank(), s.mtime());
                 ids.into_iter()
                     .filter(move |&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
-                    .filter(move |&d| filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                    .filter(move |&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
                     .map(move |d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
                     .collect::<Vec<_>>()
             })
@@ -1058,28 +1085,146 @@ fn literal_plan(s: &[u8]) -> TQ {
     TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect())
 }
 
-/// Docs matching `q` in a segment; None means "every doc".
-fn eval(s: &Segment, q: &TQ) -> Option<Vec<u32>> {
+/// A posting list as stored.
+#[derive(Clone, Copy)]
+enum List<'a> {
+    /// Bit d: doc d has the trigram.
+    Bits(&'a [u8]),
+    /// Ascending doc ids as delta varints.
+    Var(&'a [u8]),
+}
+
+/// Decodes a delta-varint list.
+struct Varints<'a> {
+    b: &'a [u8],
+    last: u32,
+}
+
+impl Iterator for Varints<'_> {
+    type Item = u32;
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        let x = *self.b.first()?;
+        let (v, n) = if x < 0x80 { (x as u32, 1) } else { varint(self.b) };
+        self.b = &self.b[n..];
+        self.last += v;
+        Some(self.last)
+    }
+}
+
+impl List<'_> {
+    /// Append its docs within `docs`, ascending.
+    fn decode(self, docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
+        match self {
+            List::Bits(b) => and_bits(&[b], docs, out),
+            List::Var(b) => out.extend(Varints { b, last: 0 }.skip_while(|&d| d < docs.start).take_while(|&d| d < docs.end)),
+        }
+    }
+
+    /// Keep the docs of `acc` (ascending) that are in the list.
+    fn retain(self, acc: &mut Vec<u32>) {
+        match self {
+            List::Bits(b) => acc.retain(|&d| b.get(d as usize / 8).is_some_and(|x| x >> (d % 8) & 1 != 0)),
+            List::Var(b) => {
+                let mut it = Varints { b, last: 0 };
+                let mut cur = it.next();
+                acc.retain(|&d| {
+                    while cur.is_some_and(|c| c < d) {
+                        cur = it.next();
+                    }
+                    cur == Some(d)
+                });
+            }
+        }
+    }
+}
+
+/// Append the docs within `docs` set in every bitset, ascending.
+fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
+    let end = (docs.end as usize).div_ceil(8).min(lists.iter().map(|l| l.len()).min().unwrap_or(0));
+    let mut i = docs.start as usize / 8;
+    while i < end {
+        let k = (end - i).min(8);
+        let mut w = u64::MAX;
+        for l in lists {
+            let mut b = [0u8; 8];
+            b[..k].copy_from_slice(&l[i..i + k]);
+            w &= u64::from_le_bytes(b);
+        }
+        while w != 0 {
+            let d = i as u32 * 8 + w.trailing_zeros();
+            if docs.contains(&d) {
+                out.push(d);
+            }
+            w &= w - 1;
+        }
+        i += k;
+    }
+}
+
+/// Docs within `docs` matching `q` in a segment, ascending; None means
+/// every doc. An AND starts from its shortest list and only tests the
+/// others, so common trigrams' long lists are never decoded in full.
+fn eval(s: &Segment, q: &TQ, docs: std::ops::Range<u32>) -> Option<Vec<u32>> {
     match q {
         TQ::All => None,
-        TQ::Tri(t) => Some(s.postings(*t)),
+        TQ::Tri(t) => {
+            let mut out = Vec::new();
+            if let Some(l) = s.list(*t) {
+                l.decode(docs, &mut out);
+            }
+            Some(out)
+        }
         TQ::And(qs) => {
-            let mut lists: Vec<Vec<u32>> = qs.iter().filter_map(|q| eval(s, q)).collect();
-            lists.sort_by_key(Vec::len);
-            let mut it = lists.into_iter();
-            let mut acc = it.next()?;
-            for l in it {
-                if acc.is_empty() {
+            let (mut bits, mut vars, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+            for q in qs {
+                match q {
+                    TQ::Tri(t) => match s.list(*t) {
+                        Some(List::Bits(b)) => bits.push(b),
+                        Some(List::Var(b)) => vars.push(b),
+                        None => return Some(Vec::new()),
+                    },
+                    TQ::All => {}
+                    q => rest.push(q),
+                }
+            }
+            vars.sort_by_key(|b| b.len());
+            let mut acc = None;
+            if let Some((first, vars)) = vars.split_first() {
+                let mut v = Vec::new();
+                List::Var(first).decode(docs.clone(), &mut v);
+                for &b in &bits {
+                    List::Bits(b).retain(&mut v);
+                }
+                for &b in vars {
+                    if v.is_empty() {
+                        break;
+                    }
+                    List::Var(b).retain(&mut v);
+                }
+                acc = Some(v);
+            } else if !bits.is_empty() {
+                let mut v = Vec::new();
+                and_bits(&bits, docs.clone(), &mut v);
+                acc = Some(v);
+            }
+            for q in rest {
+                if acc.as_ref().is_some_and(Vec::is_empty) {
                     break;
                 }
-                acc = intersect(&acc, &l);
+                if let Some(r) = eval(s, q, docs.clone()) {
+                    acc = Some(match acc {
+                        Some(a) => intersect(&a, &r),
+                        None => r,
+                    });
+                }
             }
-            Some(acc)
+            acc
         }
         TQ::Or(qs) => {
             let mut acc: Vec<u32> = Vec::new();
             for q in qs {
-                acc.extend(eval(s, q)?);
+                acc.extend(eval(s, q, docs.clone())?);
             }
             acc.sort_unstable();
             acc.dedup();
