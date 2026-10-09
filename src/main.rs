@@ -148,24 +148,55 @@ fn stdio() {
 }
 
 fn bench(qs: &str) {
-    let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
+    let dir = data_dir();
+    let idx = index::Index::load(&dir.join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
     let live = live::Live::new(idx);
-    let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
-    let s = query::Searcher { live: &live };
+    let home = home();
+    let mut q = query::Query::parse(qs, &home).unwrap_or_else(|e| die(&e));
+    // Like the daemon: a content search when the query has a pattern, on
+    // user-interactive threads, paths included.
+    let grep = q.grep.take().map(|p| fsearch::Grep::new(&p, q.grep_mode).unwrap_or_else(|e| die(&e)));
+    let content = grep.as_ref().map(|_| fsearch::content::Content::open_shared(dir.join("content")));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        })
+        .build()
+        .unwrap();
+    let run = || -> Vec<String> {
+        let (Some(g), Some(c)) = (&grep, &content) else {
+            let mut p = Vec::new();
+            let hits = pool.install(|| query::Searcher { live: &live }.search(&q));
+            return hits
+                .iter()
+                .map(|h| {
+                    live.base.path(h.idx as usize, &mut p);
+                    format!("{:5} {}", h.score, String::from_utf8_lossy(&p))
+                })
+                .collect();
+        };
+        let r = if q.scope.as_ref().is_none_or(|s| fsearch::content::in_scope(s, home.as_bytes())) {
+            pool.install(|| c.search(g, &q))
+        } else {
+            let paths = pool.install(|| fsearch::content::scan_paths(&live, q.clone_for_scan()));
+            fsearch::content::verify(g, &paths, q.limit)
+        };
+        let first = |f: &fsearch::FileMatches| f.lines.first().map_or(String::new(), |(n, t)| format!("{n}: {}", t.trim()));
+        r.files.iter().map(|f| format!("{}:{}", String::from_utf8_lossy(&f.path), first(f))).collect()
+    };
     let mut times = Vec::new();
-    let mut hits = Vec::new();
+    let mut out = Vec::new();
     for _ in 0..20 {
         let t = Instant::now();
-        hits = s.search(&q);
+        out = run();
         times.push(t.elapsed());
     }
-    let mut p = Vec::new();
-    for h in hits.iter().take(10) {
-        live.base.path(h.idx as usize, &mut p);
-        println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
+    for l in out.iter().take(10) {
+        println!("{l}");
     }
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    eprintln!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0]);
 }
 
 fn plist_path() -> PathBuf {
