@@ -188,6 +188,8 @@ fn install(login: bool) {
     // A plain reinstall keeps an existing login agent.
     #[cfg(target_os = "macos")]
     let login = login || plist_path().exists();
+    #[cfg(target_os = "linux")]
+    let login = login || PathBuf::from(home()).join(".config/systemd/user/fsearch.service").exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
     // Stop the old daemon so the next one runs the new binary.
     server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
