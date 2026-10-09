@@ -203,6 +203,10 @@ impl Segment {
     /// segment built from sorted paths; a superset after a merge).
     fn doc_range(&self, prefix: &[u8]) -> std::ops::Range<u32> {
         let bp = self.by_path();
+        let (Some(&first), Some(&last)) = (bp.first(), bp.last()) else { return 0..0 };
+        if self.path(last) < prefix || (self.path(first) > prefix && !self.path(first).starts_with(prefix)) {
+            return 0..0;
+        }
         let a = bp.partition_point(|&d| self.path(d) < prefix);
         let z = a + bp[a..].partition_point(|&d| self.path(d).starts_with(prefix));
         let (lo, hi) = bp[a..z].iter().fold((u32::MAX, 0), |(lo, hi), &d| (lo.min(d), hi.max(d + 1)));
@@ -942,33 +946,39 @@ impl Content {
     }
 
     /// Candidate docs for a pattern, filtered by the name query: one list
-    /// per segment, with its `FIRST` best-ranked in front (unordered).
+    /// per segment searched, with its `FIRST` best-ranked in front
+    /// (unordered).
     fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
         // A scope narrows each segment to the doc range holding its paths.
         let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
         let check = !passes_every_doc(filt);
-        self.segs
-            .par_iter()
-            .enumerate()
-            .map(|(si, s)| {
-                let docs = prefix.as_ref().map_or(0..s.ndocs as u32, |p| s.doc_range(p));
-                if s.live_docs == 0 || docs.is_empty() {
-                    return Vec::new();
-                }
-                let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.collect());
-                let (rank, mtime) = (s.rank(), s.mtime());
-                let mut v: Vec<Ranked> = ids
-                    .into_iter()
-                    .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
-                    .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
-                    .collect();
-                if v.len() > FIRST {
-                    v.select_nth_unstable(FIRST);
-                }
-                v
-            })
-            .collect()
+        let work: Vec<(usize, std::ops::Range<u32>)> = (self.segs.iter().enumerate())
+            .filter(|(_, s)| s.live_docs > 0)
+            .map(|(si, s)| (si, prefix.as_ref().map_or(0..s.ndocs as u32, |p| s.doc_range(p))))
+            .filter(|(_, docs)| !docs.is_empty())
+            .collect();
+        let one = |(si, docs): &(usize, std::ops::Range<u32>)| {
+            let s = &self.segs[*si];
+            let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
+            let (rank, mtime) = (s.rank(), s.mtime());
+            let mut v: Vec<Ranked> = ids
+                .into_iter()
+                .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
+                .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d))
+                .collect();
+            if v.len() > FIRST {
+                v.select_nth_unstable(FIRST);
+            }
+            v
+        };
+        // A small scope is searched sooner on this thread than by waking
+        // the pool's (each parallel step costs ~0.1 ms when they sleep).
+        if work.iter().map(|(_, docs)| docs.len()).sum::<usize>() < 100_000 {
+            work.iter().map(one).collect()
+        } else {
+            work.par_iter().map(one).collect()
+        }
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
