@@ -25,7 +25,11 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 pub static DENIED: Mutex<std::collections::BTreeSet<Vec<u8>>> = Mutex::new(std::collections::BTreeSet::new());
 
 pub fn blocked(path: &[u8]) -> bool {
-    SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
+    // An entry may be written with a trailing slash; it still names the folder.
+    fn folder(s: &[u8]) -> &[u8] {
+        s.strip_suffix(b"/").filter(|t| !t.is_empty()).unwrap_or(s)
+    }
+    SKIP.get().is_some_and(|v| v.iter().any(|s| crate::live::is_ancestor(folder(s), path)))
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;

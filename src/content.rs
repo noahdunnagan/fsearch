@@ -651,12 +651,12 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 
 /// Is this path (file or directory) inside the indexed area?
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
-    let Some(rest) = path.strip_prefix(home) else { return false };
-    if !rest.is_empty() && rest[0] != b'/' {
+    if !crate::live::is_ancestor(home, path) {
         return false;
     }
+    let rest = &path[home.len()..];
     let rel = rest.strip_prefix(b"/").unwrap_or(rest);
-    if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
+    if SKIP_UNDER_HOME.iter().any(|p| crate::live::is_ancestor(p, rel)) {
         return false;
     }
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
@@ -893,12 +893,21 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
 
 /// The dirs/trees from one batch of changes, each with what should be
 /// indexed there. Done under the name-index read lock only.
+/// A change the content index follows: inside home, or a rescanned tree
+/// that holds home.
+pub(crate) fn follows(path: &[u8], tree: bool, home: &[u8]) -> bool {
+    in_scope(path, home) || (tree && crate::live::is_ancestor(path, home))
+}
+
 pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
+        if !follows(d, r, home) {
+            continue;
+        }
         if in_scope(d, home) {
             out.push((d.clone(), r));
-        } else if r && crate::live::is_ancestor(d, home) {
+        } else {
             // A subtree containing home (e.g. "/" rescanned): sync all of home.
             out.push((home.to_vec(), true));
         }
@@ -2138,6 +2147,28 @@ mod tests {
         live.over.insert(b"/h/pq/new3.rs".to_vec(), OEnt::new(b"new3.rs", KIND_FILE, 3, 9));
         assert_eq!(paths_of(&wanted(&live, h, b"/h/p", false)), ["/h/p/a.rs", "/h/p/new.rs"]);
         assert_eq!(paths_of(&wanted(&live, h, b"/h/p", true)), ["/h/p/a.rs", "/h/p/new.rs", "/h/p/sub/b.md", "/h/p/sub/new2.rs"]);
+    }
+
+    /// Home written with a trailing slash still holds its files, and a
+    /// name prefix of home is not inside it.
+    #[test]
+    fn in_scope_takes_home_with_a_trailing_slash() {
+        assert!(in_scope(b"/h/a.rs", b"/h/"));
+        assert!(in_scope(b"/h/p/a.rs", b"/h/"));
+        assert!(in_scope(b"/h/a.rs", b"/h"));
+        assert!(!in_scope(b"/hx/a.rs", b"/h"));
+        assert!(!in_scope(b"/hx/a.rs", b"/h/"));
+    }
+
+    #[test]
+    fn content_follows_home_and_its_ancestors() {
+        let home = b"/Users/me";
+        assert!(follows(b"/Users/me/src", false, home));
+        assert!(follows(b"/Users", true, home));
+        assert!(follows(b"/", true, home));
+        assert!(!follows(b"/Users", false, home));
+        // Not an ancestor, just a name prefix.
+        assert!(!follows(b"/Users/m", true, home));
     }
 
     #[test]

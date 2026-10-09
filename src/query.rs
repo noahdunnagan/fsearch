@@ -209,7 +209,7 @@ impl Query {
     /// part) supplied by the caller, who can memoize it per folder.
     pub fn match_path_with(&self, path: &[u8], kind: u8, size: u64, mtime: u32, dirs: impl FnOnce(&[u8]) -> DirMatch) -> Option<i32> {
         if let Some(s) = &self.scope
-            && !(path.starts_with(s) && path.get(s.len()) == Some(&b'/'))
+            && !(path.len() > s.len() && crate::live::is_ancestor(s, path))
         {
             return None;
         }

@@ -460,12 +460,6 @@ pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
-/// A change the content index follows: inside home, or a rescanned
-/// folder that holds home.
-fn concerns_home(path: &[u8], tree: bool, home: &[u8]) -> bool {
-    content::in_scope(path, home) || (tree && crate::live::is_ancestor(path, home))
-}
-
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
@@ -492,7 +486,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
                 for (d, t) in std::iter::once(first).chain(rx.try_iter()) {
                     for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
                         // Most of the disk's churn (Library, caches) is outside the indexed area.
-                        if concerns_home(&key.0, key.1, &home) {
+                        if content::follows(&key.0, key.1, &home) {
                             pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                         }
                     }
@@ -876,17 +870,6 @@ mod tests {
         assert!(!lost_track(&ev(b"/tmp/r/sub", MUST_SCAN_SUBDIRS), b"/tmp/r"));
         assert!(!lost_track(&ev(b"/tmp/r", 0), b"/tmp/r"));
         assert!(!lost_track(&ev(b"/", MUST_SCAN_SUBDIRS), b"/tmp/r"));
-    }
-
-    #[test]
-    fn content_follows_home_and_its_ancestors() {
-        let home = b"/Users/me";
-        assert!(concerns_home(b"/Users/me/src", false, home));
-        assert!(concerns_home(b"/Users", true, home));
-        assert!(concerns_home(b"/", true, home));
-        assert!(!concerns_home(b"/Users", false, home));
-        // Not an ancestor, just a name prefix.
-        assert!(!concerns_home(b"/Users/m", true, home));
     }
 
     /// Folders refused more than once (a scan, then the startup check) are
