@@ -101,7 +101,7 @@ fn main() {
 
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    writeln!(s, "{req}").unwrap();
+    s.write_all(format!("{req}\n").as_bytes()).unwrap();
     // One request only: the daemon needn't keep the cores warm for a next one.
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
@@ -114,7 +114,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     if v["ok"] != true {
         die(v["error"].as_str().unwrap_or("error"));
     }
-    let mut out = std::io::stdout().lock();
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for h in v["hits"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "{}", h["path"].as_str().unwrap_or(""));
     }
@@ -123,6 +123,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
             let _ = writeln!(out, "{}:{}: {}", f["path"].as_str().unwrap_or(""), m["line"], m["text"].as_str().unwrap_or("").trim());
         }
     }
+    let _ = out.flush();
 }
 
 fn stdio() {
