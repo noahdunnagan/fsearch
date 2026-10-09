@@ -191,9 +191,7 @@ fn install(login: bool) {
     // path can be SIGKILLed by the code-signing cache. Copy then rename, so
     // reinstalling from the installed copy works too.
     let tmp = bin.with_extension("new");
-    std::fs::copy(std::env::current_exe().unwrap(), &tmp)
-        .and_then(|_| std::fs::rename(&tmp, &bin))
-        .unwrap_or_else(|e| die(&format!("copy: {e}")));
+    std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
