@@ -970,6 +970,18 @@ fn has_upper(pattern: &str, mode: GrepMode) -> bool {
     }
 }
 
+/// The index folds only ASCII; the regex folds beyond it: É/é, and two
+/// ASCII letters, k to the Kelvin sign and s to the long s (the only ones).
+/// So a case-insensitive search can't demand trigrams with those bytes.
+fn fold_safe(q: TQ) -> TQ {
+    match q {
+        TQ::Tri(t) if t < 1 << 24 && [t >> 16, t >> 8, t].iter().any(|&b| matches!(b as u8, 0x80..|b'k'| b's')) => TQ::All,
+        TQ::And(v) => TQ::And(v.into_iter().map(fold_safe).collect()),
+        TQ::Or(v) => TQ::Or(v.into_iter().map(fold_safe).collect()),
+        q => q,
+    }
+}
+
 impl Grep {
     pub fn new(pattern: &str, mode: GrepMode) -> Result<Grep, String> {
         let ci = mode != GrepMode::Symbol && !has_upper(pattern, mode);
@@ -993,19 +1005,14 @@ impl Grep {
     }
 
     fn plan(&self) -> TQ {
-        match self.mode {
+        let q = match self.mode {
             // Exactly the docs that define it (plus rare hash collisions,
             // which reading the file weeds out).
             GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => TQ::Tri(symbol_key(self.pattern.as_bytes())),
-            GrepMode::Literal | GrepMode::Symbol if !self.ci => literal_plan(self.pattern.as_bytes()),
-            // Folded the way the regex folds: beyond ASCII (É/é, and k to
-            // the Kelvin sign), where the index folds only ASCII, each letter
-            // is a small class of exact alternatives.
-            _ => {
-                let src = if self.mode == GrepMode::Regex { self.pattern.clone() } else { regex::escape(&self.pattern) };
-                regex_syntax::ParserBuilder::new().case_insensitive(self.ci).build().parse(&src).map_or(TQ::All, |h| regex_plan(&h))
-            }
-        }
+            GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
+            GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
+        };
+        if self.ci { fold_safe(q) } else { q }
     }
 }
 
@@ -1644,6 +1651,25 @@ mod tests {
             assert!(!matches!(plan, TQ::All), "{pat}: {plan:?}");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Folding for the Kelvin sign and long s must not blow up ordinary
+    /// plans: no more trigrams than the plain ASCII plan.
+    #[test]
+    fn case_insensitive_plans_stay_small() {
+        fn tris(q: &TQ) -> usize {
+            match q {
+                TQ::All => 0,
+                TQ::Tri(_) => 1,
+                TQ::And(v) | TQ::Or(v) => v.iter().map(tris).sum(),
+            }
+        }
+        for w in ["kubernetes", "session_store", "hello world", "configuration", "les misérables"] {
+            let (ci, ascii) = (Grep::new(w, GrepMode::Literal).unwrap().plan(), literal_plan(w.as_bytes()));
+            assert!(tris(&ci) <= tris(&ascii), "{w}: {} trigrams vs {}", tris(&ci), tris(&ascii));
+            let ci = Grep::new(w, GrepMode::Regex).unwrap().plan();
+            assert!(tris(&ci) <= tris(&ascii), "regex {w}: {} trigrams vs {}", tris(&ci), tris(&ascii));
+        }
     }
 
     #[test]
