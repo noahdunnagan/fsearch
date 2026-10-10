@@ -885,14 +885,17 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             } else {
                 p = join(dir, idx.name(i));
             }
-            if file_in_scope(&p, home) {
+            // Direct children share `dir`, already in scope.
+            if !recursive || file_in_scope(&p, home) {
                 want.push(&p, idx.size_of(i), idx.mtime()[i]);
             }
         }
     }
     let lo = join(dir, b"");
     for (k, o) in live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)) {
-        if o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && eligible(k, o.size, home) {
+        let direct = !k[lo.len()..].contains(&b'/');
+        let name = &k[k.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
+        if o.kind & 3 == KIND_FILE && (recursive || direct) && name_ok(name, o.size) && (direct || file_in_scope(k, home)) {
             want.push(k, o.size, o.mtime);
         }
     }
