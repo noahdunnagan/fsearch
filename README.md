@@ -1,8 +1,8 @@
 # FSearch
 
-Whole-disk file search for macOS. Finds any file by name in about a
-millisecond, forgives typos, and searches inside files with an index. Use it
-as a CLI (with a small daemon) or as a Rust crate.
+Whole-disk file search for macOS. Finds any file by name in about a tenth
+of a millisecond, forgives typos, and searches inside files with an index.
+Use it as a CLI (with a small daemon) or as a Rust crate.
 
 ```
 cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
@@ -12,15 +12,28 @@ fsearch 'ext:rs grep:apply_dir'   # search inside files
 
 ## Speed
 
-M4 Max, 7.7M files and folders on disk.
+M4 Max, 8.3M files and folders on disk. Before is the previous version
+(76d612f): same Mac, same data, same results. Medians unless noted.
 
-| | |
-|---|---|
-| find a file by name, whole disk | p50 1.3 ms |
-| search inside files | p50 9 ms |
-| a new, renamed or deleted file shows up | ~0.1 s |
-| first crawl of the disk | ~20 s, once |
-| daemon memory | 30-135 MB |
+| | before | now | |
+|---|---:|---:|---|
+| find a file by name, whole disk | 1.0 ms | 0.13 ms | 7.7× faster |
+| typing a filename, all keystrokes | 23 ms | 3.0 ms | 7.5× faster |
+| search inside files, whole disk | 14 ms | 2.3 ms | 6.2× faster |
+| find a file by name, Chromium (509k files) | 0.39 ms | 0.10 ms | 3.9× faster |
+| search inside files, Chromium | 7.4 ms | 1.4 ms | 5.3× faster |
+| slowest 10% of searches inside files, Chromium | 38 ms | 2.3 ms | 16× faster |
+| search from the CLI | 5.5 ms | 3.3 ms | 1.7× faster |
+| first run: names searchable | 27 s | 26 s | |
+| first run: file contents searchable | 101 s | 49 s | 2.1× faster |
+| memory peak, first run | 1.2 GB | 0.9 GB | |
+| memory when idle | 58 MB | 57 MB | |
+| index on disk, home folder with many repo copies | 1.15 GB | 1.41 GB | 1.2× bigger |
+| index on disk, Chromium | 0.32 GB | 0.76 GB | 2.4× bigger |
+
+The index is bigger because each file's content carries a small filter that
+lets a search skip files without the text. Identical files are indexed once.
+A new, renamed or deleted file shows up in about 0.1 s.
 
 ## vs fff
 
