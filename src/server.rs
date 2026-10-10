@@ -84,11 +84,13 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
         // No pid at all: a daemon from before they were recorded (the first
         // upgrade). Find it among the processes with the file open (another
         // install may have it open too); look again every second or so.
-        if pid.is_none() && killed.is_none() && tick % 10 == 0 {
-            if let Some(p) = holders(&path).into_iter().find(|&p| p != me && is_fsearch(p) && is_daemon(p)) {
-                unsafe { libc::kill(p, libc::SIGTERM) };
-                killed = Some(p);
-            }
+        if pid.is_none()
+            && killed.is_none()
+            && tick % 10 == 0
+            && let Some(p) = holders(&path).into_iter().find(|&p| p != me && is_fsearch(p) && is_daemon(p))
+        {
+            unsafe { libc::kill(p, libc::SIGTERM) };
+            killed = Some(p);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
