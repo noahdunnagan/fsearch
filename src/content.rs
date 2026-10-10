@@ -1152,7 +1152,9 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
         let mut lines = Vec::new();
         let (mut line_no, mut counted) = (1usize, 0usize);
         let mut last_line_start = usize::MAX;
-        let has_cr = memchr::memchr(b'\r', buf).is_some();
+        // Whether the file has a \r at all: asked at its first match only, so
+        // the many candidates that don't match aren't scanned for it.
+        let mut cr = None;
         for m in g.re.find_iter(buf) {
             // An empty match after the final newline (`^`, `$`, `x*`) is
             // not on any line.
@@ -1161,7 +1163,7 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
             }
             // Lines end at \n, \r\n or a lone \r, as the regex (crlf mode) has
             // it. Files without a \r (nearly all) take the plain \n path.
-            let (ls, le) = if has_cr {
+            let (ls, le) = if *cr.get_or_insert_with(|| memchr::memchr(b'\r', buf).is_some()) {
                 let ends_line = |i: usize| buf[i] == b'\n' || buf.get(i + 1) != Some(&b'\n');
                 line_no += memchr::memchr2_iter(b'\n', b'\r', &buf[counted..m.start()]).filter(|&i| ends_line(counted + i)).count();
                 let ls = memchr::memrchr2_iter(b'\n', b'\r', &buf[..m.start()]).find(|&i| ends_line(i)).map_or(0, |p| p + 1);
