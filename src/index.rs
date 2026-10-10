@@ -359,10 +359,11 @@ impl Index {
         put(Sec::NameEntsOff, as_bytes(&ne_off));
         put(Sec::NameEnts, as_bytes(&ne));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
-        Index::from_map(m.make_read_only().unwrap()).unwrap()
+        // Just built here, so its ids are known good: no need to check them.
+        Index::from_map(m.make_read_only().unwrap(), false).unwrap()
     }
 
-    fn from_map(map: Mmap) -> Option<Index> {
+    fn from_map(map: Mmap, check_ids: bool) -> Option<Index> {
         let [n, d, u, names_len, event_id, synced_at] = fields(&map, MAGIC)?.map(|v| v as usize);
         // Each count takes at least a byte per item, so a corrupt header
         // can't make the section sizes below overflow.
@@ -385,7 +386,7 @@ impl Index {
             map,
             plan: std::sync::OnceLock::new(),
         };
-        idx.ids_in_range().then_some(idx)
+        (!check_ids || idx.ids_in_range()).then_some(idx)
     }
 
     /// Every id a section holds points inside the section it indexes, so a
@@ -424,7 +425,7 @@ impl Index {
 
     pub fn load(path: &Path) -> Option<Index> {
         let f = std::fs::File::open(path).ok()?;
-        Index::from_map(unsafe { Mmap::map(&f) }.ok()?)
+        Index::from_map(unsafe { Mmap::map(&f) }.ok()?, true)
     }
 
     pub fn bytes(&self) -> usize {
