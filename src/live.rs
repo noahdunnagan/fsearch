@@ -195,7 +195,8 @@ impl Live {
             return f;
         }
         let Some(listing) = walk::list_one(&f.path) else {
-            f.attrs = lstat(&f.path);
+            // Only whether it still exists matters here: no mount check.
+            f.attrs = stat(&f.path, false);
             return f;
         };
         // Children that will be added as folders get their subtree scanned now.
@@ -468,13 +469,19 @@ fn shape(kind: u8) -> u8 {
 
 /// Just the mtime: one lstat, no mount check (changed_dirs asks this of
 /// every folder in the index).
-fn mtime_of(path: &[u8]) -> Option<u32> {
+pub(crate) fn mtime_of(path: &[u8]) -> Option<u32> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     (unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0).then(|| st.st_mtime.clamp(0, u32::MAX as i64) as u32)
 }
 
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
+    stat(path, true)
+}
+
+/// lstat as an index entry; `mount`: also ask a folder's mount status (an
+/// extra syscall), for callers that compare shapes.
+fn stat(path: &[u8], mount: bool) -> Option<OEnt> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
@@ -484,7 +491,7 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
         libc::S_IFREG => walk::KIND_FILE,
         // Flagged like a scan does, so a recursive event on it isn't a
         // crawl of the mounted volume.
-        libc::S_IFDIR if walk::is_mount(&c) => KIND_DIR | FLAG_MOUNT,
+        libc::S_IFDIR if mount && walk::is_mount(&c) => KIND_DIR | FLAG_MOUNT,
         libc::S_IFDIR => KIND_DIR,
         libc::S_IFLNK => walk::KIND_LINK,
         _ => walk::KIND_OTHER,

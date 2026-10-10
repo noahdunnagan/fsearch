@@ -132,7 +132,7 @@ pub fn scan_rooted(root: &[u8], threads: usize) -> Vec<Listing> {
     let mut path = Vec::new();
     for (i, c) in (0..).zip(comps) {
         path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
-        let mtime = crate::live::lstat(&path).map_or(0, |o| o.mtime);
+        let mtime = crate::live::mtime_of(&path).unwrap_or(0);
         let ent = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime, child: i + 1 };
         ls.push(Listing { id: i, names: c.to_vec(), ents: vec![ent] });
     }
