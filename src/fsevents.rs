@@ -88,6 +88,7 @@ pub fn current_id() -> u64 {
 
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
+    fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, relative_priority: i32) -> *const c_void;
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
@@ -135,7 +136,12 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
         let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
-        let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
+        // The callback only copies paths out, but it must not queue behind
+        // busy threads (a first build runs on every core at user-initiated
+        // QoS): fseventsd drops what a client falls behind on, and the drop
+        // costs a relist of every folder changed since the last sync.
+        let qos = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
+        let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
         (a.start)(s);
         Stream(s)
