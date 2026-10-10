@@ -210,6 +210,27 @@ fn re_literals(re: &regex::bytes::Regex) -> Option<Vec<Vec<u8>>> {
     lits.iter().all(|l| !l.is_empty()).then_some(lits)
 }
 
+/// Lowercased literals one of which ends every path `re` matches, if it is
+/// anchored at the end ("swift$") and they hold no '/': then a match's own
+/// name, the path's last part, ends with one of them.
+fn path_suffixes(re: &regex::bytes::Regex) -> Option<Vec<Vec<u8>>> {
+    use regex_syntax::hir::{Look, literal::ExtractKind};
+    let hir = regex_syntax::ParserBuilder::new().utf8(false).build().parse(re.as_str()).ok()?;
+    if !hir.properties().look_set_suffix().contains(Look::End) {
+        return None;
+    }
+    let seq = regex_syntax::hir::literal::Extractor::new().kind(ExtractKind::Suffix).extract(&hir);
+    let mut lits: Vec<Vec<u8>> = seq.literals()?.iter().map(|l| l.as_bytes().to_ascii_lowercase()).collect();
+    lits.sort();
+    lits.dedup();
+    lits.iter().all(|l| !l.is_empty() && !l.contains(&b'/')).then_some(lits)
+}
+
+/// Does `name` end with `s` (lowercase), ignoring ASCII case?
+fn ends_with_fold(name: &[u8], s: &[u8]) -> bool {
+    name.len() >= s.len() && name[name.len() - s.len()..].iter().zip(s).all(|(&a, &b)| fold(a) == b)
+}
+
 /// Fuzzy words this long forgive one typo (see `typo_score`).
 const TYPO_MIN_LEN: usize = 5;
 /// What a typo costs, so clean matches of the same quality rank first.
@@ -1487,7 +1508,9 @@ impl Searcher<'_> {
     /// name, or only the ones `from` matched and `within` holds.
     fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token], from: Option<&NameTable>, within: Option<&NameSet>) -> NameTable {
         let idx = &self.live.base;
-        if pos.is_empty() && neg.is_empty() && q.exts.is_empty() && q.name_re.is_none() {
+        // A `path:` anchored at the end says how a match's own name ends.
+        let tails = q.path_re.as_ref().and_then(path_suffixes);
+        if pos.is_empty() && neg.is_empty() && q.exts.is_empty() && q.name_re.is_none() && tails.is_none() {
             // Every name passes with score 0; only its flags differ.
             return NameTable::new(Vec::new(), Vec::new(), Vec::new(), idx.n, true);
         }
@@ -1559,6 +1582,7 @@ impl Searcher<'_> {
                 let ok = (pos.is_empty() || h.bits != 0)
                     && h.flags & NF_NEG == 0
                     && (q.exts.is_empty() || ext_ok_k(k, name))
+                    && tails.as_ref().is_none_or(|t| t.iter().any(|t| ends_with_fold(name, t)))
                     && re.is_none_or(|re| re.is_match(name));
                 if ok {
                     h.flags |= NF_OK;
