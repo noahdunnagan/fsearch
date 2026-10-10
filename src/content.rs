@@ -299,28 +299,62 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     out.push(v as u8);
 }
 
-/// Append the sorted distinct case-folded trigrams of a buffer to `out`.
-/// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
-fn trigrams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
-    let start = out.len();
-    let [.., a, b] = buf else { return };
+/// A file's distinct trigrams, and its end-of-file key, appended to `tri`
+/// in buckets by first byte (the runs postings are built in), and the
+/// distinct hashes of its GRAM-byte grams into `grams`. One pass, with no
+/// branch on whether a gram is new. `seen` is two 2 MiB bitsets, all zero
+/// on entry and exit; `tmp` is scratch.
+fn index_grams(buf: &[u8], seen: &mut [u64], tmp: &mut Vec<u32>, tri: &mut Vec<u32>, grams: &mut Vec<u32>) {
+    grams.clear();
+    let n = buf.len();
+    if n < 2 {
+        return;
+    }
+    let (st, sg) = seen.split_at_mut(seen.len() / 2);
     // Its last two bytes and a 0: so a two-byte search finds them too.
-    let mut t = (fold(*a) as u32) << 16 | (fold(*b) as u32) << 8;
-    seen[(t >> 6) as usize] |= 1 << (t & 63);
-    out.push(t);
-    t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
-    for &b in &buf[2..] {
-        t = ((t << 8) | fold(b) as u32) & 0xFF_FFFF;
+    let eof = (fold(buf[n - 2]) as u32) << 16 | (fold(buf[n - 1]) as u32) << 8;
+    st[(eof >> 6) as usize] |= 1 << (eof & 63);
+    tmp.clear();
+    tmp.resize(n, 0);
+    tmp[0] = eof;
+    grams.resize(n, 0);
+    let (mut nt, mut ng) = (1, 0);
+    let mut g = (fold(buf[0]) as u64) << 8 | fold(buf[1]) as u64;
+    for (i, &c) in buf.iter().enumerate().skip(2) {
+        g = g << 8 | fold(c) as u64;
+        let t = (g & 0xFF_FFFF) as u32;
         let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
-        if seen[w] & bit == 0 {
-            seen[w] |= bit;
-            out.push(t);
-        }
+        tmp[nt] = t;
+        nt += (st[w] & bit == 0) as usize;
+        st[w] |= bit;
+        let full = i + 1 >= GRAM;
+        let h = gram_hash(g & ((1 << (8 * GRAM)) - 1));
+        let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
+        grams[ng] = h;
+        ng += (full & (sg[w] & bit == 0)) as usize;
+        sg[w] |= bit & 0u64.wrapping_sub(full as u64);
     }
-    for &t in &out[start..] {
-        seen[(t >> 6) as usize] = 0;
+    grams.truncate(ng);
+    for &t in &tmp[..nt] {
+        st[(t >> 6) as usize] = 0;
     }
-    out[start..].sort_unstable();
+    for &h in grams.iter() {
+        sg[(h >> 6) as usize] = 0;
+    }
+    let mut at = [0usize; 257];
+    for &t in &tmp[..nt] {
+        at[(t >> 16) as usize + 1] += 1;
+    }
+    for k in 0..256 {
+        at[k + 1] += at[k];
+    }
+    let start = tri.len();
+    tri.resize(start + nt, 0);
+    for &t in &tmp[..nt] {
+        let k = &mut at[(t >> 16) as usize];
+        tri[start + *k] = t;
+        *k += 1;
+    }
 }
 
 /// Trigrams of a short string (query side), no scratch needed.
@@ -347,27 +381,6 @@ fn gram_hash(g: u64) -> u32 {
 fn bloom_bits(h: u32, words: usize) -> [usize; 2] {
     let at = |h: u32| ((h as u64 * words as u64 * 64) >> 24) as usize;
     [at(h), at(h.wrapping_mul(0x9E37_79B1) & 0xFF_FFFF)]
-}
-
-/// Distinct hashes of a buffer's `n`-byte grams, into `out` (cleared).
-/// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
-fn grams(buf: &[u8], n: usize, seen: &mut [u64], out: &mut Vec<u32>) {
-    out.clear();
-    let mut g = 0u64;
-    for (i, &b) in buf.iter().enumerate() {
-        g = (g << 8 | fold(b) as u64) & ((1 << (8 * n)) - 1);
-        if i + 1 >= n {
-            let h = gram_hash(g);
-            let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
-            if seen[w] & bit == 0 {
-                seen[w] |= bit;
-                out.push(h);
-            }
-        }
-    }
-    for &h in out.iter() {
-        seen[(h >> 6) as usize] = 0;
-    }
 }
 
 /// Append a bloom filter of these gram hashes to `out`: `bits` per gram, two
@@ -519,8 +532,8 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
     let splits: Vec<Split> = (runs.into_par_iter())
         .map(|run| {
-            let (mut seen, mut buf, mut hashes) =
-                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; (1 << 24) / 64], Vec::new(), Vec::new()));
+            let (mut seen, mut buf, mut hashes, mut tmp) =
+                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 2 << 18], Vec::new(), Vec::new(), Vec::new()));
             let mut sp = Split::default();
             let mut ahead = std::collections::VecDeque::new();
             for i in run.clone() {
@@ -533,16 +546,15 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                     .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &buf[..n.min(8192)]).is_none());
                 let (tri, sym, bl) = (sp.flat.len(), sp.syms.len(), sp.blooms.len());
                 if text {
-                    trigrams(&buf, &mut seen, &mut sp.flat);
+                    index_grams(&buf, &mut seen, &mut tmp, &mut sp.flat, &mut hashes);
                     symbols(&buf, &mut sp.syms);
-                    grams(&buf, GRAM, &mut seen, &mut hashes);
                     // Big files are candidates far more often (per byte of
                     // filter too): three bits a gram for them, two for others.
                     bloom(&hashes, if buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
                 }
                 sp.docs.push(SplitDoc { i, text, tri: tri..sp.flat.len(), sym: sym..sp.syms.len(), bloom: bl..sp.blooms.len() });
             }
-            scratch.lock().unwrap().push((seen, buf, hashes));
+            scratch.lock().unwrap().push((seen, buf, hashes, tmp));
             sp
         })
         .collect();
