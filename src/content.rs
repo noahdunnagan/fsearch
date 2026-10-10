@@ -31,7 +31,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG07";
+const MAGIC: &[u8; 8] = b"FSCSEG08";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -314,10 +314,12 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
 /// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
 fn trigrams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
     let start = out.len();
-    if buf.len() < 3 {
-        return;
-    }
-    let mut t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
+    let [.., a, b] = buf else { return };
+    // Its last two bytes and a 0: so a two-byte search finds them too.
+    let mut t = (fold(*a) as u32) << 16 | (fold(*b) as u32) << 8;
+    seen[(t >> 6) as usize] |= 1 << (t & 63);
+    out.push(t);
+    t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
     for &b in &buf[2..] {
         t = ((t << 8) | fold(b) as u32) & 0xFF_FFFF;
         let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
@@ -1686,15 +1688,19 @@ fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> 
 pub enum TQ {
     All,
     Tri(u32),
+    /// Any trigram starting with these two bytes (the high two of three), or
+    /// a doc ending in them.
+    Pair(u32),
     And(Vec<TQ>),
     Or(Vec<TQ>),
 }
 
 fn literal_plan(s: &[u8]) -> TQ {
-    if s.len() < 3 {
-        return TQ::All;
+    match s {
+        [] | [_] => TQ::All,
+        &[a, b] => TQ::Pair((fold(a) as u32) << 16 | (fold(b) as u32) << 8),
+        _ => TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect()),
     }
-    TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect())
 }
 
 /// A posting list as stored.
@@ -1813,6 +1819,22 @@ fn eval(s: &Segment, q: &TQ, docs: std::ops::Range<u32>) -> Option<Vec<u32>> {
                 l.decode(docs, &mut out);
             }
             Some(out)
+        }
+        TQ::Pair(p) => {
+            let keys = s.tri_key();
+            let mut bits = vec![0u64; s.ndocs.div_ceil(64)];
+            for &k in &keys[keys.partition_point(|&k| k < *p)..keys.partition_point(|&k| k <= p | 0xFF)] {
+                match s.list(k) {
+                    Some(List::Bits(b)) => {
+                        for (w, c) in bits.iter_mut().zip(b.chunks(8)) {
+                            *w |= c.iter().rev().fold(0, |x, &y| x << 8 | y as u64);
+                        }
+                    }
+                    Some(List::Var(b)) => Varints { b, last: 0 }.for_each(|d| bits[d as usize / 64] |= 1 << (d % 64)),
+                    None => {}
+                }
+            }
+            Some(set_bits(&bits, 0).into_iter().filter(|d| docs.contains(d)).collect())
         }
         TQ::And(qs) => {
             let (mut bits, mut vars, mut rest) = (Vec::new(), Vec::new(), Vec::new());
