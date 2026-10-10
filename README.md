@@ -43,15 +43,17 @@ Chromium (509k files), same Mac, same queries. Video:
 
 | | fsearch | [fff](https://github.com/dmtrKovalenko/fff) |
 |---|---|---|
-| find a file by name | 1.1 ms | 13.8 ms |
-| search inside files | 5.6 ms | 53 ms |
-| typo still finds the file first | 98% | 88% |
-| ready after launch | 50 ms | 2.5 s |
-| memory | 50 MB (whole disk) | 358 MB (that folder) |
+| find a file by name | 0.21 ms | 15.4 ms |
+| search inside files | 2.0 ms | 64 ms |
+| slowest 10% of searches inside files | 3.9 ms | 482 ms |
+| typo still finds the file first | 99% | 86% |
+| ready after launch | 28 ms | 2.5 s |
+| memory | 63 MB (whole disk) | 449 MB (that folder) |
 
-On the smaller Linux kernel (96k files), name search is a tie and fsearch
-wins the rest. fff searches the contents of about 9% more files, because
-fsearch skips some file types and `build/` and `vendor/` folders.
+On the smaller Linux kernel (96k files) fsearch wins every row too: 0.16 ms
+vs 1.8 ms by name, 1.0 ms vs 26 ms inside files. fff searches the contents
+of about 5-10% more files, because fsearch skips some file types and
+`build/` and `vendor/` folders.
 
 ## Queries
 
@@ -99,6 +101,10 @@ others follow along.
 - Crawls the disk once with `getattrlistbulk`, then stays current from
   FSEvents. A restart replays only what changed.
 - Names live in one mmap'd file, laid out folder by folder so `in:` is a
-  range. Each distinct name is scored once.
-- Content search uses a trigram index of your text files. Matches are read
+  range. Each distinct name is scored once, and a bitmap of the letters in
+  each name rules out most names before scoring, 64 at a time.
+- Content search uses a trigram index of your text files. Each file also
+  gets a small filter of its 5- and 7-character runs, so a search reads only
+  files likely to match. Identical files are indexed once. Matches are read
   fresh from disk, so they're never stale.
+- The first index runs in parallel and opens files ahead of reading them.
