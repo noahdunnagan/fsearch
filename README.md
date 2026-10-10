@@ -1,8 +1,7 @@
 # FSearch
 
-Whole-disk file search for macOS. Finds any file by name in about a tenth
-of a millisecond, forgives typos, and searches inside files with an index.
-Use it as a CLI (with a small daemon) or as a Rust crate.
+Whole-disk file search for macOS: names in about 0.1 ms, typo-tolerant,
+plus indexed search inside files. A CLI with a small daemon, or a Rust crate.
 
 ```
 cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
@@ -12,48 +11,40 @@ fsearch 'ext:rs grep:apply_dir'   # search inside files
 
 ## Speed
 
-M4 Max, 8.3M files and folders on disk. Before is the previous version
-(76d612f): same Mac, same data, same results. Medians unless noted.
+M4 Max, 8.3M files on disk, vs the previous version (76d612f). Same
+results. Medians.
 
 | | before | now | |
-|---|---:|---:|---|
-| find a file by name, whole disk | 1.0 ms | 0.13 ms | 7.7× faster |
-| typing a filename, all keystrokes | 23 ms | 3.0 ms | 7.5× faster |
-| search inside files, whole disk | 14 ms | 2.3 ms | 6.2× faster |
-| find a file by name, Chromium (509k files) | 0.39 ms | 0.10 ms | 3.9× faster |
-| search inside files, Chromium | 7.4 ms | 1.4 ms | 5.3× faster |
-| slowest 10% of searches inside files, Chromium | 38 ms | 2.3 ms | 16× faster |
-| search from the CLI | 5.5 ms | 3.3 ms | 1.7× faster |
-| first run: names searchable | 27 s | 26 s | |
-| first run: file contents searchable | 101 s | 49 s | 2.1× faster |
-| memory peak, first run | 1.2 GB | 0.9 GB | |
-| memory when idle | 58 MB | 57 MB | |
-| index on disk, home folder with many repo copies | 1.15 GB | 1.41 GB | 1.2× bigger |
-| index on disk, Chromium | 0.32 GB | 0.76 GB | 2.4× bigger |
+|---|---:|---:|---:|
+| find a file by name | 1.0 ms | 0.13 ms | 7.7× |
+| typing a whole filename, all keystrokes | 23 ms | 3.0 ms | 7.5× |
+| search inside files | 14 ms | 2.3 ms | 6.2× |
+| slowest 10% inside files (Chromium) | 38 ms | 2.3 ms | 16× |
+| CLI, launch to answer | 5.5 ms | 3.3 ms | 1.7× |
+| first run, fully searchable | 101 s | 49 s | 2.1× |
+| first run, peak memory | 1.2 GB | 0.9 GB | |
+| index on disk (Chromium) | 0.32 GB | 0.76 GB | 2.4× bigger |
 
-The index is bigger because each file's content carries a small filter that
-lets a search skip files without the text. Identical files are indexed once.
-A new, renamed or deleted file shows up in about 0.1 s.
+The index grew because each file carries a filter that lets search skip
+files without the text.
 
 ## vs fff
 
-Chromium (509k files), same Mac, same queries. Video:
-[`demo/fsearch-vs-fff.mp4`](demo/fsearch-vs-fff.mp4), method:
-[`demo/vs_fff.py`](demo/vs_fff.py).
+Chromium (509k files), same Mac and queries.
+[Video](demo/fsearch-vs-fff.mp4), [method](demo/vs_fff.py).
 
 | | fsearch | [fff](https://github.com/dmtrKovalenko/fff) |
 |---|---|---|
 | find a file by name | 0.21 ms | 15.4 ms |
 | search inside files | 2.0 ms | 64 ms |
-| slowest 10% of searches inside files | 3.9 ms | 482 ms |
+| slowest 10% inside files | 3.9 ms | 482 ms |
 | typo still finds the file first | 99% | 86% |
 | ready after launch | 28 ms | 2.5 s |
 | memory | 63 MB (whole disk) | 449 MB (that folder) |
 
-On the smaller Linux kernel (96k files) fsearch wins every row too: 0.16 ms
-vs 1.8 ms by name, 1.0 ms vs 26 ms inside files. fff searches the contents
-of about 5-10% more files, because fsearch skips some file types and
-`build/` and `vendor/` folders.
+Linux kernel (96k files): 0.16 vs 1.8 ms by name, 1.0 vs 26 ms inside
+files. fff reads 5-10% more files: fsearch skips some file types and
+`build/` and `vendor/`.
 
 ## Queries
 
@@ -71,10 +62,10 @@ Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
 
 ## Full Disk Access
 
-Started from a terminal with Full Disk Access, it indexes everything. As a
-login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
-grant in System Settings > Privacy & Security, again after each rebuild.
-Without access it skips the protected folders instead of popping a prompt.
+From a terminal with Full Disk Access it indexes everything. As a login
+item (`fsearch install --login`), grant `~/.local/bin/fsearch` access in
+System Settings > Privacy & Security, again after each rebuild. Without
+access it skips protected folders instead of prompting.
 
 ## API
 
@@ -93,18 +84,15 @@ let engine = fsearch::Engine::start(fsearch::Options { dir: fsearch::default_dir
 let hits = engine.search(&fsearch::Query::parse("fsearch main", &home)?)?;
 ```
 
-An app and the CLI share one index: the first process owns it and the
-others follow along.
+An app and the CLI share one index: the first process owns it, the rest
+follow.
 
 ## How it works
 
-- Crawls the disk once with `getattrlistbulk`, then stays current from
-  FSEvents. A restart replays only what changed.
-- Names live in one mmap'd file, laid out folder by folder so `in:` is a
-  range. Each distinct name is scored once, and a bitmap of the letters in
-  each name rules out most names before scoring, 64 at a time.
-- Content search uses a trigram index of your text files. Each file also
-  gets a small filter of its 5- and 7-character runs, so a search reads only
-  files likely to match. Identical files are indexed once. Matches are read
-  fresh from disk, so they're never stale.
-- The first index runs in parallel and opens files ahead of reading them.
+- Crawls the disk once with `getattrlistbulk`, then follows FSEvents:
+  changes show up in about 0.1 s, and a restart replays only what changed.
+- Names live in one mmap'd file, folder by folder, so `in:` is a range. A
+  bitmap of each name's letters rules out most names before scoring.
+- Content search is a trigram index plus a per-file filter, so a search
+  only reads files likely to match. Identical files are indexed once.
+  Matches are read fresh from disk.
