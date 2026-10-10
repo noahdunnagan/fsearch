@@ -201,13 +201,18 @@ impl Engine {
             let _ = walk::SKIP.set(skip);
         }
         let dir = opts.dir;
+        // Read a saved index in (Live::new faults its arrays in) while the
+        // rest starts up: opening content and FSEvents take ms, tens from disk.
+        let loading = Index::load(&dir.join("index.bin")).map(|b| {
+            let (n, event_id) = (b.n, b.event_id);
+            (n, event_id, std::thread::spawn(move || Live::new(b)))
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
         let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
-        let base = Index::load(&dir.join("index.bin"));
         let shared = Arc::new(Shared {
             live: RwLock::new(None),
-            loading: (Mutex::new(base.is_some()), Condvar::new()),
+            loading: (Mutex::new(loading.is_some()), Condvar::new()),
             content: RwLock::new(content),
             home: opts.home,
             dir,
@@ -222,8 +227,8 @@ impl Engine {
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
         });
-        let since = match &base {
-            Some(b) if b.event_id != 0 => b.event_id,
+        let since = match &loading {
+            Some((_, event_id, _)) if *event_id != 0 => *event_id,
             _ => fsevents::current_id(),
         };
         if owner {
@@ -233,23 +238,23 @@ impl Engine {
         }
         let s = shared.clone();
         spawn("fsearch-apply", move || {
-            let base = match base {
-                Some(b) => {
-                    log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
+            let live = match loading {
+                Some((n, event_id, read_in)) => {
+                    log(format!("loaded {n} entries, replaying events since {event_id}"));
                     if !owner {
-                        s.watch(b.event_id);
+                        s.watch(event_id);
                     }
-                    b
+                    read_in.join().expect("load index")
                 }
-                None if owner => full_build(&s, since),
+                None if owner => Live::new(full_build(&s, since)),
                 None => {
                     // The owner is building it; follow once it exists.
                     let b = wait_for_index(&s.dir);
                     s.watch(b.event_id);
-                    b
+                    Live::new(b)
                 }
             };
-            *s.live.write().unwrap() = Some(Live::new(base));
+            *s.live.write().unwrap() = Some(live);
             *s.loading.0.lock().unwrap() = false;
             s.loading.1.notify_all();
             if owner {
