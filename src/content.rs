@@ -299,12 +299,12 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     out.push(v as u8);
 }
 
-/// A file's distinct trigrams, and its end-of-file key, appended to `tri`
-/// in buckets by first byte (the runs postings are built in), and the
-/// distinct hashes of its GRAM-byte grams into `grams`. One pass, with no
-/// branch on whether a gram is new. `seen` is two 2 MiB bitsets, all zero
-/// on entry and exit; `tmp` is scratch.
-fn index_grams(buf: &[u8], seen: &mut [u64], tmp: &mut Vec<u32>, tri: &mut Vec<u32>, grams: &mut Vec<u32>) {
+/// A file's distinct trigrams and its end-of-file key into `tri`, and the
+/// distinct hashes of its GRAM-byte grams into `grams` (both cleared,
+/// unordered). One pass, with no branch on whether a gram is new. `seen` is
+/// two 2 MiB bitsets, all zero on entry and exit.
+fn index_grams(buf: &[u8], seen: &mut [u64], tri: &mut Vec<u32>, grams: &mut Vec<u32>) {
+    tri.clear();
     grams.clear();
     let n = buf.len();
     if n < 2 {
@@ -314,9 +314,8 @@ fn index_grams(buf: &[u8], seen: &mut [u64], tmp: &mut Vec<u32>, tri: &mut Vec<u
     // Its last two bytes and a 0: so a two-byte search finds them too.
     let eof = (fold(buf[n - 2]) as u32) << 16 | (fold(buf[n - 1]) as u32) << 8;
     st[(eof >> 6) as usize] |= 1 << (eof & 63);
-    tmp.clear();
-    tmp.resize(n, 0);
-    tmp[0] = eof;
+    tri.resize(n, 0);
+    tri[0] = eof;
     grams.resize(n, 0);
     let (mut nt, mut ng) = (1, 0);
     let mut g = (fold(buf[0]) as u64) << 8 | fold(buf[1]) as u64;
@@ -324,7 +323,7 @@ fn index_grams(buf: &[u8], seen: &mut [u64], tmp: &mut Vec<u32>, tri: &mut Vec<u
         g = g << 8 | fold(c) as u64;
         let t = (g & 0xFF_FFFF) as u32;
         let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
-        tmp[nt] = t;
+        tri[nt] = t;
         nt += (st[w] & bit == 0) as usize;
         st[w] |= bit;
         let full = i + 1 >= GRAM;
@@ -334,26 +333,13 @@ fn index_grams(buf: &[u8], seen: &mut [u64], tmp: &mut Vec<u32>, tri: &mut Vec<u
         ng += (full & (sg[w] & bit == 0)) as usize;
         sg[w] |= bit & 0u64.wrapping_sub(full as u64);
     }
+    tri.truncate(nt);
     grams.truncate(ng);
-    for &t in &tmp[..nt] {
+    for &t in tri.iter() {
         st[(t >> 6) as usize] = 0;
     }
     for &h in grams.iter() {
         sg[(h >> 6) as usize] = 0;
-    }
-    let mut at = [0usize; 257];
-    for &t in &tmp[..nt] {
-        at[(t >> 16) as usize + 1] += 1;
-    }
-    for k in 0..256 {
-        at[k + 1] += at[k];
-    }
-    let start = tri.len();
-    tri.resize(start + nt, 0);
-    for &t in &tmp[..nt] {
-        let k = &mut at[(t >> 16) as usize];
-        tri[start + *k] = t;
-        *k += 1;
     }
 }
 
@@ -499,11 +485,11 @@ struct DocMeta<'a> {
     bloom: &'a [u64],
 }
 
-/// One run of docs' output: trigrams, definition keys and bloom filters,
-/// flat, plus where each doc's runs are.
-#[derive(Default)]
+/// One run of docs' output: its (trigram, doc) pairs in 256 buckets by the
+/// trigram's first byte (the doc numbered within the run), and definition
+/// keys and bloom filters, flat, plus where each doc's are.
 struct Split {
-    flat: Vec<u32>,
+    pairs: Vec<Vec<u64>>,
     syms: Vec<u32>,
     blooms: Vec<u64>,
     docs: Vec<SplitDoc>,
@@ -513,7 +499,6 @@ struct Split {
 struct SplitDoc {
     i: usize,
     text: bool,
-    tri: std::ops::Range<usize>,
     sym: std::ops::Range<usize>,
     bloom: std::ops::Range<usize>,
 }
@@ -532,9 +517,9 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
     let splits: Vec<Split> = (runs.into_par_iter())
         .map(|run| {
-            let (mut seen, mut buf, mut hashes, mut tmp) =
+            let (mut seen, mut buf, mut hashes, mut tri) =
                 scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 2 << 18], Vec::new(), Vec::new(), Vec::new()));
-            let mut sp = Split::default();
+            let mut sp = Split { pairs: vec![Vec::new(); 256], syms: Vec::new(), blooms: Vec::new(), docs: Vec::new() };
             let mut ahead = std::collections::VecDeque::new();
             for i in run.clone() {
                 while ahead.len() <= AHEAD && i + ahead.len() < run.end {
@@ -544,17 +529,20 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                 let text = (ahead.pop_front().flatten())
                     .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut buf).ok())
                     .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &buf[..n.min(8192)]).is_none());
-                let (tri, sym, bl) = (sp.flat.len(), sp.syms.len(), sp.blooms.len());
+                let (k, sym, bl) = (sp.docs.len() as u64, sp.syms.len(), sp.blooms.len());
                 if text {
-                    index_grams(&buf, &mut seen, &mut tmp, &mut sp.flat, &mut hashes);
+                    index_grams(&buf, &mut seen, &mut tri, &mut hashes);
+                    for &t in &tri {
+                        sp.pairs[(t >> 16) as usize].push((t as u64) << 32 | k);
+                    }
                     symbols(&buf, &mut sp.syms);
                     // Big files are candidates far more often (per byte of
                     // filter too): three bits a gram for them, two for others.
                     bloom(&hashes, if buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
                 }
-                sp.docs.push(SplitDoc { i, text, tri: tri..sp.flat.len(), sym: sym..sp.syms.len(), bloom: bl..sp.blooms.len() });
+                sp.docs.push(SplitDoc { i, text, sym: sym..sp.syms.len(), bloom: bl..sp.blooms.len() });
             }
-            scratch.lock().unwrap().push((seen, buf, hashes, tmp));
+            scratch.lock().unwrap().push((seen, buf, hashes, tri));
             sp
         })
         .collect();
@@ -569,23 +557,24 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             DocMeta { path: docs.path(sd.i), size, mtime, rank, bloom: &splits[si].blooms[sd.bloom.clone()] }
         })
         .collect();
-    let tris = |d: usize| {
-        let (si, k) = order[d];
-        &splits[si].flat[splits[si].docs[k].tri.clone()]
-    };
     let syms = |d: usize| {
         let (si, k) = order[d];
         &splits[si].syms[splits[si].docs[k].sym.clone()]
     };
-    // Postings, built in parallel over runs of keys: each run takes its keys
-    // from every doc's (sorted) trigrams or definition keys, in doc order.
+    let base: Vec<u64> = splits.iter().scan(0, |n, sp| Some(std::mem::replace(n, *n + sp.docs.len() as u64))).collect();
+    // Postings, built in parallel over runs of keys: a run of trigrams takes
+    // its bucket of every split, the definition keys every doc's.
     let parts = key_runs()
         .map(|keys| {
             let mut pairs: Vec<u64> = Vec::new();
-            for d in 0..order.len() {
-                let t = if keys.start < 1 << 24 { tris(d) } else { syms(d) };
-                let from = t.partition_point(|&x| (x as u64) < keys.start);
-                pairs.extend(t[from..].iter().take_while(|&&x| (x as u64) < keys.end).map(|&x| (x as u64) << 32 | d as u64));
+            if keys.start < 1 << 24 {
+                for (sp, &b) in splits.iter().zip(&base) {
+                    pairs.extend(sp.pairs[(keys.start >> 16) as usize].iter().map(|&p| p + b));
+                }
+            } else {
+                for d in 0..order.len() {
+                    pairs.extend(syms(d).iter().map(|&x| (x as u64) << 32 | d as u64));
+                }
             }
             pairs.sort_unstable();
             let (mut part, mut list) = (Postings::default(), Vec::new());
