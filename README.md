@@ -52,14 +52,22 @@ fsearch 'sym:apply_dir'                  # where it's defined
 Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
 `main.rs`). Also `'exact`, `^prefix`, `suffix$` and `!exclude`. Filters:
 `ext:` `type:` `kind:` `in:` `size:` `mtime:` `re:` `path:` `grep:` `regex:`
-`sym:` `limit:`. Content search is smart-case.
+`sym:` `limit:`. Content search is smart-case. `mtime:<3d` is the last three
+days; a bare `mtime:3d` is that day, 3 to 4 days ago.
 
 ## Full Disk Access
 
 Started from a terminal with Full Disk Access, it indexes everything. As a
 login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
 grant in System Settings > Privacy & Security, again after each rebuild.
-Without access it skips the protected folders instead of popping a prompt.
+Without access it skips the protected folders instead of popping a prompt;
+grant it later and they are added on the next start.
+
+## Environment
+
+`FSEARCH_ROOT=/some/folder` indexes and watches that folder instead of the
+whole disk (it must exist; paths in results stay absolute). The tests use it.
+`FSEARCH_RESTRICT=1` acts as if Full Disk Access were missing.
 
 ## API
 
