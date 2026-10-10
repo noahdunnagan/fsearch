@@ -408,11 +408,20 @@ fn note_skipped(dir: &Path) {
 /// missing, since no FSEvents replay brings them back. Rescan them like a
 /// must-scan-subdirs event would; ones still refused carry over to the next
 /// save. (A save from before this was recorded rescans the gated folders.)
-fn rescan_unskipped(shared: &Shared) {
-    let was: Vec<Vec<u8>> = match std::fs::read(shared.dir.join(SKIPPED)) {
+/// The folders the saved index lacks, from `skipped`. A save from before
+/// that file existed falls back to the gated folders, but only when nothing
+/// is kept out (`unrestricted`): otherwise probing them is exactly what
+/// pops the privacy prompt the skip list avoids.
+fn lacked(dir: &Path, home: &str, unrestricted: bool) -> Vec<Vec<u8>> {
+    match std::fs::read(dir.join(SKIPPED)) {
         Ok(b) => b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect(),
-        Err(_) => gated(&shared.home),
-    };
+        Err(_) if unrestricted => gated(home),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn rescan_unskipped(shared: &Shared) {
+    let was = lacked(&shared.dir, &shared.home, walk::SKIP.get().is_none());
     let now: Vec<_> = readable_now(was).into_iter().map(|path| fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 }).collect();
     if now.is_empty() {
         return;
@@ -913,6 +922,18 @@ mod tests {
         assert!(walk::DENIED.lock().unwrap().is_empty());
         // Unwritable: logged, not fatal.
         note_skipped(&dir.join("missing"));
+    }
+
+    /// No `skipped` file (an old save) and no Full Disk Access: don't probe
+    /// the gated folders, which is what pops the privacy prompt.
+    #[test]
+    fn old_save_without_access_probes_nothing() {
+        let dir = root().join("lacked");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(lacked(&dir, "/Users/me", false).is_empty());
+        assert_eq!(lacked(&dir, "/Users/me", true), gated("/Users/me"));
+        std::fs::write(dir.join(SKIPPED), "/a\n/b\n").unwrap();
+        assert_eq!(lacked(&dir, "/Users/me", false), [b"/a".to_vec(), b"/b".to_vec()]);
     }
 
     /// Only folders that read now are rescanned: not missing ones, and not
