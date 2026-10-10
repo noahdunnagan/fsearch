@@ -638,7 +638,7 @@ pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
 /// A file is in scope when its folder is: the skip lists name folders, and
 /// the file's own name is `name_ok`'s business (a script called `build`).
 fn file_in_scope(path: &[u8], home: &[u8]) -> bool {
-    path.iter().rposition(|&b| b == b'/').is_some_and(|cut| in_scope(&path[..cut], home))
+    path.iter().rposition(|&b| b == b'/').is_some_and(|cut| in_scope(if cut == 0 { b"/" } else { &path[..cut] }, home))
 }
 
 /// The name/size half of eligibility, checkable before building a path.
@@ -658,7 +658,7 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 /// Is this path (file or directory) inside the indexed area?
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     // However home is written ("/h/", or "/" for the whole disk).
-    let home = &home[..home.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1)];
+    let home = crate::live::trim_dir(home);
     if !crate::live::is_ancestor(home, path) {
         return false;
     }
@@ -906,6 +906,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
 /// itself; a rescanned tree that holds home (e.g. "/") means all of home.
 /// None: not the content index's business.
 fn follow_target(path: &[u8], tree: bool, home: &[u8]) -> Option<(Vec<u8>, bool)> {
+    let home = crate::live::trim_dir(home);
     if in_scope(path, home) {
         Some((path.to_vec(), tree))
     } else if tree && crate::live::is_ancestor(path, home) {
@@ -2252,6 +2253,15 @@ mod tests {
         assert!(eligible(b"/h/cache", 10, b"/h"));
         assert!(!eligible(b"/h/proj/build/out.rs", 10, b"/h"));
         assert!(!eligible(b"/h/node_modules/x/index.js", 10, b"/h"));
+    }
+
+    /// Home written "/h/" is still one sync key, "/h", however the change
+    /// reaches it (a rescan of "/", or a folder inside).
+    #[test]
+    fn home_is_one_sync_key() {
+        assert_eq!(follow_target(b"/", true, b"/h/"), Some((b"/h".to_vec(), true)));
+        assert_eq!(follow_target(b"/h", true, b"/h/"), Some((b"/h".to_vec(), true)));
+        assert_eq!(follow_target(b"/h/p", false, b"/h/"), Some((b"/h/p".to_vec(), false)));
     }
 
     /// Files directly in home count, however home is written.
