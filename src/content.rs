@@ -902,24 +902,30 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     want
 }
 
-/// The dirs/trees from one batch of changes, each with what should be
-/// indexed there. Done under the name-index read lock only.
-/// A change the content index follows: inside home, or a rescanned tree
-/// that holds home.
-pub(crate) fn follows(path: &[u8], tree: bool, home: &[u8]) -> bool {
-    in_scope(path, home) || (tree && crate::live::is_ancestor(path, home))
+/// Where a change sends the content index: a folder inside home is synced
+/// itself; a rescanned tree that holds home (e.g. "/") means all of home.
+/// None: not the content index's business.
+fn follow_target(path: &[u8], tree: bool, home: &[u8]) -> Option<(Vec<u8>, bool)> {
+    if in_scope(path, home) {
+        Some((path.to_vec(), tree))
+    } else if tree && crate::live::is_ancestor(path, home) {
+        Some((home.to_vec(), true))
+    } else {
+        None
+    }
 }
 
+/// A change the content index follows (see `follow_target`).
+pub(crate) fn follows(path: &[u8], tree: bool, home: &[u8]) -> bool {
+    follow_target(path, tree, home).is_some()
+}
+
+/// The dirs/trees from one batch of changes, each with what should be
+/// indexed there. Done under the name-index read lock only.
 pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
-        // `follows`, spelled out to check scope once.
-        if in_scope(d, home) {
-            out.push((d.clone(), r));
-        } else if r && crate::live::is_ancestor(d, home) {
-            // A subtree containing home (e.g. "/" rescanned): sync all of home.
-            out.push((home.to_vec(), true));
-        }
+        out.extend(follow_target(d, r, home));
     }
     out.sort();
     out.dedup();
@@ -939,12 +945,13 @@ pub struct Grep {
     /// Stop reading candidates after this long (None = read them all).
     pub budget: Option<std::time::Duration>,
     re: Regex,
-    ci: bool,
+    /// Which docs could match, worked out once.
+    plan: TQ,
 }
 
 /// Smart case: does the pattern spell an uppercase letter? In a regex only
 /// literals count, not escapes (`\S`, `\W`), flags (`(?U)`) or group names.
-fn has_upper(pattern: &str, mode: GrepMode) -> bool {
+fn has_upper(pattern: &str, ast: Option<&regex_syntax::ast::Ast>) -> bool {
     use regex_syntax::ast::{self, Ast, ClassSetItem};
     struct Upper;
     impl ast::Visitor for Upper {
@@ -967,9 +974,9 @@ fn has_upper(pattern: &str, mode: GrepMode) -> bool {
             }
         }
     }
-    match mode {
-        GrepMode::Regex => ast::parse::Parser::new().parse(pattern).map_or(true, |a| ast::visit(&a, Upper).is_err()),
-        _ => pattern.chars().any(|c| c.is_uppercase()),
+    match ast {
+        Some(a) => ast::visit(a, Upper).is_err(),
+        None => pattern.chars().any(|c| c.is_uppercase()),
     }
 }
 
@@ -1010,7 +1017,14 @@ fn fold_safe(q: TQ) -> TQ {
 
 impl Grep {
     pub fn new(pattern: &str, mode: GrepMode) -> Result<Grep, String> {
-        let ci = mode != GrepMode::Symbol && !has_upper(pattern, mode);
+        // A regex is parsed once here for smart case and the plan (a bad
+        // one is reported by the regex build below).
+        let ast = (mode == GrepMode::Regex).then(|| regex_syntax::ast::parse::Parser::new().parse(pattern).ok()).flatten();
+        let ci = match mode {
+            GrepMode::Symbol => false,
+            GrepMode::Regex => ast.as_ref().is_some_and(|a| !has_upper(pattern, Some(a))),
+            GrepMode::Literal => !has_upper(pattern, None),
+        };
         let src = match mode {
             GrepMode::Literal => regex::escape(pattern),
             GrepMode::Regex => pattern.to_string(),
@@ -1027,18 +1041,21 @@ impl Grep {
             .size_limit(1 << 26)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re, ci })
+        let plan = match mode {
+            // Exactly the docs that define it (plus rare hash collisions,
+            // which reading the file weeds out).
+            GrepMode::Symbol if plain_identifier(pattern.as_bytes()) => TQ::Tri(symbol_key(pattern.as_bytes())),
+            GrepMode::Literal | GrepMode::Symbol => literal_plan(pattern.as_bytes()),
+            GrepMode::Regex => {
+                ast.and_then(|a| regex_syntax::hir::translate::Translator::new().translate(pattern, &a).ok()).map_or(TQ::All, |h| regex_plan(&h))
+            }
+        };
+        let plan = if ci { fold_safe(plan) } else { plan };
+        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re, plan })
     }
 
     fn plan(&self) -> TQ {
-        let q = match self.mode {
-            // Exactly the docs that define it (plus rare hash collisions,
-            // which reading the file weeds out).
-            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => TQ::Tri(symbol_key(self.pattern.as_bytes())),
-            GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
-            GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
-        };
-        if self.ci { fold_safe(q) } else { q }
+        self.plan.clone()
     }
 }
 
