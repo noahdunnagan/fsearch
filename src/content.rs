@@ -1031,10 +1031,10 @@ impl Content {
             }
             v
         };
-        // About a lane per 50k docs to search: a small index is done on this
-        // thread before a helper would wake.
+        // About a lane per 25k docs to search, at most 8: helpers start
+        // within ~10 us, but past 8 lanes they get in each other's way.
         let docs: usize = work.iter().map(|(_, docs, _)| docs.len()).sum();
-        par_claim(&work, (docs / 50_000).clamp(1, work.len().max(1)), one)
+        par_claim(&work, (docs / 25_000).clamp(1, work.len().max(1)).min(8), one)
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
