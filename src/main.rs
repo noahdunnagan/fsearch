@@ -16,7 +16,7 @@ const BIG: usize = 1 << 20;
 
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() < BIG || l.align() > 16384 {
+        if !use_mmap(&l, page()) {
             return unsafe { System.alloc(l) };
         }
         let p = unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
@@ -24,17 +24,17 @@ unsafe impl GlobalAlloc for Alloc {
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         // Fresh anonymous pages are already zero.
-        if l.size() < BIG || l.align() > 16384 { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
+        if !use_mmap(&l, page()) { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if l.size() < BIG || l.align() > 16384 {
+        if !use_mmap(&l, page()) {
             unsafe { System.dealloc(p, l) }
         } else {
             unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
         }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-        if (l.size() < BIG && new_size < BIG) || l.align() > 16384 {
+        if !use_mmap(&l, page()) && !use_mmap(&unsafe { Layout::from_size_align_unchecked(new_size, l.align()) }, page()) {
             return unsafe { System.realloc(p, l, new_size) };
         }
         let q = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, l.align())) };
@@ -46,6 +46,17 @@ unsafe impl GlobalAlloc for Alloc {
         }
         q
     }
+}
+
+/// This machine's page size: 16 KiB on Apple silicon, 4 KiB on Intel.
+fn page() -> usize {
+    unsafe { libc::vm_page_size }
+}
+
+/// Whether a block comes from mmap: big, and aligned no stricter than a
+/// page (all mmap guarantees).
+fn use_mmap(l: &Layout, page: usize) -> bool {
+    l.size() >= BIG && l.align() <= page
 }
 
 #[global_allocator]
@@ -61,7 +72,7 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
-const LABEL: &str = "mt.nd.fsearch";
+use server::LABEL;
 
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
@@ -82,20 +93,21 @@ fn main() {
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
     unsafe { setiopolicy_np(3, 0, 1) };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--json` may come anywhere; the command is the first other word.
+    let (json, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a == "--json");
+    let json = !json.is_empty();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
-        Some("serve") => server::serve(data_dir(), home()),
+        Some("serve") => {
+            server::check_socket(&data_dir()).unwrap_or_else(|e| die(&e));
+            server::serve(data_dir(), home())
+        }
         Some("stdio") => stdio(),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
-        Some(_) => {
-            let json = args.iter().any(|a| a == "--json");
-            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-            print_one(&serde_json::json!({"q": q.join(" ")}), json);
-        }
+        Some(_) => print_one(&serde_json::json!({"q": args.join(" ")}), json),
     }
 }
 
@@ -145,9 +157,14 @@ fn stdio() {
 }
 
 fn bench(qs: &str) {
+    let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
+    // A content query (`grep:`, `regex:`, `sym:`) is timed as one, on the
+    // saved content index, not as a name search.
+    if q.grep.is_some() {
+        return bench_grep(q);
+    }
     let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
     let live = live::Live::new(idx);
-    let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
     let s = query::Searcher { live: &live };
     let mut times = Vec::new();
     let mut hits = Vec::new();
@@ -161,8 +178,38 @@ fn bench(qs: &str) {
         live.base.path(h.idx as usize, &mut p);
         println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
     }
+    eprintln!("{}", summary(times));
+}
+
+fn bench_grep(mut q: query::Query) {
+    let home = home();
+    // The daemon reads files found by name outside home; that path isn't
+    // something to time against the saved index.
+    if !q.scope.as_ref().is_none_or(|s| fsearch::content::in_scope(s, home.as_bytes())) {
+        die("bench: that scope is outside home, which the content index doesn't cover");
+    }
+    let c = fsearch::content::Content::open_shared(data_dir().join("content"));
+    let g = fsearch::Grep::new(&q.grep.take().unwrap(), q.grep_mode).unwrap_or_else(|e| die(&e));
+    let mut times = Vec::new();
+    let mut found = fsearch::GrepResult::default();
+    for _ in 0..20 {
+        let t = Instant::now();
+        found = c.search(&g, &q);
+        times.push(t.elapsed());
+    }
+    for f in found.files.iter().take(10) {
+        for (line, text) in &f.lines {
+            println!("{}:{line}: {}", String::from_utf8_lossy(&f.path), text.trim());
+        }
+    }
+    eprintln!("{}", summary(times));
+}
+
+/// Run times in the order they ran.
+fn summary(mut times: Vec<std::time::Duration>) -> String {
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    format!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0])
 }
 
 fn plist_path() -> PathBuf {
@@ -181,17 +228,20 @@ fn install(login: bool) {
     // A plain reinstall keeps an existing login agent.
     let login = login || plist_path().exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
-    // Stop the old daemon so the next one runs the new binary. Unload the
-    // login agent first, or KeepAlive would restart it straight away.
-    let target = format!("{}/{LABEL}", domain());
-    launchctl(&["bootout", &target]);
-    server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
     // path can be SIGKILLed by the code-signing cache. Copy then rename, so
-    // reinstalling from the installed copy works too.
+    // reinstalling from the installed copy works too. First, so a failure
+    // leaves the running daemon alone.
     let tmp = bin.with_extension("new");
     std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    // Stop the old daemon so the next one runs the new binary. Unload the
+    // login agent first, or KeepAlive would restart it straight away.
+    let target = format!("{}/{LABEL}", domain());
+    let had_agent = launchctl(&["bootout", &target]);
+    if let Err(e) = server::stop(&data_dir()) {
+        die(&rollback(e, had_agent));
+    }
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
@@ -216,17 +266,37 @@ fn install(login: bool) {
         log.display()
     );
     std::fs::write(plist_path(), plist).unwrap();
-    // bootout returns before the old job is fully gone; bootstrap fails
-    // until it is.
     let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-    let retry = || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        false
-    };
-    if !(0..50).any(|_| bootstrap() || retry()) {
+    if !retry(BOOTSTRAP_TRIES, BOOTSTRAP_WAIT, bootstrap) {
         die("launchctl bootstrap failed");
     }
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
+}
+
+// bootout returns before the old job is fully gone; bootstrap fails until
+// it is.
+const BOOTSTRAP_TRIES: usize = 50;
+const BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Try `f` up to `tries` times, `wait` apart, until it succeeds.
+fn retry(tries: usize, wait: std::time::Duration, mut f: impl FnMut() -> bool) -> bool {
+    (0..tries).any(|i| {
+        if i > 0 {
+            std::thread::sleep(wait);
+        }
+        f()
+    })
+}
+
+/// The old daemon wouldn't stop, so it still holds the lock and serves (the
+/// old binary). Loading the agent now would respawn a daemon that can't
+/// start, over and over: leave it unloaded and say what to do.
+fn rollback(err: String, had_agent: bool) -> String {
+    if had_agent {
+        format!("{err}; the old daemon still runs and the login agent stays unloaded: run fsearch install --login once it has exited")
+    } else {
+        err
+    }
 }
 
 fn uninstall() {
@@ -238,4 +308,97 @@ fn uninstall() {
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mmap only aligns to a page: 16 KiB on Apple silicon, 4 KiB on Intel.
+    /// Stricter blocks go to the system allocator.
+    #[test]
+    fn mmap_only_for_page_aligned_blocks() {
+        let l = |size, align| Layout::from_size_align(size, align).unwrap();
+        assert!(use_mmap(&l(BIG, 4096), 4096));
+        assert!(!use_mmap(&l(BIG, 8192), 4096));
+        assert!(use_mmap(&l(BIG, 16384), 16384));
+        assert!(!use_mmap(&l(BIG - 1, 8), 16384));
+        assert!(!use_mmap(&l(BIG, 32768), 16384));
+        // The real allocator asks with this machine's page size.
+        assert_eq!(page(), unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize);
+    }
+
+    /// "first" is the first run (the cold one), not the slowest.
+    #[test]
+    fn bench_summary_reports_the_first_run() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(summary(vec![ms(2), ms(9), ms(1)]), "first 2.00ms  median 2.00ms  min 1.00ms");
+    }
+
+    /// stop() fails only while the old daemon still holds the lock: loading
+    /// the agent then would respawn a daemon that can't start, over and
+    /// over. Leave it unloaded (the old daemon still serves) and say so.
+    #[test]
+    fn rollback_leaves_the_agent_unloaded_while_the_old_daemon_runs() {
+        let err = rollback("daemon 7 did not exit".into(), true);
+        assert!(err.starts_with("daemon 7 did not exit") && err.contains("install --login"), "{err}");
+        assert_eq!(rollback("stuck".into(), false), "stuck");
+    }
+
+    unsafe fn check(p: *mut u8, n: usize, fill: u8) {
+        assert!(!p.is_null());
+        for i in [0, n / 2, n - 1] {
+            assert_eq!(unsafe { *p.add(i) }, fill, "byte {i} of {n}");
+        }
+    }
+
+    /// Blocks on either side of the mmap threshold, and moves across it.
+    #[test]
+    fn alloc_round_trips() {
+        let a = Alloc;
+        for (from, to) in [(100, 200), (100, BIG + 5), (BIG + 5, 100), (BIG, 3 * BIG), (3 * BIG, BIG + 1), (BIG - 1, BIG)] {
+            let l = Layout::from_size_align(from, 16).unwrap();
+            unsafe {
+                let p = a.alloc(l);
+                std::ptr::write_bytes(p, 0xab, from);
+                let q = a.realloc(p, l, to);
+                check(q, from.min(to), 0xab);
+                std::ptr::write_bytes(q, 0xcd, to);
+                a.dealloc(q, Layout::from_size_align(to, 16).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_zeroed_and_aligned() {
+        let a = Alloc;
+        for (size, align) in [(64, 8), (BIG, 8), (BIG * 2, 4096), (BIG, 16384), (BIG, 1 << 16), (100, 1 << 16)] {
+            let l = Layout::from_size_align(size, align).unwrap();
+            unsafe {
+                let p = a.alloc_zeroed(l);
+                assert_eq!(p as usize % align, 0, "{size} aligned to {align}");
+                check(p, size, 0);
+                // Big, over-aligned blocks stay with the system allocator,
+                // also when resized.
+                std::ptr::write_bytes(p, 1, size);
+                let q = a.realloc(p, l, size * 2);
+                assert_eq!(q as usize % align, 0);
+                check(q, size, 1);
+                a.dealloc(q, Layout::from_size_align(size * 2, align).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn huge_alloc_fails_cleanly() {
+        let l = Layout::from_size_align(1 << 62, 8).unwrap();
+        unsafe {
+            assert!(Alloc.alloc(l).is_null());
+            let small = Layout::from_size_align(BIG, 8).unwrap();
+            let p = Alloc.alloc(small);
+            // A failed grow leaves the old block alone.
+            assert!(Alloc.realloc(p, small, 1 << 62).is_null());
+            Alloc.dealloc(p, small);
+        }
+    }
 }

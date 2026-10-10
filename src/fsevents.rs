@@ -49,11 +49,13 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const i8, enc: u32) -> *const c_void;
     fn CFArrayCreate(alloc: *const c_void, vals: *const *const c_void, n: isize, cbs: *const c_void) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
     static kCFTypeArrayCallBacks: c_void;
 }
 
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
+    fn dispatch_release(obj: *mut c_void);
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
@@ -64,8 +66,17 @@ extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mu
     let _ = tx.send(batch);
 }
 
-/// A running stream; dropping it stops it.
-pub struct Stream(*mut c_void);
+/// The stream is done with its context (at deallocation, after any
+/// callback in flight): free the sender.
+extern "C" fn release_sender(info: *const c_void) {
+    drop(unsafe { Box::from_raw(info as *mut Sender<Vec<Event>>) });
+}
+
+/// A running stream; dropping it stops it and frees what it held.
+pub struct Stream {
+    s: *mut c_void,
+    q: *mut c_void,
+}
 
 // The stream is only started and stopped, never shared mid-call.
 unsafe impl Send for Stream {}
@@ -74,34 +85,104 @@ unsafe impl Sync for Stream {}
 impl Drop for Stream {
     fn drop(&mut self) {
         unsafe {
-            FSEventStreamStop(self.0);
-            FSEventStreamInvalidate(self.0);
-            FSEventStreamRelease(self.0);
+            FSEventStreamStop(self.s);
+            FSEventStreamInvalidate(self.s);
+            FSEventStreamRelease(self.s);
+            dispatch_release(self.q);
         }
     }
 }
 
-/// Watch `/` from `since` (an event id). Batches of directory-level events
-/// arrive on `tx` until the returned stream is dropped.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+/// Watch `paths` (normally just `/`) from `since` (an event id). Batches of
+/// directory-level events arrive on `tx` until the returned stream is dropped.
+pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Result<Stream, String> {
+    let paths: Vec<_> = paths.iter().map(|p| std::ffi::CString::new(*p).expect("path has no NUL")).collect();
     unsafe {
-        let root = CFStringCreateWithCString(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
-        let arr = CFArrayCreate(std::ptr::null(), &root, 1, &kCFTypeArrayCallBacks as *const c_void);
-        // The sender is leaked: a callback may still be in flight when the
-        // stream stops, and streams are replaced rarely.
+        // CoreFoundation can't make a UTF-8 string of every path: leave
+        // those out rather than hand on NULL.
+        let cf: Vec<*const c_void> = paths
+            .iter()
+            .filter_map(|p| {
+                let c = CFStringCreateWithCString(std::ptr::null(), p.as_ptr(), 0x0800_0100);
+                if c.is_null() {
+                    eprintln!("fsearch: can't watch {} (not UTF-8)", p.to_string_lossy());
+                }
+                (!c.is_null()).then_some(c)
+            })
+            .collect();
+        if cf.is_empty() {
+            return Err("no path to watch".into());
+        }
+        let arr = CFArrayCreate(std::ptr::null(), cf.as_ptr(), cf.len() as isize, &kCFTypeArrayCallBacks as *const c_void);
+        // The stream frees the sender itself, once no callback can use it.
         let ctx = Context {
             version: 0,
             info: Box::into_raw(Box::new(tx)) as *mut c_void,
             retain: std::ptr::null(),
-            release: std::ptr::null(),
+            release: release_sender as *const c_void,
             copy_description: std::ptr::null(),
         };
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
         let s = FSEventStreamCreate(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
+        // The stream keeps its own copy of the paths.
+        CFRelease(arr);
+        cf.iter().for_each(|&c| CFRelease(c));
+        if s.is_null() {
+            // No stream to release the sender: free it here.
+            drop(Box::from_raw(ctx.info as *mut Sender<Vec<Event>>));
+            return Err("FSEventStreamCreate failed".into());
+        }
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
         FSEventStreamSetDispatchQueue(s, q);
         FSEventStreamStart(s);
-        Stream(s)
+        Ok(Stream { s, q })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping a stream frees what it held: its sender goes too, so the
+    /// receiver sees the channel close (followers re-watch on every save).
+    #[test]
+    fn a_dropped_stream_releases_its_sender() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = watch(&[dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx);
+        drop(s);
+        let gone = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(gone, std::sync::mpsc::RecvTimeoutError::Disconnected);
+    }
+
+    /// A path that isn't UTF-8 (CoreFoundation can't make a string of it)
+    /// is left out, not handed on as NULL: that crashed the daemon.
+    #[test]
+    fn a_path_that_is_not_utf8_does_not_crash() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let bad = [dir.as_os_str().as_encoded_bytes(), b"/\xe9-not-utf8"].concat();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        assert!(watch(&[&bad, dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx).is_ok());
+        // Nothing left to watch: an error, not a stream that never fires.
+        assert!(watch(&[&bad], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx2).is_err());
+    }
+
+    /// For `leaks --atExit`: watch and drop many streams.
+    #[test]
+    #[ignore]
+    fn churn() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        for _ in 0..50 {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            drop(watch(&[dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
