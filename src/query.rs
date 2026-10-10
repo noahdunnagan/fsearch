@@ -2262,6 +2262,23 @@ struct Short {
     flags: u8,
 }
 
+/// `n` default `Short`s, from the allocator's zeroed memory.
+fn zeroed(n: usize) -> Vec<Short> {
+    let layout = std::alloc::Layout::array::<Short>(n).expect("dense view size");
+    if layout.size() == 0 {
+        return Vec::new();
+    }
+    // Safety: allocated with Short's layout for `n` of them; a Short is
+    // plain integers, and all zero bytes is its default.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut Short;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(p, n, n)
+    }
+}
+
 impl NameTable {
     fn new(bits: Vec<u64>, rank: Vec<u16>, hits: Vec<Vec<NameHit>>, ok_entries: usize, all: bool) -> NameTable {
         let len = hits.iter().map(Vec::len).sum();
@@ -2271,14 +2288,16 @@ impl NameTable {
     /// The `dense` view, built on first use.
     fn dense(&self, idx: &Index) -> &[Short] {
         self.dense.get_or_init(|| {
-            let mut d = DENSE_POOL.lock().unwrap().pop().unwrap_or_default();
-            if d.len() != idx.words * 64 {
-                d.clear();
-                d.par_extend(rayon::iter::repeat_n(Short::default(), idx.words * 64));
-            }
+            let spare = DENSE_POOL.lock().unwrap().pop().filter(|d| d.len() == idx.words * 64);
+            // A fresh one comes zeroed (all `Short::default()`) from the
+            // allocator, which maps zero pages in without writing them.
+            let fresh = spare.is_none();
+            let mut d = spare.unwrap_or_else(|| zeroed(idx.words * 64));
             let flags = [idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP)];
             d.par_chunks_mut(CHUNK_WORDS * 64).enumerate().for_each(|(c, out)| {
-                out.fill(Short::default());
+                if !fresh {
+                    out.fill(Short::default());
+                }
                 let base = c * CHUNK_WORDS * 64;
                 if self.all {
                     for (j, o) in out.iter_mut().enumerate() {
