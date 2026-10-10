@@ -445,6 +445,7 @@ impl Index {
         });
         drop(by_block);
         let enc: Vec<u32> = size[..n].iter().map(|&s| enc_size(s)).collect();
+        drop(size);
         // Entries grouped by name (counting sort keeps them ascending).
         let mut ne_off = vec![0u32; u + 1];
         for &id in &ent_name {
@@ -489,12 +490,15 @@ impl Index {
             let adj = prior_adjust(nm, depth[k]) + if entered_home { 15 } else { 0 };
             prior[k] = (prior[p] as i32 + adj).clamp(-100, 60) as i8;
         }
+        drop((names, name_off, name_len));
 
-        // Write the blob.
+        // Write the blob, freeing each array once its last reader is done:
+        // the build's peak is here, the blob beside the arrays it copies.
         let (off, total) = layout(&section_lens(n, d, u, unames.len()));
         let mut m = MmapMut::map_anon(total).expect("anon map");
         let mut put = |s: Sec, v: &[u8]| m[off[s as usize]..][..v.len()].copy_from_slice(v);
         put(Sec::NameBits, as_bytes(&ubits));
+        drop(ubits);
         put(Sec::NameOff, as_bytes(&uoff));
         put(Sec::Names, &unames);
         put(Sec::EntName, as_bytes(&ent_name));
@@ -502,17 +506,23 @@ impl Index {
         put(Sec::Parent, as_bytes(&parent[..n]));
         put(Sec::Size, as_bytes(&enc));
         put(Sec::Mtime, as_bytes(&mtime[..n]));
+        put(Sec::Zones, as_bytes(&zones(&kind[..n], &enc, &mtime[..n])));
+        drop((kind, enc, mtime));
         put(Sec::DirEntry, as_bytes(&dir_entry));
         put(Sec::DirStart, as_bytes(&blocks.iter().map(|b| b.1).collect::<Vec<_>>()));
         put(Sec::DirLen, as_bytes(&blocks.iter().map(|b| b.2).collect::<Vec<_>>()));
+        drop(blocks);
         put(Sec::DirEnd, as_bytes(&end));
+        drop(end);
         put(Sec::DirPrior, as_bytes(&prior));
         put(Sec::DirParent, as_bytes(&dir_entry.iter().map(|&e| parent[e as usize]).collect::<Vec<_>>()));
+        drop(dir_entry);
         // Each name's entries best location prior first (then ascending): a
         // search visiting them can stop at the first that cannot make it.
         ne.par_sort_unstable_by_key(|&e| (ent_name[e as usize], std::cmp::Reverse(prior[parent[e as usize] as usize]), e));
         put(Sec::NameEntsOff, as_bytes(&ne_off));
         put(Sec::NameEnts, as_bytes(&ne));
+        drop((ne_off, ne));
         let mut name_prior = vec![i8::MIN; u];
         for (i, &k) in ent_name.iter().enumerate().skip(1) {
             name_prior[k as usize] = name_prior[k as usize].max(prior[parent[i] as usize]);
@@ -524,7 +534,6 @@ impl Index {
         let (table, slots) = ext_slots(&unames, &uoff);
         put(Sec::NameExt, &slots);
         put(Sec::Exts, as_bytes(&table));
-        put(Sec::Zones, as_bytes(&zones(&kind[..n], &enc, &mtime[..n])));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
     }
