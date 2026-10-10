@@ -2473,20 +2473,26 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
 fn lines_at(g: &Grep, buf: &[u8], starts: impl Iterator<Item = usize>) -> Vec<(usize, String)> {
     let mut lines = Vec::new();
     let (mut line_no, mut counted) = (1usize, 0usize);
-    let mut last_line_start = usize::MAX;
+    let mut last_line_end = 0usize;
+    let mut has_line = false;
     for start in starts {
-        line_no += memchr::memchr_iter(b'\n', &buf[counted..start]).count();
-        counted = start;
-        let ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
-        if ls == last_line_start {
+        if has_line && start < last_line_end {
             continue;
         }
-        last_line_start = ls;
+        line_no += memchr::memchr_iter(b'\n', &buf[counted..start]).count();
+        counted = start;
+        let ls = if has_line {
+            memchr::memrchr(b'\n', &buf[last_line_end..start]).map_or(last_line_end + 1, |p| last_line_end + p + 1)
+        } else {
+            memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1)
+        };
         let le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
         lines.push((line_no, String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string()));
         if lines.len() >= g.max_per_file {
             break;
         }
+        last_line_end = le;
+        has_line = true;
     }
     lines
 }
