@@ -274,20 +274,24 @@ impl Index {
 
     pub fn path(&self, i: usize, out: &mut Vec<u8>) {
         out.clear();
+        if i == 0 {
+            out.push(b'/');
+            return;
+        }
+        // The entries from i up: the walk goes folder to parent folder (one
+        // dependent load a level); their entries and names load alongside.
+        let (de, dp) = (self.dir_entry(), self.dir_parent());
         let mut chain = [0u32; 256];
-        let mut k = 0;
-        let mut e = i as u32;
-        while e != 0 && k < chain.len() {
-            chain[k] = e;
+        chain[0] = i as u32;
+        let (mut k, mut d) = (1, self.parent()[i]);
+        while d != 0 && k < chain.len() {
+            chain[k] = de[d as usize];
             k += 1;
-            e = self.dir_entry()[self.parent()[e as usize] as usize];
+            d = dp[d as usize];
         }
-        if k == 0 {
+        for &e in chain[..k].iter().rev() {
             out.push(b'/');
-        }
-        for j in (0..k).rev() {
-            out.push(b'/');
-            out.extend_from_slice(self.name(chain[j] as usize));
+            out.extend_from_slice(self.name(e as usize));
         }
     }
 
