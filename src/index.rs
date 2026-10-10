@@ -166,9 +166,9 @@ impl Index {
         let mut deep = Vec::new();
         let mut k = 0;
         let mut e = i as u32;
-        // No real chain is longer than the entry count: a corrupt index
+        // No real chain is longer than the folder count: a corrupt index
         // whose parents loop is cut off there, not followed forever.
-        while e != 0 && k + deep.len() < self.n {
+        while e != 0 && k + deep.len() < self.d {
             if k < chain.len() {
                 chain[k] = e;
                 k += 1;
@@ -861,7 +861,9 @@ pub(crate) mod tests {
         let bad = Index::load(&path).unwrap();
         let mut p = Vec::new();
         bad.path(a, &mut p);
-        assert!(p.len() <= (bad.n + 1) * 3, "a cycle is cut off, not followed");
+        // No ancestor chain is longer than the folder count: cut off there.
+        let parts = p.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
+        assert!(parts <= bad.d, "{parts} components for {} folders", bad.d);
     }
 
     #[test]
