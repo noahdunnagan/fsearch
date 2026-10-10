@@ -858,8 +858,7 @@ impl Content {
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
-        let plan = g.plan();
-        let cands = self.candidates(&plan, filt);
+        let cands = self.candidates(g.plan(), filt);
         let paths: Vec<&[u8]> = cands.iter().map(|&(si, d)| self.segs[si].path(d)).collect();
         verify(g, &paths, filt.limit)
     }
@@ -894,8 +893,11 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     let lo = join(dir, b"");
     for (k, o) in live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)) {
         let direct = !k[lo.len()..].contains(&b'/');
-        let name = &k[k.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
-        if o.kind & 3 == KIND_FILE && (recursive || direct) && name_ok(name, o.size) && (direct || file_in_scope(k, home)) {
+        // Direct children share `dir`, already in scope: only the name rule.
+        let ok = |k: &[u8]| {
+            if direct { name_ok(&k[k.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..], o.size) } else { eligible(k, o.size, home) }
+        };
+        if o.kind & 3 == KIND_FILE && (recursive || direct) && ok(k) {
             want.push(k, o.size, o.mtime);
         }
     }
@@ -1070,8 +1072,8 @@ impl Grep {
         Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re, plan })
     }
 
-    fn plan(&self) -> TQ {
-        self.plan.clone()
+    fn plan(&self) -> &TQ {
+        &self.plan
     }
 }
 
@@ -1716,7 +1718,8 @@ mod tests {
         for (pat, mode) in
             [("hello world", GrepMode::Literal), ("kelvin", GrepMode::Literal), ("fn \\w+_main", GrepMode::Regex), ("émile", GrepMode::Literal)]
         {
-            let plan = Grep::new(pat, mode).unwrap().plan();
+            let g = Grep::new(pat, mode).unwrap();
+            let plan = g.plan();
             assert!(!matches!(plan, TQ::All), "{pat}: {plan:?}");
         }
         let _ = std::fs::remove_dir_all(root);
@@ -1741,7 +1744,7 @@ mod tests {
         for w in ["kubernetes", "session_store", "has_full_disk_access", "hello world", "configuration"] {
             let ascii = required(&literal_plan(w.as_bytes())).0;
             for mode in [GrepMode::Literal, GrepMode::Regex] {
-                let (n, spellings) = required(&Grep::new(w, mode).unwrap().plan());
+                let (n, spellings) = required(Grep::new(w, mode).unwrap().plan());
                 assert_eq!(n, ascii, "{w} ({mode:?}): {n} of {ascii} trigrams still required");
                 assert!(spellings <= 8, "{w}: {spellings} spellings");
             }
@@ -1756,6 +1759,9 @@ mod tests {
         assert_eq!(lines(b"a\rfoo\rb", "b$", GrepMode::Regex), [(3, "b".to_string())]);
         assert_eq!(lines(b"x\r\nfoo\r\ny", "^foo$", GrepMode::Regex), [(2, "foo".to_string())]);
         assert_eq!(lines(b"one\ntwo\rthree\r\nfour", "four", GrepMode::Literal), [(4, "four".to_string())]);
+        // A lone \r ends a line, so `.` doesn't cross it, as it doesn't \n.
+        assert!(lines(b"a\rb\n", "a.b", GrepMode::Regex).is_empty());
+        assert_eq!(lines(b"a b\n", "a.b", GrepMode::Regex).len(), 1);
     }
 
     /// An uppercase class (`\p{Lu}`, `[[:upper:]]`) says case matters, as an
