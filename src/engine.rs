@@ -910,17 +910,19 @@ mod tests {
         assert!(!lost_track(&ev(b"/tmp/rx", MUST_SCAN_SUBDIRS), b"/tmp/r"));
     }
 
-    /// A save writes only folders still refused: ones that are gone (or read
-    /// now) drop out of `skipped`, so the next start doesn't rescan them.
+    /// A save forgets folders that are gone; one that reads now stays in
+    /// `skipped`, since its contents reach the index only when the next
+    /// start rescans it.
     #[test]
-    fn skipped_drops_folders_no_longer_refused() {
+    fn skipped_forgets_only_gone_folders() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = root().join("skipped-pruned");
         std::fs::create_dir_all(&dir).unwrap();
-        walk::DENIED.lock().unwrap().extend([b"/nonexistent-fsearch/a".to_vec(), dir.as_os_str().as_bytes().to_vec()]);
+        let open = dir.as_os_str().as_bytes().to_vec();
+        walk::DENIED.lock().unwrap().extend([b"/nonexistent-fsearch/a".to_vec(), open.clone()]);
         note_skipped(&dir);
-        assert_eq!(std::fs::read(dir.join(SKIPPED)).unwrap(), b"");
-        assert!(walk::DENIED.lock().unwrap().is_empty());
+        walk::DENIED.lock().unwrap().clear();
+        assert_eq!(std::fs::read(dir.join(SKIPPED)).unwrap(), [open.as_slice(), b"\n"].concat());
         // Unwritable: logged, not fatal.
         note_skipped(&dir.join("missing"));
     }
