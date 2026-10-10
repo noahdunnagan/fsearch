@@ -596,8 +596,12 @@ impl Index {
             }
         }
         std::hint::black_box(sum);
+        // Built here rather than by the first search that needs them (~5
+        // ms each), which after a compaction would be the next keystroke.
         self.class_counts();
         self.top_prior();
+        self.by_key();
+        self.memo_plan();
     }
 }
 
