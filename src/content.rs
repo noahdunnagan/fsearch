@@ -2,7 +2,7 @@
 //!
 //! Segments are immutable, mmap'd files: a doc table, and the contents first
 //! indexed there: per trigram, the ids of the contents holding it (delta
-//! varints), and per content a bloom filter of its 6-byte substrings. Each
+//! varints), and per content bloom filters of its 5- and 7-byte substrings. Each
 //! distinct file content is indexed once (most copies are git worktrees):
 //! every doc names its content by a gid, and a copy indexed later, even in
 //! another segment, just names the same gid. A query becomes an AND/OR of
@@ -94,6 +94,7 @@ pub struct Segment {
     plen: usize,
     paths_len: usize,
     nwords: usize,
+    nlong: usize,
     /// Contents first indexed here (its own).
     nown: usize,
     nown1: usize,
@@ -130,13 +131,15 @@ enum S {
     ByHash,
     BloomOff,
     Bloom,
+    LongOff,
+    Long,
 }
-const NS: usize = 20;
+const NS: usize = 22;
 
 #[rustfmt::skip]
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize) -> [usize; NS] {
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, nlong: usize) -> [usize; NS] {
     let (d, c) = (ndocs * 4, nown * 4);
-    [ntri * 4, (ntri + 1) * 4, plen, d + 4, paths_len, ndocs * 8, d, d, ndocs, d, d, d, d, d, c, c, c * 4, c, c + 4, nwords * 8]
+    [ntri * 4, (ntri + 1) * 4, plen, d + 4, paths_len, ndocs * 8, d, d, ndocs, d, d, d, d, d, c, c, c * 4, c, c + 4, nwords * 8, c + 4, nlong * 8]
 }
 
 impl Segment {
@@ -158,14 +161,16 @@ impl Segment {
     sec!(gid_sorted, S::GidSorted, u32, ndocs);
     sec!(by_gid, S::ByGid, u32, ndocs);
     // Per own content: its gid, the first doc here holding it (or NONE), a
-    // hash of its bytes (two u64s), and a bloom filter of its GRAM-byte
-    // substrings. And the contents in hash order.
+    // hash of its bytes (two u64s), and bloom filters of its SHORT- and
+    // LONG-byte substrings. And the contents in hash order.
     sec!(own_gid, S::OwnGid, u32, nown);
     sec!(own_doc, S::OwnDoc, u32, nown);
     sec!(hash, S::Hash, u64, nown2);
     sec!(by_hash, S::ByHash, u32, nown);
     sec!(bloom_off, S::BloomOff, u32, nown1);
     sec!(bloom, S::Bloom, u64, nwords);
+    sec!(long_off, S::LongOff, u32, nown1);
+    sec!(long, S::Long, u64, nlong);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -177,14 +182,20 @@ impl Segment {
         &self.bloom()[o[c as usize] as usize..o[c as usize + 1] as usize]
     }
 
+    fn long_of(&self, c: u32) -> &[u64] {
+        let o = self.long_off();
+        &self.long()[o[c as usize] as usize..o[c as usize + 1] as usize]
+    }
+
     fn hash_of(&self, c: u32) -> [u64; 2] {
         [self.hash()[2 * c as usize], self.hash()[2 * c as usize + 1]]
     }
 
-    /// Can own content `c` hold every gram in `probes`, by its bloom filter?
-    fn may_contain(&self, c: u32, probes: &[u32]) -> bool {
-        let words = self.bloom_of(c);
-        probes.iter().all(|&h| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0)))
+    /// Can own content `c` hold every gram in `probes`, by its bloom filters?
+    fn may_contain(&self, c: u32, probes: &Probes) -> bool {
+        let has = |words: &[u64], h: u32| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0));
+        let (short, long) = (self.bloom_of(c), self.long_of(c));
+        probes.short.iter().all(|&h| has(short, h)) && probes.long.iter().all(|&h| has(long, h))
     }
 
     /// Own contents a live doc still holds.
@@ -301,8 +312,8 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = std::sync::Arc::new(unsafe { Mmap::map(&f) }.ok()?);
-        let [ndocs, ntri, plen, paths_len, nwords, nown] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nown));
+        let [ndocs, ntri, plen, paths_len, nwords, nown, nlong] = fields(&map, MAGIC)?.map(|v| v as usize);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nown, nlong));
         if map.len() < total {
             return None;
         }
@@ -315,7 +326,7 @@ impl Segment {
         let live_docs = ndocs - dead.iter().map(|w| w.count_ones() as usize).sum::<usize>();
         #[rustfmt::skip]
         let mut s = Segment {
-            map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, nown, nown1: nown + 1, nown2: nown * 2,
+            map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, nlong, nown, nown1: nown + 1, nown2: nown * 2,
             off, dead, live_docs, refs: Counts::new(nown), runs: Vec::new(),
         };
         let mut runs: Vec<(u32, u32, u32)> = Vec::new();
@@ -393,46 +404,49 @@ fn content_hash(b: &[u8]) -> [u64; 2] {
 }
 
 /// A file's distinct trigrams and its end-of-file key into `tri`, and the
-/// distinct hashes of its GRAM-byte grams into `grams` (both cleared,
-/// unordered). One pass, with no branch on whether a gram is new. `seen` is
-/// two 2 MiB bitsets, all zero on entry and exit.
-fn index_grams(buf: &[u8], seen: &mut [u64], tri: &mut Vec<u32>, grams: &mut Vec<u32>) {
+/// distinct hashes of its SHORT- and LONG-byte grams into `short` and `long`
+/// (all cleared, unordered). One pass, with no branch on whether a gram is
+/// new. `seen` is three 2 MiB bitsets, all zero on entry and exit.
+fn index_grams(buf: &[u8], seen: &mut [u64], tri: &mut Vec<u32>, short: &mut Vec<u32>, long: &mut Vec<u32>) {
     tri.clear();
-    grams.clear();
+    short.clear();
+    long.clear();
     let n = buf.len();
     if n < 2 {
         return;
     }
-    let (st, sg) = seen.split_at_mut(seen.len() / 2);
+    let (st, rest) = seen.split_at_mut(1 << 18);
+    let (ss, sl) = rest.split_at_mut(1 << 18);
     // Its last two bytes and a 0: so a two-byte search finds them too.
     let eof = (fold(buf[n - 2]) as u32) << 16 | (fold(buf[n - 1]) as u32) << 8;
     st[(eof >> 6) as usize] |= 1 << (eof & 63);
     tri.resize(n, 0);
     tri[0] = eof;
-    grams.resize(n, 0);
-    let (mut nt, mut ng) = (1, 0);
+    short.resize(n, 0);
+    long.resize(n, 0);
+    let (mut nt, mut ns, mut nl) = (1, 0, 0);
+    // A gram's hash into `out` at `k`, which moves past it if it is whole
+    // and new.
+    let add = |seen: &mut [u64], out: &mut [u32], k: &mut usize, h: u32, whole: bool| {
+        let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
+        out[*k] = h;
+        *k += (whole & (seen[w] & bit == 0)) as usize;
+        seen[w] |= bit & 0u64.wrapping_sub(whole as u64);
+    };
     let mut g = (fold(buf[0]) as u64) << 8 | fold(buf[1]) as u64;
     for (i, &c) in buf.iter().enumerate().skip(2) {
         g = g << 8 | fold(c) as u64;
-        let t = (g & 0xFF_FFFF) as u32;
-        let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
-        tri[nt] = t;
-        nt += (st[w] & bit == 0) as usize;
-        st[w] |= bit;
-        let full = i + 1 >= GRAM;
-        let h = gram_hash(g & ((1 << (8 * GRAM)) - 1));
-        let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
-        grams[ng] = h;
-        ng += (full & (sg[w] & bit == 0)) as usize;
-        sg[w] |= bit & 0u64.wrapping_sub(full as u64);
+        add(st, tri, &mut nt, (g & 0xFF_FFFF) as u32, true);
+        add(ss, short, &mut ns, gram_hash(g & ((1 << (8 * SHORT)) - 1)), i + 1 >= SHORT);
+        add(sl, long, &mut nl, gram_hash(g & ((1 << (8 * LONG)) - 1)), i + 1 >= LONG);
     }
     tri.truncate(nt);
-    grams.truncate(ng);
-    for &t in tri.iter() {
-        st[(t >> 6) as usize] = 0;
-    }
-    for &h in grams.iter() {
-        sg[(h >> 6) as usize] = 0;
+    short.truncate(ns);
+    long.truncate(nl);
+    for (seen, out) in [(st, &*tri), (ss, &*short), (sl, &*long)] {
+        for &h in out {
+            seen[(h >> 6) as usize] = 0;
+        }
     }
 }
 
@@ -444,10 +458,13 @@ fn trigrams_small(s: &[u8]) -> Vec<u32> {
     t
 }
 
-/// Bloom filters hold a content's case-folded substrings of this many bytes:
-/// a match holds all of its pattern's grams, so a content missing one of them
-/// can't match even if it has every trigram.
-const GRAM: usize = 6;
+/// Bloom filters hold a content's case-folded substrings of these lengths: a
+/// match holds all of its pattern's grams, so a content missing one of them
+/// can't match even if it has every trigram. The longer ones rule out a
+/// content holding the pattern's shorter ones only apart ("different" and
+/// "reference" for "difference").
+const SHORT: usize = 5;
+const LONG: usize = 7;
 
 /// A gram's 24-bit hash (its folded bytes, big-endian in the low 40 bits).
 #[inline]
@@ -660,6 +677,7 @@ struct ContentMeta<'a> {
     gid: u32,
     hash: [u64; 2],
     bloom: &'a [u64],
+    long: &'a [u64],
     /// The first doc there holding it, or NONE.
     doc: u32,
 }
@@ -677,12 +695,13 @@ enum Holds {
 
 /// One run of docs' output: what each doc holds, and for the contents new
 /// in this build that it saw first, their (trigram, content) pairs in 256
-/// buckets by the trigram's first byte, and their definition keys and bloom
-/// filters, flat.
+/// buckets by the trigram's first byte, and their definition keys and two
+/// bloom filters, flat.
 struct Split {
     pairs: Vec<Vec<u64>>,
     syms: Vec<u32>,
     blooms: Vec<u64>,
+    longs: Vec<u64>,
     docs: Vec<(usize, Holds)>,
     contents: Vec<SplitContent>,
 }
@@ -694,6 +713,7 @@ struct SplitContent {
     small: bool,
     sym: std::ops::Range<usize>,
     bloom: std::ops::Range<usize>,
+    long: std::ops::Range<usize>,
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
@@ -703,8 +723,9 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     use std::io::Read;
     // Docs in runs of 256, a run on one thread with its next 8 files open
     // and their reads started (`open_ahead`): on a cold cache those reads
-    // overlap the work on earlier files. A read buffer and a 2 MiB seen-set
-    // go back to a pool after each run, so a build holds one per thread.
+    // overlap the work on earlier files. A read buffer and three 2 MiB
+    // seen-sets go back to a pool after each run, so a build holds one per
+    // thread.
     const RUN: usize = 256;
     const AHEAD: usize = 8;
     let dedup = docs.dedup.get_or_init(Dedup::default);
@@ -714,9 +735,10 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
     let splits: Vec<Split> = (runs.into_par_iter())
         .map(|run| {
-            let (mut seen, mut buf, mut hashes, mut tri) =
-                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 2 << 18], Vec::new(), Vec::new(), Vec::new()));
-            let mut sp = Split { pairs: vec![Vec::new(); 256], syms: Vec::new(), blooms: Vec::new(), docs: Vec::new(), contents: Vec::new() };
+            let (mut seen, mut buf, mut short, mut long, mut tri) =
+                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 3 << 18], Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            #[rustfmt::skip]
+            let mut sp = Split { pairs: vec![Vec::new(); 256], syms: Vec::new(), blooms: Vec::new(), longs: Vec::new(), docs: Vec::new(), contents: Vec::new() };
             let mut ahead = std::collections::VecDeque::new();
             for i in run.clone() {
                 while ahead.len() <= AHEAD && i + ahead.len() < run.end {
@@ -740,17 +762,18 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                                 (k, k == n)
                             };
                             if first {
-                                let (sym, bl) = (sp.syms.len(), sp.blooms.len());
-                                index_grams(&buf, &mut seen, &mut tri, &mut hashes);
+                                let (sym, bl, lo) = (sp.syms.len(), sp.blooms.len(), sp.longs.len());
+                                index_grams(&buf, &mut seen, &mut tri, &mut short, &mut long);
                                 for &t in &tri {
                                     sp.pairs[(t >> 16) as usize].push((t as u64) << 32 | k as u64);
                                 }
                                 symbols(&buf, &mut sp.syms);
-                                // Big files are candidates far more often (per byte of
-                                // filter too): three bits a gram for them, two for others.
-                                bloom(&hashes, if buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
-                                let bloom = bl..sp.blooms.len();
-                                sp.contents.push(SplitContent { new: k, hash: h, small: buf.len() < SMALL, sym: sym..sp.syms.len(), bloom });
+                                // Three bits a short gram; two a long one, three in big
+                                // files (the costliest to read for nothing).
+                                bloom(&short, 3, &mut sp.blooms);
+                                bloom(&long, if buf.len() >= 16 << 10 { 3 } else { 2 }, &mut sp.longs);
+                                let (bloom, long) = (bl..sp.blooms.len(), lo..sp.longs.len());
+                                sp.contents.push(SplitContent { new: k, hash: h, small: buf.len() < SMALL, sym: sym..sp.syms.len(), bloom, long });
                             }
                             Holds::New(k)
                         }
@@ -758,7 +781,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                 };
                 sp.docs.push((i, holds));
             }
-            scratch.lock().unwrap().push((seen, buf, hashes, tri));
+            scratch.lock().unwrap().push((seen, buf, short, long, tri));
             sp
         })
         .collect();
@@ -790,7 +813,8 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     for sp in &splits {
         for c in &sp.contents {
             let l = local[c.new as usize] as usize;
-            own[l] = Some(ContentMeta { gid: gids[l], hash: c.hash, bloom: &sp.blooms[c.bloom.clone()], doc: first[l] });
+            let (bloom, long) = (&sp.blooms[c.bloom.clone()], &sp.longs[c.long.clone()]);
+            own[l] = Some(ContentMeta { gid: gids[l], hash: c.hash, bloom, long, doc: first[l] });
         }
     }
     let own: Vec<ContentMeta> = own.into_iter().map(Option::unwrap).collect();
@@ -845,7 +869,8 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
         let mut r = vec![NONE; s.nown];
         for c in (0..s.nown).filter(|&c| s.refs.get(c) > 0) {
             r[c] = own.len() as u32;
-            own.push(ContentMeta { gid: s.own_gid()[c], hash: s.hash_of(c as u32), bloom: s.bloom_of(c as u32), doc: NONE });
+            let (bloom, long) = (s.bloom_of(c as u32), s.long_of(c as u32));
+            own.push(ContentMeta { gid: s.own_gid()[c], hash: s.hash_of(c as u32), bloom, long, doc: NONE });
         }
         remap.push(r);
     }
@@ -973,14 +998,16 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
     let hash: Vec<u64> = own.iter().flat_map(|c| c.hash).collect();
     let mut by_hash: Vec<u32> = (0..nown as u32).collect();
     by_hash.sort_by_key(|&c| own[c as usize].hash);
-    let (mut bloom_off, mut blooms) = (vec![0u32], Vec::new());
+    let (mut bloom_off, mut blooms, mut long_off, mut longs) = (vec![0u32], Vec::new(), vec![0u32], Vec::new());
     for c in own {
         blooms.extend_from_slice(c.bloom);
         bloom_off.push(blooms.len() as u32);
+        longs.extend_from_slice(c.long);
+        long_off.push(longs.len() as u32);
     }
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown));
-    let fields = [ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown].map(|v| v as u64);
+    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown, longs.len()));
+    let fields = [ndocs, keys.len(), post.len(), paths.len(), blooms.len(), nown, longs.len()].map(|v| v as u64);
     let hdr = header(MAGIC, &fields);
     let sections: [&[u8]; NS] = [
         as_bytes(&keys),
@@ -1003,6 +1030,8 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         as_bytes(&by_hash),
         as_bytes(&bloom_off),
         as_bytes(&blooms),
+        as_bytes(&long_off),
+        as_bytes(&longs),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -2212,6 +2241,12 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
         .collect()
 }
 
+/// A pattern's gram hashes, as `may_contain` checks them.
+struct Probes {
+    short: Vec<u32>,
+    long: Vec<u32>,
+}
+
 pub struct Grep {
     pub pattern: String,
     pub mode: GrepMode,
@@ -2272,15 +2307,19 @@ impl Grep {
         self.re.get_or_init(|| self.build().expect("literal regex"))
     }
 
-    /// Hashes of the grams every match holds (see `GRAM`).
-    fn probes(&self) -> Vec<u32> {
-        if self.mode == GrepMode::Regex {
-            return Vec::new();
-        }
-        let mut out: Vec<u32> = self.pattern.as_bytes().windows(GRAM).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// Hashes of the grams every match holds (see `SHORT`).
+    fn probes(&self) -> Probes {
+        let grams = |n: usize| {
+            let mut out: Vec<u32> = if self.mode == GrepMode::Regex {
+                Vec::new()
+            } else {
+                self.pattern.as_bytes().windows(n).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect()
+            };
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        Probes { short: grams(SHORT), long: grams(LONG) }
     }
 
     fn plan(&self) -> TQ {
