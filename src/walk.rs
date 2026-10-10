@@ -62,12 +62,12 @@ pub fn prune_denied() {
 /// nothing left to skip it stays unset (unset reads as Full Disk Access).
 /// False if nothing was set.
 pub fn set_skip(entries: Vec<Vec<u8>>) -> bool {
-    let entries: Vec<Vec<u8>> = entries.iter().filter(|e| !e.is_empty()).map(|e| crate::live::trim_dir(e).to_vec()).collect();
+    let entries: Vec<Vec<u8>> = entries.iter().filter(|e| !e.is_empty()).map(|e| crate::paths::trim_dir(e).to_vec()).collect();
     !entries.is_empty() && SKIP.set(entries).is_ok()
 }
 
 pub fn blocked(path: &[u8]) -> bool {
-    SKIP.get().is_some_and(|v| v.iter().any(|s| crate::live::is_ancestor(s, path)))
+    SKIP.get().is_some_and(|v| v.iter().any(|s| crate::paths::is_ancestor(s, path)))
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -122,6 +122,14 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
 
+/// Just the mtime: one lstat, no mount check (changed_dirs asks this of
+/// every folder in the index).
+pub(crate) fn mtime_of(path: &[u8]) -> Option<u32> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0).then(|| st.st_mtime.clamp(0, u32::MAX as i64) as u32)
+}
+
 /// Scan `root` as part of the whole tree: the folders above it come first,
 /// as listings of one child each, so index paths stay absolute (as FSEvents
 /// reports them). For `/` it's just the scan.
@@ -147,8 +155,8 @@ pub fn ancestors(root: &[u8]) -> Vec<Listing> {
     (0..)
         .zip(comps)
         .map(|(i, c)| {
-            path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
-            let mtime = crate::live::mtime_of(&path).unwrap_or(0);
+            path = crate::paths::join(if i == 0 { b"/" } else { &path }, c);
+            let mtime = mtime_of(&path).unwrap_or(0);
             Listing {
                 id: i,
                 names: c.to_vec(),
@@ -201,7 +209,7 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
     for e in l.ents.iter_mut() {
         if e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0 {
             let name = &l.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
-            let child_path = path.as_ref().map(|p| crate::live::join(p, name));
+            let child_path = path.as_ref().map(|p| crate::paths::join(p, name));
             if child_path.as_deref().is_some_and(blocked) {
                 continue;
             }

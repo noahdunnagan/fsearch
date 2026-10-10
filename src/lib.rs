@@ -8,6 +8,7 @@ mod engine;
 mod fsevents;
 pub mod index;
 pub mod live;
+mod paths;
 pub mod query;
 pub mod walk;
 

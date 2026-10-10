@@ -391,7 +391,6 @@ impl Index {
     /// Every id a section holds points inside the section it indexes, so a
     /// corrupt file is refused here rather than panicking at a lookup.
     fn ids_in_range(&self) -> bool {
-        use rayon::prelude::*;
         let (n, d, u) = (self.n as u32, self.d as u32, self.u as u32);
         let monotonic = |v: &[u32], max: usize| v.par_windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&x| x as usize <= max);
         // In parallel: three of these are as long as the whole disk.
@@ -411,7 +410,6 @@ impl Index {
     /// can loop), each folder's children after it and inside its subtree,
     /// subtrees nested in their parent's. Run after the range checks.
     fn tree_is_sound(&self) -> bool {
-        use rayon::prelude::*;
         let (de, dp, ds, dl, dend, par) = (self.dir_entry(), self.dir_parent(), self.dir_start(), self.dir_len(), self.dir_end(), self.parent());
         // At least the root, entry 0, which is folder 0.
         (self.n > 0 && self.d > 0 && de[0] == 0)

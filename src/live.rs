@@ -10,6 +10,11 @@ use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
 use std::collections::{BTreeMap, HashMap};
 
+// The path helpers live in `paths` (walk uses them too); re-exported here.
+pub(crate) use crate::paths::normalize;
+pub use crate::paths::{is_ancestor, join, trim_dir};
+use crate::walk::mtime_of;
+
 #[derive(Clone, Copy)]
 pub struct OEnt {
     pub kind: u8,
@@ -432,37 +437,6 @@ pub fn for_each_path(ls: &[Listing], root: &[u8], mut f: impl FnMut(Vec<u8>, &Ra
     }
 }
 
-pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
-    let mut p = path.to_vec();
-    while p.len() > 1 && p.last() == Some(&b'/') {
-        p.pop();
-    }
-    p
-}
-
-/// A folder path without trailing slashes (`/` stays `/`): "/h/" and "/h"
-/// name the same folder.
-pub fn trim_dir(p: &[u8]) -> &[u8] {
-    let end = p.iter().rposition(|&b| b != b'/').map_or(p.len().min(1), |i| i + 1);
-    &p[..end]
-}
-
-/// `dir` is `path` or a folder above it (not just a name prefix: `/a/b`
-/// is not above `/a/bc`).
-pub fn is_ancestor(dir: &[u8], path: &[u8]) -> bool {
-    path.starts_with(dir) && (dir.ends_with(b"/") || path.len() == dir.len() || path[dir.len()] == b'/')
-}
-
-pub fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(dir.len() + 1 + name.len());
-    p.extend_from_slice(dir);
-    if dir != b"/" {
-        p.push(b'/');
-    }
-    p.extend_from_slice(name);
-    p
-}
-
 /// Key range holding everything strictly under `path`.
 fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let lo = join(path, b"");
@@ -475,14 +449,6 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// whether it's a mount point (listed, or not crossed).
 fn shape(kind: u8) -> u8 {
     kind & (3 | FLAG_MOUNT)
-}
-
-/// Just the mtime: one lstat, no mount check (changed_dirs asks this of
-/// every folder in the index).
-pub(crate) fn mtime_of(path: &[u8]) -> Option<u32> {
-    let c = std::ffi::CString::new(path).ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0).then(|| st.st_mtime.clamp(0, u32::MAX as i64) as u32)
 }
 
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
