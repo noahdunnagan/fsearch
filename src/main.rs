@@ -159,8 +159,14 @@ fn bench(qs: &str) {
         live.base.path(h.idx as usize, &mut p);
         println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
     }
+    eprintln!("{}", summary(times));
+}
+
+/// Run times in the order they ran.
+fn summary(mut times: Vec<std::time::Duration>) -> String {
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    format!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0])
 }
 
 fn plist_path() -> PathBuf {
@@ -264,6 +270,13 @@ fn die(msg: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "first" is the first run (the cold one), not the slowest.
+    #[test]
+    fn bench_summary_reports_the_first_run() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(summary(vec![ms(2), ms(9), ms(1)]), "first 2.00ms  median 2.00ms  min 1.00ms");
+    }
 
     /// launchd refuses bootstrap until the old job is gone: the rollback
     /// keeps trying, like the main path.
