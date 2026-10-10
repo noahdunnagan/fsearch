@@ -94,7 +94,15 @@ pub struct ByKey {
     pub cover: i32,
     pub list: Vec<(i8, u32)>,
     pub counts: Vec<u32>,
+    /// Per `NameInfo::head`: its names in `list`, in order.
+    pub heads: Vec<Vec<u32>>,
+    /// Per `NameInfo::head`: the names whose length or stem is at most
+    /// SHORT, the ones a token that short can match whole.
+    pub short: Vec<Vec<u32>>,
 }
+
+/// See `ByKey::short`.
+pub const SHORT: usize = 3;
 
 /// How to fold per-dir data down the tree in parallel (see `memo_plan`).
 pub struct MemoPlan {
@@ -208,10 +216,22 @@ impl Index {
                 cover -= 1;
                 n += count[(cover + 128) as usize];
             }
-            let mut list: Vec<(i8, u32)> = info.iter().enumerate().filter(|(_, x)| x.key as i32 >= cover).map(|(k, x)| (x.key, k as u32)).collect();
+            let (mut list, mut short) = (Vec::new(), vec![Vec::new(); 256]);
+            for (k, x) in info.iter().enumerate() {
+                if x.key as i32 >= cover {
+                    list.push((x.key, k as u32));
+                }
+                if x.len as usize <= SHORT || x.stem as usize <= SHORT {
+                    short[x.head as usize].push(k as u32);
+                }
+            }
             list.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut heads = vec![Vec::new(); 256];
+            for &(_, k) in &list {
+                heads[info[k as usize].head as usize].push(k);
+            }
             let counts = (cover..=i8::MAX as i32).map(|k| count[(k + 128) as usize] as u32).collect();
-            ByKey { cover, list, counts }
+            ByKey { cover, list, counts, heads, short }
         })
     }
 
