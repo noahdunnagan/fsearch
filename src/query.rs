@@ -1078,8 +1078,10 @@ const INLINE_VISITS: usize = 4096;
 /// below BORDERLINE they do not, in between the bitmaps tell (`rankable`).
 const RANKED_MIN: f64 = 20_000.0;
 const BORDERLINE: f64 = 1_000.0;
-/// `driven` tries a token expected to match at most this many names.
+/// `driven` tries a token expected to match at most this many names, the
+/// rarest first, DRIVEN_TRIES of them at most.
 const DRIVEN_NAMES: f64 = 20_000.0;
+const DRIVEN_TRIES: usize = 2;
 /// Cheap bounds `ranked` tells apart: BINS of them from -BIN0.
 const BINS: usize = 1024;
 const BIN0: i32 = 256;
@@ -1506,22 +1508,40 @@ impl Searcher<'_> {
         let idx = &self.live.base;
         let (counts, u) = (idx.class_counts(), idx.u as f64);
         let est = |t: &Token| (0..CLASSES).filter(|&c| t.mask & (1 << c) != 0).fold(u, |e, c| e * counts[c] as f64 / u);
-        let t = (0..pos.len()).min_by(|&a, &b| est(pos[a]).total_cmp(&est(pos[b])))?;
-        if est(pos[t]) > DRIVEN_NAMES {
-            return None;
+        // Rarest first. A rare name can still hold too much (a big folder:
+        // "developer" is ~/Developer); found out early, the next one gets a
+        // try.
+        let mut order: Vec<usize> = (0..pos.len()).filter(|&t| est(pos[t]) <= DRIVEN_NAMES).collect();
+        order.sort_by(|&a, &b| est(pos[a]).total_cmp(&est(pos[b])));
+        for t in order.into_iter().take(DRIVEN_TRIES) {
+            match self.drive(q, pos, neg, lo, hi, t) {
+                Ok(hits) => return Some(hits),
+                Err(true) => continue,
+                Err(false) => return None,
+            }
         }
+        None
+    }
+
+    /// `driven` from token `t`'s names; Err(true) if it gave up within the
+    /// first sixteenth of the names.
+    fn drive(&self, q: &Query, pos: &[&Token], neg: &[&Token], lo: usize, hi: usize, t: usize) -> Result<Vec<Hit>, bool> {
+        let idx = &self.live.base;
         let tb = TokenBits::new(idx, pos[t]);
         let space = char_bit(b' ').trailing_zeros() as usize;
         let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
         let (ne_off, ne, kind, en, parent) = (idx.name_ents_off(), idx.name_ents(), idx.kind(), idx.ent_name(), idx.parent());
         // The names' entries, and the subtrees of those that are folders
         // (from above `lo` too: the scope's own ancestors). Past SELECTIVE
-        // entries in all, give up early.
-        let seen = std::sync::atomic::AtomicUsize::new(0);
-        let over = || seen.load(std::sync::atomic::Ordering::Relaxed) > SELECTIVE;
+        // entries in all, give up, or as soon as the chunks so far (handed
+        // out in order; a sixteenth at least) say twice that many are coming.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        let chunks = idx.words.div_ceil(CHUNK_WORDS);
+        let (seen, quit, early) = (AtomicUsize::new(0), AtomicBool::new(false), AtomicBool::new(false));
+        let over = || quit.load(Relaxed);
         let spaced = |w: usize, i: u32| (space[0][w] | space[1][w]) >> i & 1 != 0;
         let found = par_each(
-            idx.words.div_ceil(CHUNK_WORDS),
+            chunks,
             || (),
             |_, c| {
                 let (mut ents, mut trees) = (Vec::new(), Vec::new());
@@ -1541,6 +1561,9 @@ impl Searcher<'_> {
                         }
                         let mut n = 0;
                         for &e in &ne[ne_off[k] as usize..ne_off[k + 1] as usize] {
+                            if n > SELECTIVE {
+                                break;
+                            }
                             if (lo..hi).contains(&(e as usize)) {
                                 ents.push(e);
                                 n += 1;
@@ -1555,8 +1578,14 @@ impl Searcher<'_> {
                                 }
                             }
                         }
-                        seen.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        if seen.fetch_add(n, Relaxed) + n > SELECTIVE {
+                            quit.store(true, Relaxed);
+                            early.fetch_or(c < chunks / 16, Relaxed);
+                        }
                     }
+                }
+                if c >= chunks / 16 && seen.load(Relaxed) * chunks / (c + 1) > 2 * SELECTIVE {
+                    quit.store(true, Relaxed);
                 }
                 (ents, trees)
             },
@@ -1567,7 +1596,7 @@ impl Searcher<'_> {
             trees.extend(t);
         }
         if over() {
-            return None;
+            return Err(early.load(Relaxed));
         }
         trees.sort_unstable();
         let mut merged: Vec<(u32, u32)> = Vec::new();
@@ -1580,27 +1609,59 @@ impl Searcher<'_> {
         // In those subtrees, entries whose name has the token are in `ents`.
         let first = ents.len();
         if first + merged.iter().map(|&(a, b)| (b - a) as usize).sum::<usize>() > SELECTIVE {
-            return None;
+            return Err(false);
         }
         ents.extend(merged.iter().flat_map(|&(a, b)| a..b));
-        let scan = Scan {
-            q,
-            live: self.live,
-            names: &NameTable::new(Vec::new(), Vec::new(), Vec::new(), 0, false),
-            npos: pos.len(),
-            need_dirs: true,
-            now: now_secs(),
-        };
-        Some(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
+        if ents.len() <= INLINE_VISITS {
+            // Few (one thread's worth): names and folders scored as they
+            // come up.
+            let scan = Scan {
+                q,
+                live: self.live,
+                names: &NameTable::new(Vec::new(), Vec::new(), Vec::new(), 0, false),
+                npos: pos.len(),
+                need_dirs: true,
+                now: now_secs(),
+            };
+            return Ok(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
+                let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
+                let mut hits = HashMap::<u32, Option<NameHit>, crate::index::Fx>::default();
+                let re = q.name_re.clone();
+                let mut hit = |k: u32| *hits.entry(k).or_insert_with(|| name_hit(idx, q, pos, neg, re.as_ref(), k));
+                for j in r {
+                    let i = ents[j] as usize;
+                    let Some(nh) = hit(en[i]).filter(|h| h.flags & NF_OK != 0 && (j < first || h.bits >> t & 1 == 0)) else { continue };
+                    let m = scan.memo_of(parent[i], &mut memo, &mut hit);
+                    if let Some(key) = scan.score(i, nh, m, top.floor, &mut pbuf, q.path_re.as_ref()) {
+                        top.push(key);
+                    }
+                }
+            }));
+        }
+        // Many: score the names of those entries and of the folders above
+        // them once, in one table, rather than per thread as they come up.
+        let (de, dp) = (idx.dir_entry(), idx.dir_parent());
+        let (mut bits, mut seen_dir) = (vec![0u64; idx.words], vec![0u64; idx.d.div_ceil(64)]);
+        for &e in &ents {
+            let k = en[e as usize];
+            bits[k as usize >> 6] |= 1 << (k & 63);
+            let mut d = parent[e as usize];
+            while d != 0 && seen_dir[d as usize >> 6] >> (d & 63) & 1 == 0 {
+                seen_dir[d as usize >> 6] |= 1 << (d & 63);
+                let k = en[de[d as usize] as usize];
+                bits[k as usize >> 6] |= 1 << (k & 63);
+                d = dp[d as usize];
+            }
+        }
+        let names = self.score_names(q, pos, neg, None, Some(&NameSet { busy: true, ..NameSet::new(bits) }));
+        let scan = Scan { q, live: self.live, names: &names, npos: pos.len(), need_dirs: true, now: now_secs() };
+        Ok(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
-            let mut hits = HashMap::<u32, Option<NameHit>, crate::index::Fx>::default();
-            let re = q.name_re.clone();
             let path_re = q.path_re.clone();
-            let mut hit = |k: u32| *hits.entry(k).or_insert_with(|| name_hit(idx, q, pos, neg, re.as_ref(), k));
             for j in r {
                 let i = ents[j] as usize;
-                let Some(nh) = hit(en[i]).filter(|h| h.flags & NF_OK != 0 && (j < first || h.bits >> t & 1 == 0)) else { continue };
-                let m = scan.memo_of(parent[i], &mut memo, &mut hit);
+                let Some(nh) = names.get(en[i]).filter(|h| h.flags & NF_OK != 0 && (j < first || h.bits >> t & 1 == 0)) else { continue };
+                let m = scan.memo_of(parent[i], &mut memo, &mut |k| names.get(k));
                 if let Some(key) = scan.score(i, nh, m, top.floor, &mut pbuf, path_re.as_ref()) {
                     top.push(key);
                 }
@@ -1815,7 +1876,7 @@ impl Searcher<'_> {
         let (mut bits, mut rank) = spare_bits.unwrap_or_else(|| (vec![0; idx.words], vec![0; idx.words]));
         // A few thousand words to look at (a small index, a scope, a
         // narrowed table) take less time than waking threads.
-        let few = from.map_or(within.map_or(idx.words, |s| s.words), |f| f.len) <= INLINE_WORDS;
+        let few = from.map_or(within.map_or(idx.words, |s| if s.busy { s.names } else { s.words }), |f| f.len) <= INLINE_WORDS;
         let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
         spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
         let scratch = || vec![Line([(0, 0, 0); 2]); toks.len()];
@@ -2367,15 +2428,20 @@ impl NameTable {
 struct NameSet {
     bits: Vec<u64>,
     todo: Vec<Todo>,
-    /// Non-zero words.
+    /// Non-zero words, and names.
     words: usize,
+    names: usize,
+    /// Most of its names will need scoring (not just their words'
+    /// bitmaps): its names, not its words, say whether threads pay.
+    busy: bool,
 }
 
 impl NameSet {
     fn new(bits: Vec<u64>) -> NameSet {
         let todo = bits.chunks(CHUNK_WORDS).map(nonzero).collect();
         let words = bits.iter().filter(|&&b| b != 0).count();
-        NameSet { bits, todo, words }
+        let names = bits.iter().map(|b| b.count_ones() as usize).sum();
+        NameSet { bits, todo, words, names, busy: false }
     }
 }
 
