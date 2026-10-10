@@ -680,7 +680,9 @@ fn owner_wrote(events: &[fsevents::Event], data_dir: &[u8]) -> bool {
 /// FSEvents lost track of the whole watched root (dropped events, or no
 /// history back to our save).
 fn lost_track(e: &fsevents::Event, root: &[u8]) -> bool {
-    e.flags & MUST_SCAN_SUBDIRS != 0 && crate::live::normalize(&e.path) == root
+    // Reported for the root, or for a folder above it (`/`): either way the
+    // root's history is gone.
+    e.flags & MUST_SCAN_SUBDIRS != 0 && crate::live::is_ancestor(&crate::live::normalize(&e.path), root)
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
@@ -698,7 +700,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // rather than at its next periodic check.
         let owner_wrote = owner_wrote(&events, ours);
         // Only the root is indexed; a data dir outside it is watched for the above.
-        events.retain(|e| e.flags & HISTORY_DONE != 0 || crate::live::is_ancestor(&shared.root, &e.path));
+        events.retain(|e| e.flags & HISTORY_DONE != 0 || crate::live::is_ancestor(&shared.root, &e.path) || lost_track(e, &shared.root));
         if !events.is_empty() {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
             let (mut max_id, mut root_flags) = (0, 0);
@@ -891,7 +893,11 @@ mod tests {
         assert!(lost_track(&ev(b"/tmp/r/", MUST_SCAN_SUBDIRS), b"/tmp/r"));
         assert!(!lost_track(&ev(b"/tmp/r/sub", MUST_SCAN_SUBDIRS), b"/tmp/r"));
         assert!(!lost_track(&ev(b"/tmp/r", 0), b"/tmp/r"));
-        assert!(!lost_track(&ev(b"/", MUST_SCAN_SUBDIRS), b"/tmp/r"));
+        // Reported for a folder above the root (or `/`): the root's history
+        // is lost too.
+        assert!(lost_track(&ev(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED), b"/tmp/r"));
+        assert!(lost_track(&ev(b"/tmp", MUST_SCAN_SUBDIRS), b"/tmp/r"));
+        assert!(!lost_track(&ev(b"/tmp/rx", MUST_SCAN_SUBDIRS), b"/tmp/r"));
     }
 
     /// A save writes only folders still refused: ones that are gone (or read
