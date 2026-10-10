@@ -621,6 +621,10 @@ fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
     if let Some(s) = prefix_score(name, q, cap) {
         return Some(s);
     }
+    #[cfg(target_arch = "aarch64")]
+    if name.len() <= 64 && q.len() <= 32 {
+        return fuzzy_masked(name, q, cap);
+    }
     // Leftmost-ending match: jump to each query byte in turn (memchr is
     // SIMD; most names fail on the first or second byte).
     let mut end = 0;
@@ -629,24 +633,86 @@ fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
         end = from + find_folded(&name[from..], c)?;
         from = end + 1;
     }
+    let next = |k: usize, from: usize, to: usize| Some(from + find_folded(&name[from..=to], q[k])?);
+    fuzzy_from(name, q, cap, end, next, |k, to| rfind_folded(&name[..to], q[k]))
+}
+
+/// `fuzzy_score_capped` past the prefix test, for a name of at most 64
+/// bytes: each query byte's places in the name as one 64-bit mask (NEON
+/// compares over the whole name at once) stand in for memchr's scans,
+/// which cost several times more per name tried.
+#[cfg(target_arch = "aarch64")]
+fn fuzzy_masked(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+    use std::arch::aarch64::*;
+    let mut buf = [0u8; 64];
+    buf[..name.len()].copy_from_slice(name);
+    let valid = u64::MAX.checked_shr(64 - name.len() as u32).unwrap_or(0);
+    // Safety (here and below): NEON is part of aarch64; loads stay in `buf`.
+    let v: [uint8x16_t; 4] = std::array::from_fn(|i| unsafe {
+        let x = vld1q_u8(buf.as_ptr().add(16 * i));
+        vorrq_u8(x, vandq_u8(vcltq_u8(vsubq_u8(x, vdupq_n_u8(b'A')), vdupq_n_u8(26)), vdupq_n_u8(0x20)))
+    });
+    // Byte i of a compare weighed by bit i % 8: pairwise adds then pack
+    // the 64 compares into 64 bits, position p in bit p.
+    let places = |c: u8| unsafe {
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let (w, c) = (vld1q_u8(W.as_ptr()), vdupq_n_u8(c));
+        let m = |i: usize| vandq_u8(vceqq_u8(v[i], c), w);
+        let s = vpaddq_u8(vpaddq_u8(m(0), m(1)), vpaddq_u8(m(2), m(3)));
+        vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(s, s)), 0) & valid
+    };
+    let mut masks = [0u64; 32];
+    let (mut end, mut from) = (0, 0);
+    for (m, &c) in masks.iter_mut().zip(q) {
+        *m = places(c);
+        let x = if from < 64 { *m >> from << from } else { 0 };
+        if x == 0 {
+            return None;
+        }
+        end = x.trailing_zeros() as usize;
+        from = end + 1;
+    }
+    let next = |k: usize, from: usize, to: usize| {
+        let x = masks[k] >> from << from & u64::MAX >> (63 - to);
+        (x != 0).then(|| x.trailing_zeros() as usize)
+    };
+    let prev = |k: usize, to: usize| {
+        let x = masks[k] & u64::MAX.checked_shr(64 - to as u32).unwrap_or(0);
+        (x != 0).then(|| 63 - x.leading_zeros() as usize)
+    };
+    fuzzy_from(name, q, cap, end, next, prev)
+}
+
+/// The rest of `fuzzy_score_capped` once the leftmost-ending match ends at
+/// `end`: `next(k, from, to)` finds query byte k's first place in
+/// from..=to, `prev(k, to)` its last one before `to`.
+#[inline(always)]
+fn fuzzy_from(
+    name: &[u8],
+    q: &[u8],
+    cap: i32,
+    end: usize,
+    next: impl Fn(usize, usize, usize) -> Option<usize>,
+    prev: impl Fn(usize, usize) -> Option<usize>,
+) -> Option<i32> {
     if q.len() == 1 {
         return Some(single_score(name, end, cap));
     }
     // Shrink from the right: the latest start that still ends at `end`.
     let mut start = end + 1;
-    for &c in q.iter().rev() {
-        start = rfind_folded(&name[..start], c)?;
+    for k in (0..q.len()).rev() {
+        start = prev(k, start)?;
     }
     // Score the greedy match from `start`, jumping between matched bytes:
     // each gap costs GAP_START then GAP_EXT per byte, a run of consecutive
     // matches carries its strongest boundary bonus along.
     let mut score = 0;
     let (mut at, mut first_bonus) = (start, 0);
-    for (k, &c) in q.iter().enumerate() {
+    for k in 0..q.len() {
         let mut run = false;
         if k > 0 {
             let last = at;
-            at = last + 1 + find_folded(&name[last + 1..=end], c)?;
+            at = next(k, last + 1, end)?;
             run = at == last + 1;
             if !run {
                 score += GAP_START + (at - last - 2) as i32 * GAP_EXT;
@@ -667,16 +733,15 @@ fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
     // Whole-name and stem matches are what people mean most of the time. A
     // leading dot doesn't count: "zshrc" means ~/.zshrc.
     let off = (name.len() > 1 && name[0] == b'.') as usize;
-    let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
-    let contiguous = end + 1 - start == q.len();
-    let placed = if start == off && contiguous && end + 1 == name.len() {
-        100
-    } else if start == off && contiguous && end + 1 == stem {
-        80
-    } else if start == off && contiguous {
-        30
-    } else {
+    let at_stem = || end + 1 == name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
+    let placed = if start != off || end + 1 - start != q.len() {
         0
+    } else if end + 1 == name.len() {
+        100
+    } else if at_stem() {
+        80
+    } else {
+        30
     };
     Some(score + placed.min(cap) - (name.len() as i32).min(80) / 3)
 }
