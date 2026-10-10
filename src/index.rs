@@ -486,6 +486,16 @@ impl Index {
 
 /// Section files (this index, content segments): a 4 KiB header (magic,
 /// then u64 fields), then the sections, each 64-byte aligned.
+/// Replace `path` with `bytes` all at once (tmp + rename): a crash midway
+/// leaves the old file, never half of the new one.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_data()?;
+    std::fs::rename(tmp, path)
+}
+
 pub(crate) const HDR: usize = 4096;
 
 pub(crate) fn header(magic: &[u8; 8], fields: &[u64]) -> Vec<u8> {
@@ -956,6 +966,20 @@ pub(crate) mod tests {
         let (idx, saved) = fresh.persist(&path);
         assert!(saved.is_err());
         assert_eq!(idx.n, 2, "the new index, not the old file's {}", sample().n);
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_old_file_on_failure() {
+        let t = Tmp::new("atomic");
+        let path = t.p("skipped");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::create_dir_all(t.p("skipped.tmp")).unwrap();
+        assert!(write_atomic(&path, b"new\n").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
+        std::fs::remove_dir_all(t.p("skipped.tmp")).unwrap();
+        write_atomic(&path, b"new\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert!(!t.p("skipped.tmp").exists());
     }
 
     #[test]

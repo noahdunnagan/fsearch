@@ -371,7 +371,7 @@ fn note_skipped(dir: &Path) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
-    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+    if let Err(e) = crate::index::write_atomic(&dir.join(SKIPPED), &out) {
         log(format!("save failed: {e}"));
     }
 }
