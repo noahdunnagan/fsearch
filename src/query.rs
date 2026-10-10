@@ -169,7 +169,12 @@ impl Query {
             "mtime" | "modified" => {
                 // mtime:<7d means "modified within the last 7 days".
                 let now = now_secs();
-                let (lo, hi) = range(v, parse_age)?;
+                let (lo, mut hi) = range(v, parse_age)?;
+                // A bare age is that whole unit, like `find -mtime`:
+                // mtime:3d is 3 to 4 days ago, mtime:2h 2 to 3 hours.
+                if !v.contains(['<', '>']) && !v.contains("..") {
+                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).unwrap_or(0));
+                }
                 self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo.min(now as u64) as u32));
                 if hi == u64::MAX {
                     self.mtime.0 = 0;
@@ -1568,6 +1573,18 @@ mod tests {
         // Older than the epoch: lower bound clamps to 0.
         assert_eq!(q("mtime:<200y").mtime.0, 0);
         assert_eq!(q("mtime:99999999999999999999999y").mtime, (0, 0));
+    }
+
+    /// No `<`/`>`: that whole unit, like `find -mtime 3` (3 to 4 days ago).
+    #[test]
+    fn bare_mtime_is_that_whole_unit() {
+        let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
+        let now = now_secs();
+        let p = q("mtime:3d");
+        assert!(near(p.mtime.0, now - 4 * 86400) && near(p.mtime.1, now - 3 * 86400), "{:?}", p.mtime);
+        let p = q("mtime:2h");
+        assert!(near(p.mtime.0, now - 3 * 3600) && near(p.mtime.1, now - 2 * 3600), "{:?}", p.mtime);
+        assert_eq!(q("mtime:3").mtime, q("mtime:3d").mtime);
     }
 
     #[test]
