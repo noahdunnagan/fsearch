@@ -1785,16 +1785,30 @@ fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
     }
 }
 
-/// For a plan of trigrams whose lists in `s` are all bitsets: the live docs
-/// holding all of them, as bits, and how many.
+/// For a plan of trigrams whose lists in `s` are all bitsets (or of none):
+/// the live docs holding all of them (the live text docs), as bits, and how
+/// many.
 fn and_dense(s: &Segment, q: &TQ) -> Option<(Vec<u64>, usize)> {
-    let TQ::And(qs) = q else { return None };
-    let lists = qs.iter().map(|q| match q {
-        TQ::Tri(t) => s.list(*t).and_then(|l| if let List::Bits(b) = l { Some(b) } else { None }),
-        _ => None,
-    });
-    let lists: Vec<&[u8]> = lists.collect::<Option<_>>().filter(|l: &Vec<_>| !l.is_empty())?;
+    let lists: Vec<&[u8]> = match q {
+        TQ::All => Vec::new(),
+        TQ::And(qs) if !qs.is_empty() => qs
+            .iter()
+            .map(|q| match q {
+                TQ::Tri(t) => s.list(*t).and_then(|l| if let List::Bits(b) = l { Some(b) } else { None }),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
     let mut bits: Vec<u64> = s.dead.iter().map(|w| !w).collect();
+    if lists.is_empty() {
+        for (d, _) in s.rank().iter().enumerate().filter(|&(_, &r)| r == NOT_TEXT) {
+            bits[d / 64] &= !(1 << (d % 64));
+        }
+        if let Some(w) = bits.last_mut().filter(|_| !s.ndocs.is_multiple_of(64)) {
+            *w &= (1 << (s.ndocs % 64)) - 1;
+        }
+    }
     for l in lists {
         for (w, b) in bits.iter_mut().zip(l.chunks(8)) {
             *w &= match <[u8; 8]>::try_from(b) {
