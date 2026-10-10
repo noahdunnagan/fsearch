@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX008";
+const MAGIC: &[u8; 8] = b"FSIDX009";
 
 #[derive(Clone, Copy)]
 enum Sec {
@@ -39,9 +39,10 @@ enum Sec {
     NameEntsOff,
     NameEnts,
     NamePrior,
+    NameInfo,
     Zones,
 }
-const NSEC: usize = 18;
+const NSEC: usize = 19;
 
 pub struct Index {
     map: Mmap,
@@ -65,6 +66,31 @@ pub struct Index {
     plan: std::sync::OnceLock<MemoPlan>,
     counts: std::sync::OnceLock<[u32; CLASSES]>,
     top_prior: std::sync::OnceLock<i8>,
+    by_key: std::sync::OnceLock<ByKey>,
+}
+
+/// Per distinct name, what bounds its score for one fuzzy token without
+/// reading the name (see `query::Searcher::ranked`).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct NameInfo {
+    /// The best location prior among the name's folders, plus the best rank
+    /// tweak its flags allow, less the length penalty.
+    pub key: i8,
+    /// Length past a leading dot (at most 255).
+    pub len: u8,
+    /// Stem length (up to the last dot) past a leading dot (at most 255).
+    pub stem: u8,
+    /// First byte past a leading dot, ASCII-folded.
+    pub head: u8,
+}
+
+/// The names with the highest `NameInfo::key`, best first: every name whose
+/// key is at least `cover`, and how many have each key from `cover` up.
+pub struct ByKey {
+    pub cover: i32,
+    pub list: Vec<(i8, u32)>,
+    pub counts: Vec<u32>,
 }
 
 /// How to fold per-dir data down the tree in parallel (see `memo_plan`).
@@ -115,6 +141,8 @@ impl Index {
     // Per distinct name, the highest location prior among the folders
     // holding it: bounds what any entry with the name can score.
     sec!(name_prior, Sec::NamePrior, i8, u);
+    // Per distinct name, what bounds its score without reading it.
+    sec!(name_info, Sec::NameInfo, NameInfo, u);
     // Per ZONE entries: what a filter on size, mtime or kind can skip.
     sec!(zones, Sec::Zones, Zone, zones_len);
 
@@ -134,6 +162,28 @@ impl Index {
     /// The highest `name_prior`.
     pub fn top_prior(&self) -> i8 {
         *self.top_prior.get_or_init(|| self.name_prior().iter().copied().max().unwrap_or(0))
+    }
+
+    /// The names with the highest keys (see `ByKey`).
+    pub fn by_key(&self) -> &ByKey {
+        self.by_key.get_or_init(|| {
+            const WANT: usize = 1 << 14;
+            let info = self.name_info();
+            let mut count = [0usize; 256];
+            for x in info {
+                count[(x.key as i32 + 128) as usize] += 1;
+            }
+            // The lowest key such that all names at or above it fit.
+            let (mut cover, mut n) = (i8::MAX as i32 + 1, 0);
+            while cover > i8::MIN as i32 && n + count[(cover - 1 + 128) as usize] <= WANT {
+                cover -= 1;
+                n += count[(cover + 128) as usize];
+            }
+            let mut list: Vec<(i8, u32)> = info.iter().enumerate().filter(|(_, x)| x.key as i32 >= cover).map(|(k, x)| (x.key, k as u32)).collect();
+            list.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let counts = (cover..=i8::MAX as i32).map(|k| count[(k + 128) as usize] as u32).collect();
+            ByKey { cover, list, counts }
+        })
     }
 
     pub fn uname(&self, id: u32) -> &[u8] {
@@ -404,6 +454,9 @@ impl Index {
             name_prior[k as usize] = name_prior[k as usize].max(prior[parent[i] as usize]);
         }
         put(Sec::NamePrior, as_bytes(&name_prior));
+        let info: Vec<NameInfo> =
+            (0..u).into_par_iter().map(|k| NameInfo::of(&unames[uoff[k] as usize..uoff[k + 1] as usize], name_prior[k])).collect();
+        put(Sec::NameInfo, as_bytes(&info));
         put(Sec::Zones, as_bytes(&zones(&kind[..n], &enc, &mtime[..n])));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
@@ -432,6 +485,7 @@ impl Index {
             plan: std::sync::OnceLock::new(),
             counts: std::sync::OnceLock::new(),
             top_prior: std::sync::OnceLock::new(),
+            by_key: std::sync::OnceLock::new(),
         })
     }
 
@@ -512,10 +566,25 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+impl NameInfo {
+    /// The info of a name whose folders' best location prior is `prior`.
+    pub fn of(name: &[u8], prior: i8) -> NameInfo {
+        let off = (name.len() > 1 && name[0] == b'.') as usize;
+        let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
+        let tweak = 10 + if name.ends_with(b".app") { 25 } else { 0 } - if name.first() == Some(&b'.') { 8 } else { 0 };
+        NameInfo {
+            key: (prior as i32 + tweak - (name.len() as i32).min(80) / 3).max(i8::MIN as i32) as i8,
+            len: (name.len() - off).min(255) as u8,
+            stem: (stem - off).min(255) as u8,
+            head: name.get(off).map_or(0, |&b| crate::query::fold(b)),
+        }
+    }
+}
+
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
     let (n4, d4, u4) = (n * 4, d * 4, (u + 1) * 4);
     let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
-    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, z]
+    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, u * 4, z]
 }
 
 /// Entries per `Zone`.
