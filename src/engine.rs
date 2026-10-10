@@ -197,7 +197,8 @@ impl Engine {
         if owner {
             // Watch before scanning so nothing that changes mid-scan is
             // missed; replaying it afterwards is harmless (diffs are idempotent).
-            shared.watch(since);
+            // No watcher, no live index: refuse to start rather than go stale.
+            shared.watch(since)?;
         }
         let s = shared.clone();
         spawn("fsearch-apply", move || {
@@ -205,7 +206,7 @@ impl Engine {
                 Some(b) => {
                     log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
                     if !owner {
-                        s.watch(b.event_id);
+                        s.watch(b.event_id).ok();
                     }
                     b
                 }
@@ -213,13 +214,13 @@ impl Engine {
                 None => match wait_for_index(&s) {
                     // The owner built it; follow.
                     Some(b) => {
-                        s.watch(b.event_id);
+                        s.watch(b.event_id).ok();
                         b
                     }
                     // The owner quit before saving one: build it here.
                     None => {
                         let since = unsafe { fsevents::FSEventsGetCurrentEventId() };
-                        s.watch(since);
+                        s.watch(since).ok();
                         full_build(&s, since)
                     }
                 },
@@ -321,14 +322,15 @@ impl Shared {
     }
 
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
-    fn watch(&self, since: u64) {
+    fn watch(&self, since: u64) -> Result<(), String> {
         self.replaying.store(true, Ordering::Relaxed);
         // The data dir too when it's outside the root: a follower spots the
         // owner's saves by their events.
         let dir = self.dir.as_os_str().as_bytes();
         let paths: &[&[u8]] = if crate::live::is_ancestor(&self.root, dir) { &[&self.root] } else { &[&self.root, dir] };
-        let new = fsevents::watch(paths, since, 0.1, self.wake.clone());
+        let new = fsevents::watch(paths, since, 0.1, self.wake.clone()).inspect_err(|e| log(format!("not watching for changes: {e}")))?;
         *self.stream.lock().unwrap() = Some(new);
+        Ok(())
     }
 
     /// A follower picks up what the owner wrote: a newer name-index save
@@ -341,7 +343,7 @@ impl Shared {
             && let Some(base) = Index::load(&path)
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
-            self.watch(base.event_id);
+            let _ = self.watch(base.event_id);
             *self.live.write().unwrap() = Some(Live::new(base));
         }
         let cdir = self.dir.join("content");

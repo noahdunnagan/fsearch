@@ -84,9 +84,6 @@ unsafe impl Sync for Stream {}
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if self.s.is_null() {
-            return;
-        }
         unsafe {
             FSEventStreamStop(self.s);
             FSEventStreamInvalidate(self.s);
@@ -98,7 +95,7 @@ impl Drop for Stream {
 
 /// Watch `paths` (normally just `/`) from `since` (an event id). Batches of
 /// directory-level events arrive on `tx` until the returned stream is dropped.
-pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Result<Stream, String> {
     let paths: Vec<_> = paths.iter().map(|p| std::ffi::CString::new(*p).expect("path has no NUL")).collect();
     unsafe {
         // CoreFoundation can't make a UTF-8 string of every path: leave
@@ -114,7 +111,7 @@ pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) 
             })
             .collect();
         if cf.is_empty() {
-            return Stream { s: std::ptr::null_mut(), q: std::ptr::null_mut() };
+            return Err("no path to watch".into());
         }
         let arr = CFArrayCreate(std::ptr::null(), cf.as_ptr(), cf.len() as isize, &kCFTypeArrayCallBacks as *const c_void);
         // The stream frees the sender itself, once no callback can use it.
@@ -131,10 +128,15 @@ pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) 
         // The stream keeps its own copy of the paths.
         CFRelease(arr);
         cf.iter().for_each(|&c| CFRelease(c));
+        if s.is_null() {
+            // No stream to release the sender: free it here.
+            drop(Box::from_raw(ctx.info as *mut Sender<Vec<Event>>));
+            return Err("FSEventStreamCreate failed".into());
+        }
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), std::ptr::null());
         FSEventStreamSetDispatchQueue(s, q);
         FSEventStreamStart(s);
-        Stream { s, q }
+        Ok(Stream { s, q })
     }
 }
 
@@ -166,7 +168,10 @@ mod tests {
         let dir = std::env::temp_dir().canonicalize().unwrap();
         let bad = [dir.as_os_str().as_encoded_bytes(), b"/\xe9-not-utf8"].concat();
         let (tx, _rx) = std::sync::mpsc::channel();
-        drop(watch(&[&bad, dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx));
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        assert!(watch(&[&bad, dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx).is_ok());
+        // Nothing left to watch: an error, not a stream that never fires.
+        assert!(watch(&[&bad], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx2).is_err());
     }
 
     /// For `leaks --atExit`: watch and drop many streams.
