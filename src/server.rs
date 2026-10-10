@@ -173,7 +173,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Reply, String> {
         "status" => {
             let s = engine.status();
             if !s.ready {
-                return Err("indexing (first run scans the whole disk, ~20s)".into());
+                return Err(engine.indexing());
             }
             let mut v = serde_json::to_value(s).map_err(|e| e.to_string())?;
             v["ok"] = true.into();

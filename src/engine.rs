@@ -299,7 +299,7 @@ impl Engine {
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
         WARM_UNTIL.store(0, Ordering::Relaxed);
         let g = self.s.live();
-        let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
+        let Some(live) = g.as_ref() else { return Err(indexing()) };
         let mut p = Vec::new();
         Ok(search_pool()
             .install(|| Searcher { live }.search(q))
@@ -338,7 +338,7 @@ impl Engine {
         // be slow and a waiting writer would stall every other query.
         let paths = {
             let l = self.s.live();
-            let Some(live) = l.as_ref() else { return Err(INDEXING.into()) };
+            let Some(live) = l.as_ref() else { return Err(indexing()) };
             search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))
         };
         Ok((content::verify(g, &paths, q.limit), false))
@@ -364,6 +364,11 @@ impl Engine {
         }
     }
 
+    /// The answer while the first index builds, with its progress.
+    pub fn indexing(&self) -> String {
+        indexing()
+    }
+
     /// Compact and save the name index soon (on the background thread).
     pub fn save(&self) {
         self.s.save_requested.store(true, Ordering::Relaxed);
@@ -374,7 +379,11 @@ impl Engine {
 /// (dirs, trees) for the content worker to re-sync.
 type Resync = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
+/// The answer while the first index builds, with its progress.
+fn indexing() -> String {
+    let n = walk::LISTED.load(Ordering::Relaxed);
+    format!("indexing: {:.1}M entries so far (the first run lists the whole disk, ~25s)", n as f64 / 1e6)
+}
 
 impl Shared {
     fn live(&self) -> RwLockReadGuard<'_, Option<Live>> {

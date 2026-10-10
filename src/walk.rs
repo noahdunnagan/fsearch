@@ -9,7 +9,7 @@ use rayon::Scope;
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const NONE: u32 = u32::MAX;
 
@@ -22,6 +22,9 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// silently denies some, like ~/Library/Mail. Recorded only while paths are
 /// tracked, i.e. while SKIP is set.
 pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Entries listed by scans so far: the first scan's progress.
+pub static LISTED: AtomicUsize = AtomicUsize::new(0);
 
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
@@ -188,6 +191,7 @@ fn entry_count(dir: i32, name: &CString) -> Option<u32> {
 }
 
 fn push(l: Listing, ctx: &Ctx) {
+    LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
     let slot = rayon::current_thread_index().unwrap_or(ctx.out.len() - 1);
     ctx.out[slot].lock().unwrap().push(l);
 }
