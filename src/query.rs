@@ -680,18 +680,25 @@ fn fuzzy_masked(name: &[u8], src: &[u8; 64], q: &[u8], cap: i32) -> Option<i32> 
     });
     // Byte i of a compare weighed by bit i % 8: pairwise adds then pack
     // the 64 compares into 64 bits, position p in bit p.
+    const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let weight = unsafe { vld1q_u8(W.as_ptr()) };
     let places = |c: u8| unsafe {
-        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let (w, c) = (vld1q_u8(W.as_ptr()), vdupq_n_u8(c));
-        let m = |i: usize| vandq_u8(vceqq_u8(v[i], c), w);
+        let c = vdupq_n_u8(c);
+        let m = |i: usize| vandq_u8(vceqq_u8(v[i], c), weight);
         let s = vpaddq_u8(vpaddq_u8(m(0), m(1)), vpaddq_u8(m(2), m(3)));
         vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(s, s)), 0) & valid
     };
     let mut masks = [0u64; 32];
     let (mut end, mut from) = (0, 0);
-    for (m, &c) in masks.iter_mut().zip(q) {
-        *m = places(c);
-        let x = if from < 64 { *m >> from << from } else { 0 };
+    for i in 0..q.len() {
+        let c = q[i];
+        let m = if let Some(prev) = q[..i].iter().rposition(|&x| x == c) {
+            masks[prev]
+        } else {
+            places(c)
+        };
+        masks[i] = m;
+        let x = if from < 64 { m >> from << from } else { 0 };
         if x == 0 {
             return None;
         }
