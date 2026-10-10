@@ -603,33 +603,59 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-/// A name's extension, lowercased: the bytes after its last dot.
-fn ext_of(name: &[u8]) -> Option<Vec<u8>> {
+/// A name's extension (the bytes after its last dot) as `[len, bytes..]`,
+/// lowercased; None if it has no dot or a longer extension.
+fn ext_key(name: &[u8]) -> Option<[u8; 16]> {
     let dot = name.iter().rposition(|&b| b == b'.')?;
-    Some(name[dot + 1..].iter().map(|&b| crate::query::fold(b)).collect())
+    let e = &name[dot + 1..];
+    if e.len() > 15 {
+        return None;
+    }
+    let mut key = [0u8; 16];
+    key[0] = e.len() as u8;
+    for (k, &b) in key[1..].iter_mut().zip(e) {
+        *k = crate::query::fold(b);
+    }
+    Some(key)
 }
 
 /// The table of the 254 most common extensions among `names` (each at
 /// most 15 bytes) and each name's slot in it (see `Index::name_ext`).
 pub(crate) fn ext_slots(names: &[u8], off: &[u32]) -> (Vec<[u8; 16]>, Vec<u8>) {
-    let u = off.len() - 1;
     let name = |k: usize| &names[off[k] as usize..off[k + 1] as usize];
-    let mut count: HashMap<Vec<u8>, u32> = HashMap::new();
-    for k in 0..u {
-        if let Some(e) = ext_of(name(k)).filter(|e| e.len() < 16) {
-            *count.entry(e).or_default() += 1;
-        }
-    }
-    let mut common: Vec<(Vec<u8>, u32)> = count.into_iter().collect();
-    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let count = (0..off.len() - 1)
+        .into_par_iter()
+        .with_min_len(1 << 16)
+        .fold(HashMap::<[u8; 16], u32, Fx>::default, |mut m, k| {
+            if let Some(e) = ext_key(name(k)) {
+                *m.entry(e).or_default() += 1;
+            }
+            m
+        })
+        .reduce(HashMap::default, |mut a, b| {
+            for (e, n) in b {
+                *a.entry(e).or_default() += n;
+            }
+            a
+        });
+    let mut common: Vec<([u8; 16], u32)> = count.into_iter().collect();
+    common.sort_by(|(a, m), (b, n)| n.cmp(m).then_with(|| a[1..=a[0] as usize].cmp(&b[1..=b[0] as usize])));
     let mut table = vec![[0u8; 16]; 256];
-    let mut slot: HashMap<Vec<u8>, u8> = HashMap::new();
+    let mut slot: HashMap<[u8; 16], u8, Fx> = HashMap::default();
     for (i, (e, _)) in common.into_iter().take(254).enumerate() {
-        table[i + 1][0] = e.len() as u8;
-        table[i + 1][1..1 + e.len()].copy_from_slice(&e);
+        table[i + 1] = e;
         slot.insert(e, i as u8 + 1);
     }
-    let slots = (0..u).into_par_iter().map(|k| ext_of(name(k)).map_or(0, |e| slot.get(&e).copied().unwrap_or(255))).collect();
+    let slots = (0..off.len() - 1)
+        .into_par_iter()
+        .map(|k| {
+            let n = name(k);
+            match ext_key(n) {
+                Some(e) => slot.get(&e).copied().unwrap_or(255),
+                None => n.contains(&b'.') as u8 * 255,
+            }
+        })
+        .collect();
     (table, slots)
 }
 
