@@ -16,7 +16,7 @@ const BIG: usize = 1 << 20;
 
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() < BIG || l.align() > 16384 {
+        if !use_mmap(&l, page()) {
             return unsafe { System.alloc(l) };
         }
         let p = unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
@@ -24,17 +24,17 @@ unsafe impl GlobalAlloc for Alloc {
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         // Fresh anonymous pages are already zero.
-        if l.size() < BIG || l.align() > 16384 { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
+        if !use_mmap(&l, page()) { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if l.size() < BIG || l.align() > 16384 {
+        if !use_mmap(&l, page()) {
             unsafe { System.dealloc(p, l) }
         } else {
             unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
         }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-        if (l.size() < BIG && new_size < BIG) || l.align() > 16384 {
+        if !use_mmap(&l, page()) && !use_mmap(&unsafe { Layout::from_size_align_unchecked(new_size, l.align()) }, page()) {
             return unsafe { System.realloc(p, l, new_size) };
         }
         let q = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, l.align())) };
@@ -46,6 +46,17 @@ unsafe impl GlobalAlloc for Alloc {
         }
         q
     }
+}
+
+/// This machine's page size: 16 KiB on Apple silicon, 4 KiB on Intel.
+fn page() -> usize {
+    unsafe { libc::vm_page_size }
+}
+
+/// Whether a block comes from mmap: big, and aligned no stricter than a
+/// page (all mmap guarantees).
+fn use_mmap(l: &Layout, page: usize) -> bool {
+    l.size() >= BIG && l.align() <= page
 }
 
 #[global_allocator]
@@ -273,6 +284,20 @@ fn die(msg: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mmap only aligns to a page: 16 KiB on Apple silicon, 4 KiB on Intel.
+    /// Stricter blocks go to the system allocator.
+    #[test]
+    fn mmap_only_for_page_aligned_blocks() {
+        let l = |size, align| Layout::from_size_align(size, align).unwrap();
+        assert!(use_mmap(&l(BIG, 4096), 4096));
+        assert!(!use_mmap(&l(BIG, 8192), 4096));
+        assert!(use_mmap(&l(BIG, 16384), 16384));
+        assert!(!use_mmap(&l(BIG - 1, 8), 16384));
+        assert!(!use_mmap(&l(BIG, 32768), 16384));
+        // The real allocator asks with this machine's page size.
+        assert_eq!(page(), unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize);
+    }
 
     /// "first" is the first run (the cold one), not the slowest.
     #[test]
