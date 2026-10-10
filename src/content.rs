@@ -1325,10 +1325,19 @@ impl Content {
     /// Every live doc holding one of the own contents `sel` (ascending) of
     /// segment `a`, as (segment, doc).
     fn holders(&self, a: usize, sel: &[u32], mut f: impl FnMut(usize, u32)) {
-        let (s, cp) = (&self.segs[a], &self.copies[a]);
+        let (s, cp, own) = (&self.segs[a], &self.copies[a], self.segs[a].own_doc());
+        if cp.contents.is_empty() {
+            for &c in sel {
+                let first = own[c as usize];
+                if first != NONE && !s.is_dead(first) {
+                    f(a, first);
+                }
+            }
+            return;
+        }
         let mut k = 0;
         for &c in sel {
-            let first = s.own_doc()[c as usize];
+            let first = own[c as usize];
             if first != NONE && !s.is_dead(first) {
                 f(a, first);
             }
@@ -1652,11 +1661,22 @@ impl Content {
         // (Each lane gathers the docs it finds in its own `Top`.)
         let expand = |a: usize, sel: &[u32], top: &mut Top| {
             let at = top.len();
-            self.holders(a, sel, |b, d| {
-                if let Some(r) = admit(b, d) {
-                    top.push(r)
-                }
-            });
+            if global {
+                // No scope to check; the ranks of the segment's docs at hand.
+                let mut seg = (usize::MAX, &[][..], &[][..]);
+                self.holders(a, sel, |b, d| {
+                    if b != seg.0 {
+                        seg = (b, self.segs[b].rank(), self.segs[b].mtime());
+                    }
+                    top.push((rank_key(seg.1[d as usize], seg.2[d as usize]), b as u32, d));
+                });
+            } else {
+                self.holders(a, sel, |b, d| {
+                    if let Some(r) = admit(b, d) {
+                        top.push(r)
+                    }
+                });
+            }
             total.fetch_add(top.len() - at, Relaxed);
         };
         // A selection's docs: right away, or in chunks of about 1k docs (by
@@ -2647,13 +2667,18 @@ struct Cursor<'a> {
     /// Contents read so far; the last is `cur`.
     read: usize,
     cur: Option<u32>,
+    /// The skip entry of the next run after `cur`, and the content before
+    /// that run (u32::MAX: no next run).
+    skip: usize,
+    before: u32,
 }
 
 impl<'a> Cursor<'a> {
     fn new(var: Var<'a>) -> Cursor<'a> {
         let mut it = var.iter();
         let cur = it.next();
-        Cursor { var, it, read: 1, cur }
+        let before = if var.skips.is_empty() { u32::MAX } else { var.skip(0).0 };
+        Cursor { var, it, read: 1, cur, skip: 0, before }
     }
 
     fn next(&mut self) -> Option<u32> {
@@ -2667,11 +2692,14 @@ impl<'a> Cursor<'a> {
         if self.cur.is_none_or(|c| c >= x) {
             return self.cur;
         }
-        // The next run starting after `cur`, and the last one past it that
-        // starts before `x`: jump there.
-        let (j, n) = ((self.read - 1) / SKIP, self.var.skips.len() / 8);
-        if j < n && self.var.skip(j).0 < x {
-            let (mut lo, mut hi) = (j, n);
+        let n = self.var.skips.len() / 8;
+        if (self.read - 1) / SKIP != self.skip {
+            self.skip = (self.read - 1) / SKIP;
+            self.before = if self.skip < n { self.var.skip(self.skip).0 } else { u32::MAX };
+        }
+        // A run past `cur` starts before `x`: jump to the last such.
+        if self.before < x {
+            let (mut lo, mut hi) = (self.skip, n);
             while hi - lo > 1 {
                 let mid = (lo + hi) / 2;
                 if self.var.skip(mid).0 < x { lo = mid } else { hi = mid }
@@ -2726,9 +2754,20 @@ impl List<'_> {
     fn retain(self, acc: &mut Vec<u32>) {
         match self {
             List::Bits(b) => acc.retain(|&d| b.get(d as usize / 8).is_some_and(|x| x >> (d % 8) & 1 != 0)),
-            List::Var(v) => {
+            // Few to find in a long list: jump by its skip table.
+            List::Var(v) if acc.len() * 64 < v.deltas.len() => {
                 let mut c = Cursor::new(v);
                 acc.retain(|&d| c.seek(d) == Some(d));
+            }
+            List::Var(v) => {
+                let mut it = v.iter();
+                let mut cur = it.next();
+                acc.retain(|&d| {
+                    while cur.is_some_and(|c| c < d) {
+                        cur = it.next();
+                    }
+                    cur == Some(d)
+                });
             }
         }
     }
