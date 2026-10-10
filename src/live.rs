@@ -335,7 +335,7 @@ impl Live {
         use rayon::prelude::*;
         let idx = &self.base;
         let de = idx.dir_entry();
-        let check = |p: &[u8]| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
+        let check = |p: &[u8]| !walk::blocked(p) && mtime_of(p).is_some_and(|m| m >= since);
         let pool = stat_pool();
         let mut out: Vec<Vec<u8>> = pool.install(|| {
             (1..idx.d)
@@ -350,7 +350,7 @@ impl Live {
                 .collect()
         });
         out.extend(self.over.iter().filter(|(p, o)| o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0 && check(p)).map(|(p, _)| p.clone()));
-        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
+        if mtime_of(b"/").is_some_and(|m| m >= since) {
             out.push(b"/".to_vec());
         }
         out.sort();
@@ -462,6 +462,14 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut hi = lo.clone();
     *hi.last_mut().unwrap() += 1; // '/' + 1 == '0'
     (lo, hi)
+}
+
+/// Just the mtime: one lstat, no mount check (changed_dirs asks this of
+/// every folder in the index).
+fn mtime_of(path: &[u8]) -> Option<u32> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0).then(|| st.st_mtime.clamp(0, u32::MAX as i64) as u32)
 }
 
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
