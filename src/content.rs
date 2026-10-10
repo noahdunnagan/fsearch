@@ -970,10 +970,33 @@ fn has_upper(pattern: &str, mode: GrepMode) -> bool {
 
 /// The index folds only ASCII; the regex folds beyond it: É/é, and two
 /// ASCII letters, k to the Kelvin sign and s to the long s (the only ones).
-/// So a case-insensitive search can't demand trigrams with those bytes.
+/// So a case-insensitive search can't demand non-ASCII trigrams, and a
+/// trigram with k or s becomes a choice of its spellings: the file holds
+/// one of them, and that spelling's last three bytes are a trigram there.
 fn fold_safe(q: TQ) -> TQ {
     match q {
-        TQ::Tri(t) if t < 1 << 24 && [t >> 16, t >> 8, t].iter().any(|&b| matches!(b as u8, 0x80..|b'k'| b's')) => TQ::All,
+        TQ::Tri(t) if t < 1 << 24 => {
+            let b = [(t >> 16) as u8, (t >> 8) as u8, t as u8];
+            if b.iter().any(|&c| c >= 0x80) {
+                return TQ::All;
+            }
+            let mut spellings: Vec<Vec<u8>> = vec![Vec::new()];
+            for c in b {
+                let alts: Vec<Vec<u8>> = match c {
+                    b'k' => vec![b"k".to_vec(), "\u{212A}".into()],
+                    b's' => vec![b"s".to_vec(), "\u{17F}".into()],
+                    _ => vec![vec![c]],
+                };
+                spellings = spellings.iter().flat_map(|p| alts.iter().map(move |a| [p.as_slice(), a].concat())).collect();
+            }
+            if spellings.len() == 1 {
+                return TQ::Tri(t);
+            }
+            let mut tris: Vec<u32> = spellings.iter().map(|w| w[w.len() - 3..].iter().fold(0u32, |acc, &c| acc << 8 | fold(c) as u32)).collect();
+            tris.sort();
+            tris.dedup();
+            TQ::Or(tris.into_iter().map(TQ::Tri).collect())
+        }
         TQ::And(v) => TQ::And(v.into_iter().map(fold_safe).collect()),
         TQ::Or(v) => TQ::Or(v.into_iter().map(fold_safe).collect()),
         q => q,
@@ -1651,22 +1674,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Folding for the Kelvin sign and long s must not blow up ordinary
-    /// plans: no more trigrams than the plain ASCII plan.
+    /// Folding for the Kelvin sign and long s keeps plans selective: every
+    /// trigram the ASCII plan requires is still required (as its ASCII
+    /// spelling or a folded one), with at most 8 spellings each.
     #[test]
-    fn case_insensitive_plans_stay_small() {
-        fn tris(q: &TQ) -> usize {
+    fn case_insensitive_plans_keep_every_trigram() {
+        // Trigram positions a plan requires, and the most spellings any one has.
+        fn required(q: &TQ) -> (usize, usize) {
             match q {
-                TQ::All => 0,
-                TQ::Tri(_) => 1,
-                TQ::And(v) | TQ::Or(v) => v.iter().map(tris).sum(),
+                TQ::All => (0, 0),
+                TQ::Tri(_) => (1, 1),
+                TQ::Or(v) if v.iter().all(|t| matches!(t, TQ::Tri(_))) => (1, v.len()),
+                TQ::And(v) => v.iter().map(required).fold((0, 0), |a, b| (a.0 + b.0, a.1.max(b.1))),
+                // Alternatives (a regex plan): as strong as the weakest.
+                TQ::Or(v) => v.iter().map(required).min_by_key(|r| r.0).unwrap_or((0, 0)),
             }
         }
-        for w in ["kubernetes", "session_store", "hello world", "configuration", "les misérables"] {
-            let (ci, ascii) = (Grep::new(w, GrepMode::Literal).unwrap().plan(), literal_plan(w.as_bytes()));
-            assert!(tris(&ci) <= tris(&ascii), "{w}: {} trigrams vs {}", tris(&ci), tris(&ascii));
-            let ci = Grep::new(w, GrepMode::Regex).unwrap().plan();
-            assert!(tris(&ci) <= tris(&ascii), "regex {w}: {} trigrams vs {}", tris(&ci), tris(&ascii));
+        for w in ["kubernetes", "session_store", "has_full_disk_access", "hello world", "configuration"] {
+            let ascii = required(&literal_plan(w.as_bytes())).0;
+            for mode in [GrepMode::Literal, GrepMode::Regex] {
+                let (n, spellings) = required(&Grep::new(w, mode).unwrap().plan());
+                assert_eq!(n, ascii, "{w} ({mode:?}): {n} of {ascii} trigrams still required");
+                assert!(spellings <= 8, "{w}: {spellings} spellings");
+            }
         }
     }
 
