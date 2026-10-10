@@ -142,6 +142,23 @@ impl Live {
         self.base.lookup(path).filter(|&e| !self.is_dead(e))
     }
 
+    /// Drop a child the listing no longer has (or whose shape changed) and
+    /// everything under it, including what was added inside it since the
+    /// save. `base`: its base entry, if it has one.
+    fn remove_child(&mut self, child: &[u8], base: Option<u32>) {
+        let was_dir = match base {
+            Some(c) => self.base.kind()[c as usize] & 3 == KIND_DIR,
+            None => self.over.get(child).is_some_and(|o| o.kind & 3 == KIND_DIR),
+        };
+        if was_dir {
+            self.trees.push(child.to_vec());
+        }
+        if let Some(c) = base {
+            self.kill_subtree(c);
+        }
+        self.drop_over_subtree(child);
+    }
+
     fn remove_path(&mut self, path: &[u8]) {
         self.trees.push(path.to_vec());
         if let Some(e) = self.base_alive(path) {
@@ -261,12 +278,7 @@ impl Live {
                     let c = c as usize;
                     let was_kind = self.base.kind()[c];
                     if shape(was_kind) != shape(now.kind) {
-                        if was_kind & 3 == KIND_DIR {
-                            self.trees.push(child.clone());
-                        }
-                        self.kill_subtree(c as u32);
-                        // What was added inside the old folder since.
-                        self.drop_over_subtree(&child);
+                        self.remove_child(&child, Some(c as u32));
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
                     } else if now.kind & 3 != KIND_DIR && (self.base.size_raw()[c] != enc_size(now.size) || self.base.mtime()[c] != now.mtime) {
@@ -277,10 +289,7 @@ impl Live {
                 Some(None) => {
                     let old = self.over[&child];
                     if shape(old.kind) != shape(now.kind) {
-                        if old.kind & 3 == KIND_DIR {
-                            self.trees.push(child.clone());
-                        }
-                        self.drop_over_subtree(&child);
+                        self.remove_child(&child, None);
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
                     } else if (old.kind, old.size, old.mtime) != (now.kind, now.size, now.mtime) {
@@ -290,22 +299,7 @@ impl Live {
             }
         }
         for (name, c) in cur {
-            let child = join(&p, &name);
-            match c {
-                Some(c) => {
-                    if self.base.kind()[c as usize] & 3 == KIND_DIR {
-                        self.trees.push(child.clone());
-                    }
-                    self.kill_subtree(c);
-                    self.drop_over_subtree(&child)
-                }
-                None => {
-                    if self.over.get(&child).is_some_and(|o| o.kind & 3 == KIND_DIR) {
-                        self.trees.push(child.clone());
-                    }
-                    self.drop_over_subtree(&child)
-                }
-            }
+            self.remove_child(&join(&p, &name), c);
         }
         Applied::Done
     }
