@@ -860,7 +860,7 @@ fn top_k(n: usize, k: usize, visits: usize, floor: u64, visit: impl Fn(std::ops:
     } else {
         let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
         let step = n.div_ceil(pieces).max(1);
-        (0..pieces).into_par_iter().map(|p| piece((p * step).min(n)..((p + 1) * step).min(n))).collect()
+        par_each(pieces, || (), |_, p| piece((p * step).min(n)..((p + 1) * step).min(n)))
     };
     // A full piece's k-th best already bounds the overall k-th from below.
     let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
@@ -1131,7 +1131,7 @@ impl Searcher<'_> {
             }
             (sorted, h)
         };
-        let parts = if pieces == 1 { vec![piece(0)] } else { (0..pieces).into_par_iter().map(piece).collect::<Vec<_>>() };
+        let parts = if pieces == 1 { vec![piece(0)] } else { par_each(pieces, || (), |_, p| piece(p)) };
         let mut hist = vec![0usize; BINS];
         for (_, h) in &parts {
             hist.iter_mut().zip(h).for_each(|(a, &b)| *a += b as usize);
@@ -1167,7 +1167,7 @@ impl Searcher<'_> {
             let mut batch: Vec<Cand> = if n <= INLINE_NAMES {
                 (0..parts.len()).flat_map(one).collect()
             } else {
-                (0..parts.len()).into_par_iter().flat_map_iter(one).collect()
+                par_each(parts.len(), || (), |_, p| one(p)).into_iter().flatten().collect()
             };
             let re = q.name_re.clone();
             batch.extend(by_key.list[listed..lend].iter().filter_map(|&(_, k)| {
@@ -1196,10 +1196,11 @@ impl Searcher<'_> {
             let placed = x.head == t0;
             bin(cheap(x)) >= top && (placed || x.key as i32 >= by_key.cover)
         };
-        let rest: Vec<Cand> = (0..idx.words.div_ceil(CHUNK_WORDS))
-            .into_par_iter()
-            .flat_map_iter(|c| {
-                let (re, mut out) = (q.name_re.clone(), Vec::new());
+        let rest = par_each(
+            idx.words.div_ceil(CHUNK_WORDS),
+            || q.name_re.clone(),
+            |re, c| {
+                let mut out = Vec::new();
                 for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.words) {
                     let mut m = within(w);
                     if m == 0 {
@@ -1219,8 +1220,11 @@ impl Searcher<'_> {
                     }
                 }
                 out
-            })
-            .collect();
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         Some(best(hits.into_iter().chain(visit(&rest, fkey)).collect()).0)
     }
 
@@ -1247,9 +1251,10 @@ impl Searcher<'_> {
         let seen = std::sync::atomic::AtomicUsize::new(0);
         let over = || seen.load(std::sync::atomic::Ordering::Relaxed) > SELECTIVE;
         let spaced = |w: usize, i: u32| (space[0][w] | space[1][w]) >> i & 1 != 0;
-        let (mut ents, mut trees) = (0..idx.words.div_ceil(CHUNK_WORDS))
-            .into_par_iter()
-            .map(|c| {
+        let found = par_each(
+            idx.words.div_ceil(CHUNK_WORDS),
+            || (),
+            |_, c| {
                 let (mut ents, mut trees) = (Vec::new(), Vec::new());
                 for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.words) {
                     if over() {
@@ -1285,15 +1290,13 @@ impl Searcher<'_> {
                     }
                 }
                 (ents, trees)
-            })
-            .reduce(
-                || (Vec::new(), Vec::new()),
-                |mut a, b| {
-                    a.0.extend(b.0);
-                    a.1.extend(b.1);
-                    a
-                },
-            );
+            },
+        );
+        let (mut ents, mut trees): (Vec<u32>, Vec<(u32, u32)>) = (Vec::new(), Vec::new());
+        for (e, t) in found {
+            ents.extend(e);
+            trees.extend(t);
+        }
         if over() {
             return None;
         }
