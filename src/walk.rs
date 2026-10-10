@@ -24,6 +24,19 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// again.
 pub static DENIED: Mutex<std::collections::BTreeSet<Vec<u8>>> = Mutex::new(std::collections::BTreeSet::new());
 
+/// A folder some volume is mounted on (or will be, an automount trigger):
+/// what a scan flags `FLAG_MOUNT` and doesn't cross. Firmlinks aren't.
+pub fn is_mount(path: &std::ffi::CStr) -> bool {
+    let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
+    al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
+    let mut buf = [0u32; 2];
+    let r = unsafe {
+        libc::getattrlist(path.as_ptr(), &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, 8, libc::FSOPT_NOFOLLOW)
+    };
+    r == 0 && buf[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
+}
+
 pub fn blocked(path: &[u8]) -> bool {
     // An entry may be written with a trailing slash; it still names the folder.
     fn folder(s: &[u8]) -> &[u8] {

@@ -472,6 +472,9 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
     }
     let kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFREG => walk::KIND_FILE,
+        // Flagged like a scan does, so a recursive event on it isn't a
+        // crawl of the mounted volume.
+        libc::S_IFDIR if walk::is_mount(&c) => KIND_DIR | FLAG_MOUNT,
         libc::S_IFDIR => KIND_DIR,
         libc::S_IFLNK => walk::KIND_LINK,
         _ => walk::KIND_OTHER,
@@ -829,6 +832,19 @@ mod tests {
         seen.sort();
         assert_eq!(seen, [(b"/r/d".to_vec(), KIND_DIR), (b"/r/d/e".to_vec(), KIND_FILE)]);
         assert_eq!(stat_pool().current_num_threads(), 12);
+    }
+
+    /// lstat flags a mount point the way a scan does, so a recursive event
+    /// on one doesn't scan into the volume. (Only lstat here: a fetch that
+    /// missed the flag would crawl the whole Data volume.) /Users is a
+    /// firmlink, crossed on purpose, not a mount.
+    #[test]
+    fn lstat_flags_mount_points() {
+        let data = lstat(b"/System/Volumes/Data").expect("the Data volume");
+        assert_ne!(data.kind & FLAG_MOUNT, 0);
+        assert_eq!(lstat(b"/Users").unwrap().kind & FLAG_MOUNT, 0);
+        let t = Tmp::new("lstat-mount");
+        assert_eq!(lstat(t.0.as_os_str().as_encoded_bytes()).unwrap().kind & FLAG_MOUNT, 0);
     }
 
     #[test]
