@@ -364,16 +364,25 @@ fn start_content(s: &Arc<Shared>) {
 }
 
 /// A follower takes over the index files once their owner is gone.
-fn try_upgrade(s: &Arc<Shared>) -> bool {
-    if s.owner() {
-        return true;
-    }
+/// Become the owner if the lock is free: from now on this engine writes the
+/// index files.
+fn take_lock(s: &Shared) -> bool {
     if !try_lock(&s.lock) {
         return false;
     }
     s.owner.store(true, Ordering::Relaxed);
     log("took over the index from a previous owner");
     *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+    true
+}
+
+fn try_upgrade(s: &Arc<Shared>) -> bool {
+    if s.owner() {
+        return true;
+    }
+    if !take_lock(s) {
+        return false;
+    }
     rescan_unskipped(s);
     start_content(s);
     true
@@ -435,9 +444,7 @@ fn wait_for_index(s: &Shared) -> Option<Index> {
         if let Some(b) = Index::load(&s.dir.join("index.bin")) {
             return Some(b);
         }
-        if try_lock(&s.lock) {
-            s.owner.store(true, Ordering::Relaxed);
-            *s.content.write().unwrap() = Content::open(s.dir.join("content"));
+        if take_lock(s) {
             // The owner may have saved one just before it quit.
             return Index::load(&s.dir.join("index.bin"));
         }
