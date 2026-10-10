@@ -207,13 +207,11 @@ fn install(login: bool) {
     let tmp = bin.with_extension("new");
     std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
     // Stop the old daemon so the next one runs the new binary. Unload the
-    // login agent first, or KeepAlive would restart it straight away; if the
-    // daemon won't stop, load the agent again rather than leave none.
+    // login agent first, or KeepAlive would restart it straight away.
     let target = format!("{}/{LABEL}", domain());
     let had_agent = launchctl(&["bootout", &target]);
     if let Err(e) = server::stop(&data_dir()) {
-        let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-        die(&rollback(e, had_agent, bootstrap, BOOTSTRAP_WAIT));
+        die(&rollback(e, had_agent));
     }
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
@@ -261,13 +259,15 @@ fn retry(tries: usize, wait: std::time::Duration, mut f: impl FnMut() -> bool) -
     })
 }
 
-/// The old daemon wouldn't stop: load the login agent again if we unloaded
-/// it, and say what went wrong.
-fn rollback(err: String, had_agent: bool, bootstrap: impl FnMut() -> bool, wait: std::time::Duration) -> String {
-    if had_agent && !retry(BOOTSTRAP_TRIES, wait, bootstrap) {
-        return format!("{err}; the login agent could not be loaded again: run fsearch install --login");
+/// The old daemon wouldn't stop, so it still holds the lock and serves (the
+/// old binary). Loading the agent now would respawn a daemon that can't
+/// start, over and over: leave it unloaded and say what to do.
+fn rollback(err: String, had_agent: bool) -> String {
+    if had_agent {
+        format!("{err}; the old daemon still runs and the login agent stays unloaded: run fsearch install --login once it has exited")
+    } else {
+        err
     }
-    err
 }
 
 fn uninstall() {
@@ -306,41 +306,14 @@ mod tests {
         assert_eq!(summary(vec![ms(2), ms(9), ms(1)]), "first 2.00ms  median 2.00ms  min 1.00ms");
     }
 
-    /// launchd refuses bootstrap until the old job is gone: the rollback
-    /// keeps trying, like the main path.
+    /// stop() fails only while the old daemon still holds the lock: loading
+    /// the agent then would respawn a daemon that can't start, over and
+    /// over. Leave it unloaded (the old daemon still serves) and say so.
     #[test]
-    fn rollback_retries_until_the_agent_loads() {
-        let mut calls = 0;
-        let err = rollback(
-            "stuck".into(),
-            true,
-            || {
-                calls += 1;
-                calls == 3
-            },
-            std::time::Duration::from_millis(1),
-        );
-        assert_eq!((calls, err.as_str()), (3, "stuck"));
-    }
-
-    #[test]
-    fn rollback_says_when_the_agent_stays_unloaded() {
-        let err = rollback("stuck".into(), true, || false, std::time::Duration::ZERO);
-        assert!(err.starts_with("stuck") && err.contains("install --login"), "{err}");
-        let mut calls = 0;
-        assert_eq!(
-            rollback(
-                "stuck".into(),
-                false,
-                || {
-                    calls += 1;
-                    true
-                },
-                std::time::Duration::ZERO
-            ),
-            "stuck"
-        );
-        assert_eq!(calls, 0, "no agent was unloaded, so none to load");
+    fn rollback_leaves_the_agent_unloaded_while_the_old_daemon_runs() {
+        let err = rollback("daemon 7 did not exit".into(), true);
+        assert!(err.starts_with("daemon 7 did not exit") && err.contains("install --login"), "{err}");
+        assert_eq!(rollback("stuck".into(), false), "stuck");
     }
 
     unsafe fn check(p: *mut u8, n: usize, fill: u8) {
