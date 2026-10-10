@@ -600,7 +600,7 @@ fn resolve_root(root: Option<std::ffi::OsString>) -> Result<Vec<u8>, String> {
 
 /// Scan from `root`. Below `/`, the folders above it are listed with that
 /// one child each, so index paths stay absolute, as FSEvents reports them.
-fn scan_from(root: &[u8]) -> Vec<walk::Listing> {
+pub(crate) fn scan_from(root: &[u8]) -> Vec<walk::Listing> {
     let mut ls = walk::scan(root, SCAN_THREADS);
     let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
     let k = comps.len() as u32;

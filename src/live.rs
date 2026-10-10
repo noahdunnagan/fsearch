@@ -485,7 +485,6 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::tests::lst;
     use crate::walk::tests::Tmp;
     use crate::walk::{KIND_FILE, KIND_LINK};
     use std::collections::BTreeSet;
@@ -493,20 +492,10 @@ mod tests {
 
     /// An index whose paths are real: the ancestors of `root` as one-entry
     /// listings (never listing them), then a scan of `root` itself.
+    /// The index an engine builds for `root` (its ancestors as one-child
+    /// folders), so the live code works on real paths without listing `/`.
     fn base_for(root: &[u8]) -> Index {
-        let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-        let k = comps.len() as u32;
-        let mut ls: Vec<Listing> = comps.iter().enumerate().map(|(i, c)| lst(i as u32, &[(c, KIND_DIR, 0, i as u32 + 1)])).collect();
-        for mut l in walk::scan(root, 2) {
-            l.id += k;
-            for e in &mut l.ents {
-                if e.child != NONE {
-                    e.child += k;
-                }
-            }
-            ls.push(l);
-        }
-        Index::build(ls, 5, 9, b"")
+        Index::build(crate::engine::scan_from(root), 5, 9, b"")
     }
 
     fn live_for(t: &Tmp) -> Live {
