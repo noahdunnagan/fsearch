@@ -373,7 +373,7 @@ impl Index {
         if map.len() < total {
             return None;
         }
-        Some(Index {
+        let idx = Index {
             n,
             d,
             u,
@@ -384,7 +384,24 @@ impl Index {
             off,
             map,
             plan: std::sync::OnceLock::new(),
-        })
+        };
+        idx.ids_in_range().then_some(idx)
+    }
+
+    /// Every id a section holds points inside the section it indexes, so a
+    /// corrupt file is refused here rather than panicking at a lookup.
+    fn ids_in_range(&self) -> bool {
+        let (n, d, u) = (self.n as u32, self.d as u32, self.u as u32);
+        let monotonic = |v: &[u32], max: usize| v.windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&x| x as usize <= max);
+        monotonic(self.name_off(), self.names_len)
+            && monotonic(self.name_ents_off(), self.n)
+            && self.ent_name().iter().all(|&x| x < u)
+            && self.parent().iter().all(|&x| x < d.max(1))
+            && self.dir_entry().iter().all(|&x| x < n)
+            && self.dir_parent().iter().all(|&x| x < d)
+            && self.dir_end().iter().all(|&x| x <= n)
+            && self.dir_start().iter().zip(self.dir_len()).all(|(&s, &l)| s as u64 + l as u64 <= n as u64)
+            && self.name_ents().iter().all(|&x| x < n)
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
@@ -799,6 +816,31 @@ pub(crate) mod tests {
         let mut p = Vec::new();
         idx.path(leaf as usize, &mut p);
         assert_eq!(p, want);
+    }
+
+    /// Ids inside the sections are checked at load too: an out-of-range one
+    /// is refused, not a panic at the first lookup that follows it.
+    #[test]
+    fn load_rejects_out_of_range_ids() {
+        let t = Tmp::new("idx-ids");
+        let idx = Index::build(vec![lst(0, &[(b"a", D, 0, 1)]), lst(1, &[(b"f", F, 1, NONE)])], 0, 0, b"");
+        let path = t.p("index.bin");
+        idx.save(&path).unwrap();
+        let f = idx.lookup(b"/a/f").unwrap() as usize;
+        let corrupt = |sec: &[u32], i: usize, v: u32| {
+            let at = sec.as_ptr() as usize - idx.map.as_ptr() as usize + i * 4;
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[at..at + 4].copy_from_slice(&v.to_ne_bytes());
+            let bad = t.p("bad.bin");
+            std::fs::write(&bad, bytes).unwrap();
+            Index::load(&bad).is_none()
+        };
+        assert!(corrupt(idx.parent(), f, idx.d as u32), "parent past the last dir");
+        assert!(corrupt(idx.ent_name(), f, idx.u as u32), "name id past the last name");
+        assert!(corrupt(idx.dir_entry(), 1, idx.n as u32), "dir entry past the last entry");
+        assert!(corrupt(idx.dir_len(), 0, idx.n as u32), "children past the last entry");
+        assert!(corrupt(idx.name_off(), 1, u32::MAX), "name offset past the names");
+        assert!(corrupt(idx.name_ents(), 0, idx.n as u32), "name's entry past the last entry");
     }
 
     /// A corrupt index whose parent links loop must not recurse forever: a
