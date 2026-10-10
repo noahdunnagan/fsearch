@@ -908,12 +908,10 @@ pub(crate) fn follows(path: &[u8], tree: bool, home: &[u8]) -> bool {
 pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
-        if !follows(d, r, home) {
-            continue;
-        }
+        // `follows`, spelled out to check scope once.
         if in_scope(d, home) {
             out.push((d.clone(), r));
-        } else {
+        } else if r && crate::live::is_ancestor(d, home) {
             // A subtree containing home (e.g. "/" rescanned): sync all of home.
             out.push((home.to_vec(), true));
         }
