@@ -38,11 +38,13 @@ pub fn is_mount(path: &std::ffi::CStr) -> bool {
 }
 
 pub fn blocked(path: &[u8]) -> bool {
-    // An entry may be written with a trailing slash; it still names the folder.
+    // An entry may be written with trailing slashes; it still names the
+    // folder (`/` itself stays `/`). An empty one names nothing.
     fn folder(s: &[u8]) -> &[u8] {
-        s.strip_suffix(b"/").filter(|t| !t.is_empty()).unwrap_or(s)
+        let end = s.iter().rposition(|&b| b != b'/').map_or(s.len().min(1), |i| i + 1);
+        &s[..end]
     }
-    SKIP.get().is_some_and(|v| v.iter().any(|s| crate::live::is_ancestor(folder(s), path)))
+    SKIP.get().is_some_and(|v| v.iter().filter(|s| !s.is_empty()).any(|s| crate::live::is_ancestor(folder(s), path)))
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
