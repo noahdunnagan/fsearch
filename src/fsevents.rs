@@ -84,6 +84,9 @@ unsafe impl Sync for Stream {}
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        if self.s.is_null() {
+            return;
+        }
         unsafe {
             FSEventStreamStop(self.s);
             FSEventStreamInvalidate(self.s);
@@ -98,7 +101,21 @@ impl Drop for Stream {
 pub fn watch(paths: &[&[u8]], since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
     let paths: Vec<_> = paths.iter().map(|p| std::ffi::CString::new(*p).expect("path has no NUL")).collect();
     unsafe {
-        let cf: Vec<*const c_void> = paths.iter().map(|p| CFStringCreateWithCString(std::ptr::null(), p.as_ptr(), 0x0800_0100)).collect();
+        // CoreFoundation can't make a UTF-8 string of every path: leave
+        // those out rather than hand on NULL.
+        let cf: Vec<*const c_void> = paths
+            .iter()
+            .filter_map(|p| {
+                let c = CFStringCreateWithCString(std::ptr::null(), p.as_ptr(), 0x0800_0100);
+                if c.is_null() {
+                    eprintln!("fsearch: can't watch {} (not UTF-8)", p.to_string_lossy());
+                }
+                (!c.is_null()).then_some(c)
+            })
+            .collect();
+        if cf.is_empty() {
+            return Stream { s: std::ptr::null_mut(), q: std::ptr::null_mut() };
+        }
         let arr = CFArrayCreate(std::ptr::null(), cf.as_ptr(), cf.len() as isize, &kCFTypeArrayCallBacks as *const c_void);
         // The stream frees the sender itself, once no callback can use it.
         let ctx = Context {
@@ -140,6 +157,16 @@ mod tests {
             }
         };
         assert_eq!(gone, std::sync::mpsc::RecvTimeoutError::Disconnected);
+    }
+
+    /// A path that isn't UTF-8 (CoreFoundation can't make a string of it)
+    /// is left out, not handed on as NULL: that crashed the daemon.
+    #[test]
+    fn a_path_that_is_not_utf8_does_not_crash() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let bad = [dir.as_os_str().as_encoded_bytes(), b"/\xe9-not-utf8"].concat();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        drop(watch(&[&bad, dir.as_os_str().as_encoded_bytes()], unsafe { FSEventsGetCurrentEventId() }, 0.05, tx));
     }
 
     /// For `leaks --atExit`: watch and drop many streams.
