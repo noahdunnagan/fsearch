@@ -70,6 +70,9 @@ struct Cand {
 #[repr(align(128))]
 struct Line<T>(T);
 
+/// A token's `TokenBits::words` for a pair of words, on its own line.
+type Pair = Line<[(u64, u64, u64); 2]>;
+
 /// One token's view of the name bitmaps (`index::BM_FIRST` and on): which
 /// of 64 names at a time it can match, before any name is read.
 struct TokenBits<'a> {
@@ -101,35 +104,59 @@ impl<'a> TokenBits<'a> {
     /// the halves test; can match cleanly; may match with a typo). Cleanly,
     /// the name has every class of the token, and some prefix of the token
     /// fits the classes of its first half and the rest its second half. With
-    /// a typo, a word starts with the first letter and at most one other
-    /// class is missing.
+    /// a typo, a word starts with the first letter, at most one other class
+    /// is missing, and so does the halves test with one char after the
+    /// first left out: every edit `typo_score` takes leaves the rest of the
+    /// token in order in the name.
     #[inline]
     fn word(&self, w: usize) -> (u64, u64, u64) {
-        let has = |b: &[&[u64]; 2]| b[0][w] | b[1][w];
-        let mut all = has(&self.classes[0]);
-        let typo = self.start.map_or(0, |s| s[w] & all);
+        self.words::<1>(w)[0]
+    }
+
+    /// `word` for words `w..w + B`, side by side: a pair fills a NEON
+    /// register, and the loops exit when both words are done, which is
+    /// easier to predict than each word on its own.
+    #[inline(always)]
+    fn words<const B: usize>(&self, w: usize) -> [(u64, u64, u64); B] {
+        let has = |b: &[&[u64]; 2], j: usize| b[0][w + j] | b[1][w + j];
+        let none = |x: &[[u64; B]]| x.iter().flatten().fold(0, |a, &b| a | b) == 0;
+        let mut all: [u64; B] = std::array::from_fn(|j| has(&self.classes[0], j));
+        let typo: [u64; B] = self.start.map_or([0; B], |s| std::array::from_fn(|j| s[w + j] & all[j]));
         // Names with every class so far, and typo-able ones missing one.
-        let mut one = 0;
+        let mut one = [0; B];
         for b in &self.classes[1..] {
-            if all | one == 0 {
+            if none(&[all, one]) {
                 break;
             }
-            let x = has(b);
-            one = (one & x) | (all & !x & typo);
-            all &= x;
+            for j in 0..B {
+                let x = has(b, j);
+                one[j] = (one[j] & x) | (all[j] & !x & typo[j]);
+                all[j] &= x;
+            }
         }
         // Names whose first half holds the token so far, and names where
-        // the token so far ends in the second half.
-        let (mut first, mut second) = (all, 0);
-        for b in &self.seq {
-            if first | second == 0 {
+        // the token so far ends in the second half; then the same with one
+        // char left out, for typo-able names.
+        let (mut first, mut second): ([u64; B], _) = (std::array::from_fn(|j| all[j] | one[j]), [0; B]);
+        let (mut first1, mut second1) = ([0; B], [0; B]);
+        for (k, b) in self.seq.iter().enumerate() {
+            if none(&[first, second, first1, second1]) {
                 break;
             }
-            second = (second | first) & b[1][w];
-            first &= b[0][w];
+            let skip = if k > 0 { !0 } else { 0 };
+            for j in 0..B {
+                let (b0, b1) = (b[0][w + j], b[1][w + j]);
+                second1[j] = ((second1[j] | first1[j]) & b1) | (second[j] & typo[j] & skip);
+                first1[j] = (first1[j] & b0) | (first[j] & typo[j] & skip);
+                second[j] = (second[j] | first[j]) & b1;
+                first[j] &= b0;
+            }
         }
-        let clean = first | second;
-        (clean | ((all | one) & typo), clean, typo)
+        std::array::from_fn(|j| {
+            let clean = (first[j] | second[j]) & all[j];
+            let typo = (first[j] | second[j] | first1[j] | second1[j]) & typo[j];
+            (clean | typo, clean, typo)
+        })
     }
 }
 
@@ -1240,82 +1267,99 @@ impl Searcher<'_> {
         let re_toks = q.name_re.as_ref().and_then(re_literals).map(filter);
         let bits_of = |t: &Option<Vec<Token>>| t.as_ref().map(|t| t.iter().map(|t| TokenBits::new(idx, t)).collect::<Vec<_>>());
         let (ext_bits, re_bits) = (bits_of(&ext_toks), bits_of(&re_toks));
-        // Name k is bit i of `per` (each token's `TokenBits::word`). `re` is
-        // the task's own copy of `name_re`: sharing one regex's cache pool
-        // across threads costs more than the match.
-        let score_one = |k: usize,
-                         i: u32,
-                         per: &[Line<(u64, u64, u64)>],
-                         spaced: bool,
-                         re: Option<&regex::bytes::Regex>,
-                         ok_entries: &mut usize|
-         -> Option<NameHit> {
-            let name = idx.uname(k as u32);
-            let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
-            let bit = |x: u64| x >> i & 1 != 0;
-            for (t, tok) in pos.iter().enumerate() {
-                let (fits, clean, typo) = per[t].0;
-                if bit(fits)
-                    && let Some(s) = token_score(name, tok.known_mask(bit(clean), bit(typo), spaced), tok)
-                {
-                    h.bits |= 1 << t;
-                    let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    h.score = h.score.saturating_add(s16);
-                    if t < 4 {
-                        h.best[t] = s16.max(0);
+        // Name k is bit i of lane j of `per` (each token's
+        // `TokenBits::words`). `re` is the task's own copy of `name_re`:
+        // sharing one regex's cache pool across threads costs more than the
+        // match.
+        let score_one =
+            |k: usize, i: u32, per: &[Pair], j: usize, spaced: bool, re: Option<&regex::bytes::Regex>, ok_entries: &mut usize| -> Option<NameHit> {
+                let name = idx.uname(k as u32);
+                let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
+                let bit = |x: u64| x >> i & 1 != 0;
+                for (t, tok) in pos.iter().enumerate() {
+                    let (fits, clean, typo) = per[t].0[j];
+                    if bit(fits)
+                        && let Some(s) = token_score(name, tok.known_mask(bit(clean), bit(typo), spaced), tok)
+                    {
+                        h.bits |= 1 << t;
+                        let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        h.score = h.score.saturating_add(s16);
+                        if t < 4 {
+                            h.best[t] = s16.max(0);
+                        }
                     }
                 }
-            }
-            if neg.iter().zip(&per[pos.len()..]).any(|(t, p)| bit(p.0.0) && token_matches(name, t)) {
-                h.flags |= NF_NEG;
-            }
-            // As a file match it must hit a token and pass name filters;
-            // as a folder on someone's path, the raw token bits matter.
-            let ok = (pos.is_empty() || h.bits != 0)
-                && h.flags & NF_NEG == 0
-                && (q.exts.is_empty() || ext_ok(name, &q.exts))
-                && re.is_none_or(|re| re.is_match(name));
-            if ok {
-                h.flags |= NF_OK;
-                *ok_entries += (ne_off[k + 1] - ne_off[k]) as usize;
-            }
-            (ok || h.bits != 0 || h.flags & NF_NEG != 0).then_some(h)
-        };
+                if neg.iter().zip(&per[pos.len()..]).any(|(t, p)| bit(p.0[j].0) && token_matches(name, t)) {
+                    h.flags |= NF_NEG;
+                }
+                // As a file match it must hit a token and pass name filters;
+                // as a folder on someone's path, the raw token bits matter.
+                let ok = (pos.is_empty() || h.bits != 0)
+                    && h.flags & NF_NEG == 0
+                    && (q.exts.is_empty() || ext_ok(name, &q.exts))
+                    && re.is_none_or(|re| re.is_match(name));
+                if ok {
+                    h.flags |= NF_OK;
+                    *ok_entries += (ne_off[k + 1] - ne_off[k]) as usize;
+                }
+                (ok || h.bits != 0 || h.flags & NF_NEG != 0).then_some(h)
+            };
         // One chunk of name ids: its words of the bitset and rank, and its
-        // hits in id order (into a spare buffer).
-        let chunk = |c: usize, bits: &mut [u64], rank: &mut [u16], mut hits: Vec<NameHit>| -> (Vec<NameHit>, usize) {
+        // hits in id order (into a spare buffer). Words with candidates go
+        // in pairs where they can (see `TokenBits::words`). `per` is the
+        // task's scratch.
+        let chunk = |c: usize, bits: &mut [u64], rank: &mut [u16], mut hits: Vec<NameHit>, per: &mut [Pair]| {
             let mut ok = 0;
-            if from.is_some_and(|f| f.hits[c].is_empty()) || within.is_some_and(|s| !s.any[c]) {
+            let (lo, n) = (c * CHUNK_WORDS, bits.len());
+            // The chunk's words with candidates, as a bitset.
+            let mut todo: Todo = std::array::from_fn(|g| 1u64.checked_shl(n.saturating_sub(g * 64) as u32).map_or(!0, |b| b - 1));
+            if let Some(f) = from {
+                let words = if f.hits[c].is_empty() { Todo::default() } else { nonzero(&f.bits[lo..lo + n]) };
+                todo = std::array::from_fn(|g| todo[g] & words[g]);
+            }
+            if let Some(s) = within {
+                todo = std::array::from_fn(|g| todo[g] & s.todo[c][g]);
+            }
+            if todo == Todo::default() {
                 return (hits, ok);
             }
             let re = q.name_re.clone();
-            let mut per = vec![Line((0, 0, 0)); toks.len()];
-            for (wi, (word, r)) in bits.iter_mut().zip(rank.iter_mut()).enumerate() {
-                *r = hits.len() as u16;
-                let w = c * CHUNK_WORDS + wi;
-                let mut cand = from.map_or(!0, |f| f.bits[w]) & within.map_or(!0, |s| s.bits[w]);
-                if cand == 0 {
-                    continue;
-                }
-                let mut any = 0;
-                for (p, tb) in per.iter_mut().zip(&toks) {
-                    p.0 = tb.word(w);
-                    any |= p.0.0;
-                }
-                // With no positive token every name is a candidate, unless
-                // a name filter says which can pass.
-                if pos.is_empty() {
-                    let some = |f: &Option<Vec<TokenBits>>| f.as_ref().map_or(!0, |f| f.iter().fold(0, |a, t| a | t.word(w).0));
-                    any |= !0 >> (64 - (idx.u - w * 64).min(64)) & some(&ext_bits) & some(&re_bits);
-                }
-                cand &= any;
-                while cand != 0 {
-                    let i = cand.trailing_zeros();
-                    cand &= cand - 1;
-                    let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
-                    if let Some(h) = score_one(w * 64 + i as usize, i, &per, spaced, re.as_ref(), &mut ok) {
-                        hits.push(h);
-                        *word |= 1 << i;
+            let cand_of = |w: usize| from.map_or(!0, |f| f.bits[w]) & within.map_or(!0, |s| s.bits[w]);
+            let has = |todo: &[u64], wi: usize| wi < n && todo[wi / 64] >> (wi % 64) & 1 != 0;
+            for g in 0..todo.len() {
+                while todo[g] != 0 {
+                    let wi = g * 64 + todo[g].trailing_zeros() as usize;
+                    todo[g] &= todo[g] - 1;
+                    let pair = has(&todo, wi + 1);
+                    if pair {
+                        todo[(wi + 1) / 64] &= !(1 << ((wi + 1) % 64));
+                    }
+                    let w = lo + wi;
+                    for (p, tb) in per.iter_mut().zip(&toks) {
+                        p.0 = if pair { tb.words::<2>(w) } else { [tb.word(w), (0, 0, 0)] };
+                    }
+                    for j in 0..1 + pair as usize {
+                        // A word's rank counts the chunk's hits before it
+                        // (read only for words with a hit).
+                        let (wi, w) = (wi + j, w + j);
+                        rank[wi] = hits.len() as u16;
+                        let mut any = per.iter().take(toks.len()).fold(0, |a, p| a | p.0[j].0);
+                        // With no positive token every name is a candidate,
+                        // unless a name filter says which can pass.
+                        if pos.is_empty() {
+                            let some = |f: &Option<Vec<TokenBits>>| f.as_ref().map_or(!0, |f| f.iter().fold(0, |a, t| a | t.word(w).0));
+                            any |= !0 >> (64 - (idx.u - w * 64).min(64)) & some(&ext_bits) & some(&re_bits);
+                        }
+                        let mut cand = cand_of(w) & any;
+                        while cand != 0 {
+                            let i = cand.trailing_zeros();
+                            cand &= cand - 1;
+                            let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
+                            if let Some(h) = score_one(w * 64 + i as usize, i, per, j, spaced, re.as_ref(), &mut ok) {
+                                hits.push(h);
+                                bits[wi] |= 1 << i;
+                            }
+                        }
                     }
                 }
             }
@@ -1328,12 +1372,13 @@ impl Searcher<'_> {
         let few = from.map_or(within.map_or(idx.words, |s| s.words), |f| f.len) <= INLINE_WORDS;
         let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
         spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
+        let scratch = || vec![Line([(0, 0, 0); 2]); toks.len()];
         let out: Vec<(Vec<NameHit>, usize)> = if few {
-            let chunks = bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare);
-            chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h)).collect()
+            let (chunks, mut per) = (bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare), scratch());
+            chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h, &mut per)).collect()
         } else {
             let chunks = bits.par_chunks_mut(CHUNK_WORDS).zip(rank.par_chunks_mut(CHUNK_WORDS)).zip(spare);
-            chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h)).collect()
+            chunks.enumerate().map_init(scratch, |per, (c, ((b, r), h))| chunk(c, b, r, h, per)).collect()
         };
         let ok_entries = out.iter().map(|c| c.1).sum();
         let hits: Vec<Vec<NameHit>> = out.into_iter().map(|c| c.0).collect();
@@ -1826,20 +1871,32 @@ impl NameTable {
     }
 }
 
-/// A set of name ids, and which chunks of it are not empty.
+/// A set of name ids, and which words of each chunk are not empty.
 struct NameSet {
     bits: Vec<u64>,
-    any: Vec<bool>,
+    todo: Vec<Todo>,
     /// Non-zero words.
     words: usize,
 }
 
 impl NameSet {
     fn new(bits: Vec<u64>) -> NameSet {
-        let any = bits.chunks(CHUNK_WORDS).map(|c| c.iter().any(|&b| b != 0)).collect();
+        let todo = bits.chunks(CHUNK_WORDS).map(nonzero).collect();
         let words = bits.iter().filter(|&&b| b != 0).count();
-        NameSet { bits, any, words }
+        NameSet { bits, todo, words }
     }
+}
+
+/// One bit per word of a chunk (CHUNK_WORDS of them).
+type Todo = [u64; CHUNK_WORDS / 64];
+
+/// Which of a chunk's words are not zero.
+fn nonzero(words: &[u64]) -> Todo {
+    let mut out = Todo::default();
+    for (o, g) in out.iter_mut().zip(words.chunks(64)) {
+        *o = g.iter().enumerate().fold(0, |m, (b, &x)| m | ((x != 0) as u64) << b);
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
