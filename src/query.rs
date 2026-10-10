@@ -692,11 +692,7 @@ fn fuzzy_masked(name: &[u8], src: &[u8; 64], q: &[u8], cap: i32) -> Option<i32> 
     let (mut end, mut from) = (0, 0);
     for i in 0..q.len() {
         let c = q[i];
-        let m = if let Some(prev) = q[..i].iter().rposition(|&x| x == c) {
-            masks[prev]
-        } else {
-            places(c)
-        };
+        let m = if let Some(prev) = q[..i].iter().rposition(|&x| x == c) { masks[prev] } else { places(c) };
         masks[i] = m;
         let x = if from < 64 { m >> from << from } else { 0 };
         if x == 0 {
