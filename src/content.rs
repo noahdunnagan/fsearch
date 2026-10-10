@@ -632,7 +632,13 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
 /// Should this file be in the content index?
 pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
     let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-    name_ok(name, size) && in_scope(path, home)
+    name_ok(name, size) && file_in_scope(path, home)
+}
+
+/// A file is in scope when its folder is: the skip lists name folders, and
+/// the file's own name is `name_ok`'s business (a script called `build`).
+fn file_in_scope(path: &[u8], home: &[u8]) -> bool {
+    path.iter().rposition(|&b| b == b'/').is_some_and(|cut| in_scope(&path[..cut], home))
 }
 
 /// The name/size half of eligibility, checkable before building a path.
@@ -877,7 +883,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             } else {
                 p = join(dir, idx.name(i));
             }
-            if in_scope(&p, home) {
+            if file_in_scope(&p, home) {
                 want.push(&p, idx.size_of(i), idx.mtime()[i]);
             }
         }
@@ -2147,6 +2153,17 @@ mod tests {
         live.over.insert(b"/h/pq/new3.rs".to_vec(), OEnt::new(b"new3.rs", KIND_FILE, 3, 9));
         assert_eq!(paths_of(&wanted(&live, h, b"/h/p", false)), ["/h/p/a.rs", "/h/p/new.rs"]);
         assert_eq!(paths_of(&wanted(&live, h, b"/h/p", true)), ["/h/p/a.rs", "/h/p/new.rs", "/h/p/sub/b.md", "/h/p/sub/new2.rs"]);
+    }
+
+    /// Skip lists name folders: a file called `build` or `cache` (a script
+    /// in a project root) is still indexed; files inside such folders aren't.
+    #[test]
+    fn a_file_named_like_a_skipped_folder_is_indexed() {
+        assert!(eligible(b"/h/proj/build", 10, b"/h"));
+        assert!(eligible(b"/h/proj/dist", 10, b"/h"));
+        assert!(eligible(b"/h/cache", 10, b"/h"));
+        assert!(!eligible(b"/h/proj/build/out.rs", 10, b"/h"));
+        assert!(!eligible(b"/h/node_modules/x/index.js", 10, b"/h"));
     }
 
     /// Home written with a trailing slash still holds its files, and a
