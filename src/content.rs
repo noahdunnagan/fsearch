@@ -565,68 +565,27 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         let (si, k) = order[d];
         &splits[si].syms[splits[si].docs[k].sym.clone()]
     };
-    // Definition keys sort after every trigram (they're above 2^24), so they
-    // follow the trigrams as sorted (key, doc) pairs in either build.
-    let mut sym_pairs: Vec<u64> = (0..order.len()).flat_map(|d| syms(d).iter().map(move |&t| (t as u64) << 32 | d as u64)).collect();
-    sym_pairs.sort_unstable();
-    let pairs: usize = (0..order.len()).map(|d| tris(d).len()).sum();
-    if pairs < 1 << 22 {
-        // Small batch (the usual incremental update): sort the pairs. Cost
-        // scales with the batch, not with the 16.7M-slot trigram space.
-        let mut v: Vec<u64> = Vec::with_capacity(pairs + sym_pairs.len());
-        for d in 0..order.len() {
-            v.extend(tris(d).iter().map(|&t| (t as u64) << 32 | d as u64));
-        }
-        v.sort_unstable();
-        v.extend_from_slice(&sym_pairs);
-        let mut i = 0;
-        return write_segment(dir, id, &meta, |list| {
-            let t = (*v.get(i)? >> 32) as u32;
-            while i < v.len() && (v[i] >> 32) as u32 == t {
-                list.push(v[i] as u32);
-                i += 1;
+    // Postings, built in parallel over runs of keys: each run takes its keys
+    // from every doc's (sorted) trigrams or definition keys, in doc order.
+    let parts = key_runs()
+        .map(|keys| {
+            let mut pairs: Vec<u64> = Vec::new();
+            for d in 0..order.len() {
+                let t = if keys.start < 1 << 24 { tris(d) } else { syms(d) };
+                let from = t.partition_point(|&x| (x as u64) < keys.start);
+                pairs.extend(t[from..].iter().take_while(|&&x| (x as u64) < keys.end).map(|&x| (x as u64) << 32 | d as u64));
             }
-            Some(t)
-        });
-    }
-    // Big batch (initial build): counting sort over the whole trigram space.
-    let mut count = vec![0u32; 1 << 24];
-    for d in 0..order.len() {
-        for &x in tris(d) {
-            count[x as usize] += 1;
-        }
-    }
-    let keys: Vec<u32> = (0..1u32 << 24).filter(|&t| count[t as usize] != 0).collect();
-    let mut start = vec![0usize; keys.len() + 1];
-    for (k, &t) in keys.iter().enumerate() {
-        start[k + 1] = start[k] + count[t as usize] as usize;
-        count[t as usize] = k as u32; // reuse as trigram -> key index
-    }
-    let mut raw = vec![0u32; start[keys.len()]];
-    let mut cur = start.clone();
-    for d in 0..order.len() {
-        for &x in tris(d) {
-            let k = count[x as usize] as usize;
-            raw[cur[k]] = d as u32;
-            cur[k] += 1;
-        }
-    }
-    drop(count);
-    drop(cur);
-    let (mut k, mut i) = (0, 0);
-    write_segment(dir, id, &meta, |list| {
-        if let Some(&t) = keys.get(k) {
-            list.extend_from_slice(&raw[start[k]..start[k + 1]]);
-            k += 1;
-            return Some(t);
-        }
-        let t = (*sym_pairs.get(i)? >> 32) as u32;
-        while i < sym_pairs.len() && (sym_pairs[i] >> 32) as u32 == t {
-            list.push(sym_pairs[i] as u32);
-            i += 1;
-        }
-        Some(t)
-    })
+            pairs.sort_unstable();
+            let (mut part, mut list) = (Postings::default(), Vec::new());
+            for run in pairs.chunk_by(|a, b| a >> 32 == b >> 32) {
+                list.clear();
+                list.extend(run.iter().map(|&p| p as u32));
+                part.push(order.len(), (run[0] >> 32) as u32, &list);
+            }
+            part
+        })
+        .collect();
+    write_segment(dir, id, &meta, parts)
 }
 
 /// Merge segments into one, dropping tombstoned docs. Postings stay in
@@ -645,56 +604,85 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
         }
         remap.push(r);
     }
-    let mut pos = vec![0usize; segs.len()];
-    let mut part = Vec::new();
-    write_segment(dir, id, &meta, |list| {
-        loop {
-            let t = segs.iter().zip(&pos).filter_map(|(s, &p)| s.tri_key().get(p).copied()).min()?;
-            for (si, s) in segs.iter().enumerate() {
-                if s.tri_key().get(pos[si]) == Some(&t) {
-                    part.clear();
-                    s.list_into(pos[si], &mut part);
-                    list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
-                    pos[si] += 1;
+    // Postings, merged in parallel over runs of keys.
+    let parts = key_runs()
+        .map(|keys| {
+            let k = |s: &Segment, x: u64| s.tri_key().partition_point(|&t| (t as u64) < x);
+            let mut pos: Vec<std::ops::Range<usize>> = segs.iter().map(|s| k(s, keys.start)..k(s, keys.end)).collect();
+            let (mut out, mut list, mut part) = (Postings::default(), Vec::new(), Vec::new());
+            while let Some(t) = segs.iter().zip(&pos).filter(|(_, p)| !p.is_empty()).map(|(s, p)| s.tri_key()[p.start]).min() {
+                list.clear();
+                for (si, s) in segs.iter().enumerate() {
+                    if !pos[si].is_empty() && s.tri_key()[pos[si].start] == t {
+                        part.clear();
+                        s.list_into(pos[si].start, &mut part);
+                        list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
+                        pos[si].start += 1;
+                    }
+                }
+                if !list.is_empty() {
+                    out.push(meta.len(), t, &list);
                 }
             }
-            if !list.is_empty() {
-                return Some(t);
-            }
-        }
-    })
+            out
+        })
+        .collect();
+    write_segment(dir, id, &meta, parts)
 }
 
-/// Encode postings (bitset when dense, delta varints otherwise) and write
-/// the segment file. `next` fills one trigram's sorted doc ids into the
-/// (cleared) buffer and returns the trigram, ascending, until None.
-fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut(&mut Vec<u32>) -> Option<u32>) -> Option<Segment> {
+/// The key space in runs that postings are built in, in parallel: the
+/// trigrams 64k at a time, then the definition keys (above 2^24).
+fn key_runs() -> impl IndexedParallelIterator<Item = std::ops::Range<u64>> {
+    (0..257usize).into_par_iter().map(|r| if r < 256 { (r as u64) << 16..(r as u64 + 1) << 16 } else { 1 << 24..1 << 32 })
+}
+
+/// Posting lists for a run of keys, encoded: the keys (ascending), where
+/// each list starts in `post` (with BITSET for a bitset), and the bytes.
+#[derive(Default)]
+struct Postings {
+    keys: Vec<u32>,
+    offs: Vec<u32>,
+    post: Vec<u8>,
+}
+
+impl Postings {
+    /// Add `key`'s docs (ascending) in a segment of `ndocs`: a bitset when
+    /// dense, delta varints otherwise.
+    fn push(&mut self, ndocs: usize, key: u32, list: &[u32]) {
+        self.keys.push(key);
+        if list.len() * 8 > ndocs {
+            self.offs.push(self.post.len() as u32 | BITSET);
+            let at = self.post.len();
+            self.post.resize(at + ndocs.div_ceil(8), 0);
+            for &d in list {
+                self.post[at + d as usize / 8] |= 1 << (d % 8);
+            }
+        } else {
+            self.offs.push(self.post.len() as u32);
+            let mut last = 0u32;
+            for &d in list {
+                put_varint(&mut self.post, d - last);
+                last = d;
+            }
+        }
+    }
+}
+
+/// Write the segment file: docs, and their postings in runs of keys
+/// (ascending).
+fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], parts: Vec<Postings>) -> Option<Segment> {
     if docs.is_empty() {
         return None;
     }
     let ndocs = docs.len();
     let (mut keys, mut tri_off, mut post) = (Vec::new(), Vec::new(), Vec::new());
-    let mut list = Vec::new();
-    loop {
-        list.clear();
-        let Some(t) = next(&mut list) else { break };
-        keys.push(t);
-        if list.len() * 8 > ndocs {
-            tri_off.push(post.len() as u32 | BITSET);
-            let at = post.len();
-            post.resize(at + ndocs.div_ceil(8), 0);
-            for &d in &list {
-                post[at + d as usize / 8] |= 1 << (d % 8);
-            }
-        } else {
-            tri_off.push(post.len() as u32);
-            let mut last = 0u32;
-            for &d in &list {
-                put_varint(&mut post, d - last);
-                last = d;
-            }
-        }
+    for p in &parts {
+        let base = post.len() as u32;
+        keys.extend_from_slice(&p.keys);
+        tri_off.extend(p.offs.iter().map(|&o| ((o & !BITSET) + base) | (o & BITSET)));
+        post.extend_from_slice(&p.post);
     }
+    drop(parts);
     tri_off.push(post.len() as u32);
     let mut paths = Vec::new();
     let mut path_off = vec![0u32];
