@@ -696,6 +696,34 @@ mod tests {
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
 
+    /// install renames the new binary over the running one before stopping
+    /// it: the old daemon must still be recognised and stopped.
+    #[test]
+    fn stop_finds_a_daemon_whose_binary_was_replaced() {
+        let dir = root().join("stop8");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        let bin = dir.join("fsearch");
+        std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        let mut c = std::process::Command::new(&bin)
+            .args(["--exact", "server::tests::lock_holder", "serve", "--ignored", "--nocapture"])
+            .env("FSEARCH_TEST_HOLD", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = c.id().to_string();
+        wait_for("the holder", || std::fs::read_to_string(&path).is_ok_and(|s| s == pid));
+        // What install does: a new copy renamed over the running one.
+        let new = dir.join("fsearch.new");
+        std::fs::copy(std::env::current_exe().unwrap(), &new).unwrap();
+        std::fs::rename(&new, &bin).unwrap();
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let _ = c.kill();
+        assert_eq!(r, Ok(()));
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
     /// The lock's holder hasn't written its pid yet, and the file still
     /// names a stale pid that is now ours: never signal ourselves.
     #[test]
