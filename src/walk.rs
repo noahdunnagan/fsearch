@@ -37,11 +37,18 @@ pub fn is_mount(path: &std::ffi::CStr) -> bool {
     r == 0 && buf[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
 }
 
-/// Forget refused folders that have since become readable or are gone;
-/// keep only those still refused (EPERM).
+/// Forget refused folders that are gone. One that reads now stays: its
+/// contents are still missing from the index until the next start rescans
+/// it. The disk is read with the lock released.
 pub fn prune_denied() {
     use std::os::unix::ffi::OsStrExt;
-    DENIED.lock().unwrap().retain(|p| std::fs::read_dir(std::ffi::OsStr::from_bytes(p)).is_err_and(|e| e.raw_os_error() == Some(libc::EPERM)));
+    let listed: Vec<Vec<u8>> = DENIED.lock().unwrap().iter().cloned().collect();
+    let gone = |p: &[u8]| std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(p)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    let gone: Vec<Vec<u8>> = listed.into_iter().filter(|p| gone(p)).collect();
+    let mut denied = DENIED.lock().unwrap();
+    for p in &gone {
+        denied.remove(p);
+    }
 }
 
 pub fn blocked(path: &[u8]) -> bool {
