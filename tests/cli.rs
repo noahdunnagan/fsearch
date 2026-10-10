@@ -166,6 +166,15 @@ fn searches_through_the_daemon() {
     assert!(o.status.success());
     assert!(out(&o).ends_with(&format!(" {heron}\n")), "{}", out(&o));
     assert!(err(&o).contains("median"));
+    // A content query is timed as one (#10), not as a name search.
+    let o = h.run(&["bench", "regex:heron.needle"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), format!("{heron}:2: a heron needle\n"));
+    assert!(err(&o).contains("median"));
+    // Outside home the content index doesn't reach: said, not faked.
+    let o = h.run(&["bench", "grep:needle in:/usr"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("content index"), "{}", err(&o));
     let o = h.run(&["bench", "re:("]);
     assert_eq!(o.status.code(), Some(1));
 }

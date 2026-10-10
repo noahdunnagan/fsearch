@@ -157,9 +157,14 @@ fn stdio() {
 }
 
 fn bench(qs: &str) {
+    let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
+    // A content query (`grep:`, `regex:`, `sym:`) is timed as one, on the
+    // saved content index, not as a name search.
+    if q.grep.is_some() {
+        return bench_grep(q);
+    }
     let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
     let live = live::Live::new(idx);
-    let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
     let s = query::Searcher { live: &live };
     let mut times = Vec::new();
     let mut hits = Vec::new();
@@ -172,6 +177,30 @@ fn bench(qs: &str) {
     for h in hits.iter().take(10) {
         live.base.path(h.idx as usize, &mut p);
         println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
+    }
+    eprintln!("{}", summary(times));
+}
+
+fn bench_grep(mut q: query::Query) {
+    let home = home();
+    // The daemon reads files found by name outside home; that path isn't
+    // something to time against the saved index.
+    if !q.scope.as_ref().is_none_or(|s| fsearch::content::in_scope(s, home.as_bytes())) {
+        die("bench: that scope is outside home, which the content index doesn't cover");
+    }
+    let c = fsearch::content::Content::open_shared(data_dir().join("content"));
+    let g = fsearch::Grep::new(&q.grep.take().unwrap(), q.grep_mode).unwrap_or_else(|e| die(&e));
+    let mut times = Vec::new();
+    let mut found = fsearch::GrepResult::default();
+    for _ in 0..20 {
+        let t = Instant::now();
+        found = c.search(&g, &q);
+        times.push(t.elapsed());
+    }
+    for f in found.files.iter().take(10) {
+        for (line, text) in &f.lines {
+            println!("{}:{line}: {}", String::from_utf8_lossy(&f.path), text.trim());
+        }
     }
     eprintln!("{}", summary(times));
 }
