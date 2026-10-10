@@ -1269,7 +1269,9 @@ impl Searcher<'_> {
             want *= 4;
             // A tentative try that one batch does not settle has few good
             // matches: a name table costs no more and typing can narrow it.
-            if tentative && !(done(floor, top) && floor >= base + by_key.cover) {
+            // So does any try whose first two batches turn up a handful of
+            // hits.
+            if tentative && !(done(floor, top) && floor >= base + by_key.cover) || hits.len() < q.limit / 4 && want > FIRST_BATCH * 4 {
                 return None;
             }
         }
