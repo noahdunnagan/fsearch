@@ -1323,8 +1323,9 @@ impl Searcher<'_> {
         };
         let mut bits = vec![0u64; idx.words];
         let mut rank = vec![0u16; idx.words];
-        // A few hundred words to look at take less time than waking threads.
-        let few = from.map_or(within.map(|s| s.words), |f| Some(f.len)).is_some_and(|n| n <= INLINE_WORDS);
+        // A few thousand words to look at (a small index, a scope, a
+        // narrowed table) take less time than waking threads.
+        let few = from.map_or(within.map_or(idx.words, |s| s.words), |f| f.len) <= INLINE_WORDS;
         let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
         spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
         let out: Vec<(Vec<NameHit>, usize)> = if few {
