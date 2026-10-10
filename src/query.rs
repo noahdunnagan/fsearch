@@ -589,6 +589,9 @@ pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
 
 /// `fuzzy_score` with the whole-name/stem/prefix bonus capped at `cap`.
 fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+    if let Some(s) = prefix_score(name, q, cap) {
+        return Some(s);
+    }
     // Leftmost-ending match: jump to each query byte in turn (memchr is
     // SIMD; most names fail on the first or second byte).
     let mut end = 0;
@@ -645,6 +648,37 @@ fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
         30
     } else {
         0
+    };
+    Some(score + placed.min(cap) - (name.len() as i32).min(80) / 3)
+}
+
+/// `fuzzy_score_capped` of a name that starts with the query (past a
+/// leading dot, unless the query starts with one): the match is the prefix,
+/// so the score comes from one pass over it. None if the name does not.
+#[inline]
+fn prefix_score(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    let end = off + q.len();
+    if (off == 1 && q[0] == b'.') || name.len() < end || !name[off..end].iter().zip(q).all(|(&a, &b)| fold(a) == b) {
+        return None;
+    }
+    // The first byte follows a delimiter (or nothing); each next one runs on
+    // from the one before it.
+    let mut first = bonus(Class::Delim, class(name[off]));
+    let mut score = SCORE_MATCH + first * 2;
+    for i in off + 1..end {
+        let b = bonus(class(name[i - 1]), class(name[i]));
+        if b >= BONUS_BOUNDARY && b > first {
+            first = b;
+        }
+        score += SCORE_MATCH + b.max(first).max(BONUS_CONSEC);
+    }
+    let placed = if end == name.len() {
+        100
+    } else if name[end] == b'.' && !name[end + 1..].contains(&b'.') {
+        80
+    } else {
+        30
     };
     Some(score + placed.min(cap) - (name.len() as i32).min(80) / 3)
 }
