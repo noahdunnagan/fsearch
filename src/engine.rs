@@ -689,6 +689,11 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     ));
 }
 
+/// The owner wrote the index files (they live in the data dir).
+fn owner_wrote(events: &[fsevents::Event], data_dir: &[u8]) -> bool {
+    events.iter().any(|e| crate::live::is_ancestor(data_dir, &e.path))
+}
+
 /// FSEvents lost track of the whole watched root (dropped events, or no
 /// history back to our save).
 fn lost_track(e: &fsevents::Event, root: &[u8]) -> bool {
@@ -708,7 +713,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         events.extend(rx.try_iter().flatten());
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
-        let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
+        let owner_wrote = owner_wrote(&events, ours);
         // Only the root is indexed; a data dir outside it is watched for the above.
         events.retain(|e| e.flags & HISTORY_DONE != 0 || crate::live::is_ancestor(&shared.root, &e.path));
         if !events.is_empty() {
@@ -880,6 +885,18 @@ mod tests {
         let dirs = to_relist(&e.s, crate::query::now_secs().saturating_sub(2 * 86400));
         let out: Vec<_> = dirs.iter().filter(|d| !crate::live::is_ancestor(&e.s.root, d)).map(|d| String::from_utf8_lossy(d)).collect();
         assert!(out.is_empty(), "outside the root: {out:?}");
+    }
+
+    /// A sibling folder whose name starts like the data dir's is not the
+    /// owner writing (FSearch-backup next to FSearch).
+    #[test]
+    fn owner_writes_are_inside_the_data_dir() {
+        let ev = |p: &[u8]| vec![fsevents::Event { path: p.to_vec(), flags: 0, id: 0 }];
+        let dir = b"/h/Library/FSearch";
+        assert!(owner_wrote(&ev(b"/h/Library/FSearch/index.bin"), dir));
+        assert!(owner_wrote(&ev(b"/h/Library/FSearch"), dir));
+        assert!(!owner_wrote(&ev(b"/h/Library/FSearch-backup/index.bin"), dir));
+        assert!(!owner_wrote(&ev(b"/h/Library/FSearchApp"), dir));
     }
 
     /// Under `FSEARCH_ROOT`, lost history is reported for the root, not `/`.
