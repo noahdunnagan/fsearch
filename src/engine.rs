@@ -432,16 +432,18 @@ fn rescan_unskipped(shared: &Shared) {
     shared.save_requested.store(true, Ordering::Relaxed);
 }
 
-/// Of the folders a save lacked, the ones that can be read now. Ones still
-/// refused (EPERM) go back in `walk::DENIED`; gone, or closed by plain
-/// permissions: nothing to rescan or record.
+/// Of the folders a save lacked, the ones that can be read now. Gone ones
+/// are dropped; any still failing go back in `walk::DENIED`, to be written
+/// to `skipped` and tried again.
 fn readable_now(was: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut now = Vec::new();
     for path in was.into_iter().filter(|p| !walk::blocked(p)) {
         match std::fs::read_dir(std::ffi::OsStr::from_bytes(&path)) {
             Ok(_) => now.push(path),
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) => drop(walk::DENIED.lock().unwrap().insert(path)),
-            Err(_) => {}
+            // Gone, or no longer a folder.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+            // Refused, locked, or a passing error: listed again, retried.
+            Err(_) => drop(walk::DENIED.lock().unwrap().insert(path)),
         }
     }
     now
@@ -939,8 +941,9 @@ mod tests {
         assert_eq!(lacked(&dir, "/Users/me", false), [b"/a".to_vec(), b"/b".to_vec()]);
     }
 
-    /// Only folders that read now are rescanned: not missing ones, and not
-    /// ones closed by plain permissions (FDA doesn't open those).
+    /// Only folders that read now are rescanned. A gone one is forgotten;
+    /// one that still fails for any other reason (refused, locked, a
+    /// passing error) stays listed, to be tried again.
     #[test]
     fn rescans_only_folders_that_read() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -951,10 +954,15 @@ mod tests {
         let mode = |p: &Path, m| std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(m)).unwrap();
         mode(&locked, 0o000);
         let b = |p: &Path| p.as_os_str().as_bytes().to_vec();
-        let now = readable_now(vec![b(&open), b(&dir.join("gone")), b(&locked)]);
+        std::fs::write(dir.join("file"), "").unwrap();
+        let now = readable_now(vec![b(&open), b(&dir.join("gone")), b(&locked), b(&dir.join("file"))]);
         mode(&locked, 0o755);
+        let kept = walk::DENIED.lock().unwrap().clone();
+        walk::DENIED.lock().unwrap().clear();
         assert_eq!(now, vec![b(&open)]);
-        assert!(walk::DENIED.lock().unwrap().is_empty(), "EACCES is not a privacy refusal");
+        assert!(kept.contains(&b(&locked)), "still failing: kept to try again");
+        assert!(!kept.contains(&b(&dir.join("gone"))));
+        assert!(!kept.contains(&b(&dir.join("file"))), "no longer a folder: gone");
     }
 
     #[test]
