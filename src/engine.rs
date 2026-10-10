@@ -393,7 +393,7 @@ fn rescan_unskipped(shared: &Shared) {
         if readable {
             now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 });
         } else {
-            walk::DENIED.lock().unwrap().push(path);
+            walk::DENIED.lock().unwrap().insert(path);
         }
     }
     if now.is_empty() {
