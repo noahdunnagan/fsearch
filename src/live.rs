@@ -20,13 +20,47 @@ pub struct OEnt {
     pub mask: u64,
     /// Location prior of the nearest folder the base knows (set on insert).
     pub prior: i8,
+    /// Its slot in `Live::flat` (set on insert).
+    slot: u32,
 }
 
 impl OEnt {
     /// `path` may be the whole path or just the name.
     pub fn new(path: &[u8], kind: u8, size: u64, mtime: u32) -> OEnt {
         let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-        OEnt { kind, size, mtime, mask: crate::index::name_mask(name), prior: 0 }
+        OEnt { kind, size, mtime, mask: crate::index::name_mask(name), prior: 0, slot: 0 }
+    }
+}
+
+/// The overlay laid out for searches: every entry's name mask in one array
+/// to scan (walking the map cost ~7 ns an entry, 0.35 ms a search at 50k
+/// entries), its path and value in the same slot. A removed entry's slot
+/// is reused; until then its mask is 0, which no name has.
+#[derive(Default)]
+pub struct Flat {
+    pub masks: Vec<u64>,
+    pub items: Vec<(Vec<u8>, OEnt)>,
+    free: Vec<u32>,
+}
+
+impl Flat {
+    fn set(&mut self, path: &[u8], e: OEnt) {
+        let s = e.slot as usize;
+        if s == self.masks.len() {
+            self.masks.push(0);
+            self.items.push((Vec::new(), e));
+        }
+        self.masks[s] = e.mask;
+        if self.items[s].0 != path {
+            self.items[s].0 = path.to_vec();
+        }
+        self.items[s].1 = e;
+    }
+
+    fn clear(&mut self, e: OEnt) {
+        self.masks[e.slot as usize] = 0;
+        self.items[e.slot as usize].0 = Vec::new();
+        self.free.push(e.slot);
     }
 }
 
@@ -35,6 +69,8 @@ pub struct Live {
     dead: Vec<u64>,
     pub dead_count: usize,
     pub over: BTreeMap<Vec<u8>, OEnt>,
+    /// `over` laid out for searches.
+    pub flat: Flat,
     /// Last FSEvents id fully applied.
     pub event_id: u64,
     /// Paths of directories added or removed since last drained; the
@@ -75,6 +111,7 @@ impl Live {
             dead: vec![0; words],
             dead_count: 0,
             over: BTreeMap::new(),
+            flat: Flat::default(),
             event_id,
             trees: Vec::new(),
             names_cache: Default::default(),
@@ -102,6 +139,11 @@ impl Live {
                 prior
             }
         };
+        e.slot = match self.over.get(&path) {
+            Some(old) => old.slot,
+            None => self.flat.free.pop().unwrap_or(self.flat.masks.len() as u32),
+        };
+        self.flat.set(&path, e);
         self.over.insert(path, e);
     }
 
@@ -129,11 +171,15 @@ impl Live {
     }
 
     fn drop_over_subtree(&mut self, path: &[u8]) {
-        self.over.remove(path);
+        if let Some(o) = self.over.remove(path) {
+            self.flat.clear(o);
+        }
         let (lo, hi) = subtree_bounds(path);
         let keys: Vec<Vec<u8>> = self.over.range(lo..hi).map(|(k, _)| k.clone()).collect();
         for k in keys {
-            self.over.remove(&k);
+            if let Some(o) = self.over.remove(&k) {
+                self.flat.clear(o);
+            }
         }
     }
 

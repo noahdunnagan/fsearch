@@ -474,7 +474,6 @@ pub struct DirMatch {
     best: [Option<i32>; 8],
 }
 
-/// Split on spaces, keeping "double quoted" runs together.
 /// The real path of `p` (the index holds real paths: /etc is
 /// /private/etc), or `p` if it has none. Resolving costs a few syscalls
 /// (~4 us), as much as a whole search in a small folder, and searches in
@@ -494,6 +493,7 @@ fn real_path(p: String) -> String {
     to
 }
 
+/// Split on spaces, keeping "double quoted" runs together.
 fn split_words(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     for c in s.chars() {
@@ -1089,6 +1089,9 @@ const BIN0: i32 = 256;
 const FIRST_BATCH: usize = 64;
 const LAST_BATCH: usize = 4096;
 const INLINE_NAMES: usize = 512;
+/// Overlay candidates a thread scores at a time (all of them on the calling
+/// thread if no more).
+const OVERLAY_CHUNK: usize = 256;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -1840,34 +1843,36 @@ impl Searcher<'_> {
         let now = now_secs();
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
         // A hit needs some positive token in its own name.
-        let cands: Vec<(&Vec<u8>, &crate::live::OEnt)> =
-            self.live.over.iter().filter(|(_, o)| pos.is_empty() || pos.iter().any(|t| t.fits(o.mask))).collect();
+        let flat = &self.live.flat;
+        let cands: Vec<&(Vec<u8>, crate::live::OEnt)> = flat
+            .masks
+            .iter()
+            .zip(&flat.items)
+            .filter(|&(&m, _)| m != 0 && (pos.is_empty() || pos.iter().any(|t| t.fits(m))))
+            .map(|(_, item)| item)
+            .collect();
         if cands.is_empty() {
             return Vec::new();
         }
         // Overlay entries cluster in a few busy folders: match each folder's
         // components once per folder, not per entry.
-        let mut hits: Vec<Hit> = cands
-            .par_iter()
-            .fold(
-                || (Vec::new(), HashMap::<&[u8], DirMatch, crate::index::Fx>::default()),
-                |(mut out, mut memo), &(path, o)| {
-                    let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
-                    let dir = &path[..cut];
-                    if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
-                        let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
-                        out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
-                    }
-                    (out, memo)
-                },
-            )
-            .map(|(out, _)| out)
-            .flatten_iter()
-            .collect();
-        if hits.len() > q.limit {
-            hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
-            hits.truncate(q.limit);
-        }
+        let score = |items: &[&(Vec<u8>, crate::live::OEnt)]| {
+            let mut memo = HashMap::<&[u8], DirMatch, crate::index::Fx>::default();
+            let mut out = Vec::new();
+            for &&(ref path, o) in items {
+                let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                let dir = &path[..cut];
+                if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
+                    let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
+                    out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
+                }
+            }
+            out
+        };
+        let mut hits = if cands.len() <= OVERLAY_CHUNK { score(&cands) } else { cands.par_chunks(OVERLAY_CHUNK).flat_map_iter(score).collect() };
+        // Best first, equal scores by path (the overlay map's order).
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
+        hits.truncate(q.limit);
         hits
     }
 
