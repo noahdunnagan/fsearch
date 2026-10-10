@@ -53,10 +53,12 @@ pub fn prune_denied() {
 }
 
 /// Set SKIP once, its entries normalized: trailing slashes trimmed (they
-/// still name the folder), empty ones dropped (they name nothing). False if
-/// it was already set.
+/// still name the folder), empty ones dropped (they name nothing). With
+/// nothing left to skip it stays unset (unset reads as Full Disk Access).
+/// False if nothing was set.
 pub fn set_skip(entries: Vec<Vec<u8>>) -> bool {
-    SKIP.set(entries.iter().filter(|e| !e.is_empty()).map(|e| crate::live::trim_dir(e).to_vec()).collect()).is_ok()
+    let entries: Vec<Vec<u8>> = entries.iter().filter(|e| !e.is_empty()).map(|e| crate::live::trim_dir(e).to_vec()).collect();
+    !entries.is_empty() && SKIP.set(entries).is_ok()
 }
 
 pub fn blocked(path: &[u8]) -> bool {
