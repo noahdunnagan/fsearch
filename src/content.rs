@@ -1,9 +1,11 @@
 //! Content search: a trigram index over the user's text files.
 //!
 //! Segments are immutable, mmap'd files: a doc table plus, per trigram, the
-//! ids of the docs containing it (delta varints). A query becomes an AND/OR
-//! of trigrams, the posting lists pick candidate files, and the candidates
-//! are read fresh from disk and matched for real. Results therefore never
+//! ids of the docs containing it (delta varints), and per doc bloom filters
+//! of its 5- and 7-byte substrings. A query becomes an AND/OR of trigrams,
+//! the posting lists pick candidate files, the bloom filters drop most of
+//! those that only contain the pattern's trigrams scattered about, and the
+//! rest are read fresh from disk and matched for real. Results therefore never
 //! show stale content; only candidate selection can trail a file written
 //! in the last couple of seconds.
 //!
@@ -29,7 +31,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG03";
+const MAGIC: &[u8; 8] = b"FSCSEG06";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -80,6 +82,8 @@ pub struct Segment {
     ntri1: usize,
     plen: usize,
     paths_len: usize,
+    nwords: usize,
+    nlong: usize,
     off: [usize; NS],
     dead: Vec<u64>,
     pub live_docs: usize,
@@ -96,11 +100,16 @@ enum S {
     Mtime,
     ByPath,
     Rank,
+    BloomOff,
+    Bloom,
+    LongOff,
+    Long,
 }
-const NS: usize = 9;
+const NS: usize = 13;
 
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs]
+#[rustfmt::skip]
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nlong: usize) -> [usize; NS] {
+    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, (ndocs + 1) * 4, nwords * 8, (ndocs + 1) * 4, nlong * 8]
 }
 
 impl Segment {
@@ -113,10 +122,32 @@ impl Segment {
     sec!(mtime, S::Mtime, u32, ndocs);
     sec!(by_path, S::ByPath, u32, ndocs);
     sec!(rank, S::Rank, i8, ndocs);
+    // Per doc, bloom filters of its GRAM-byte and LONG-byte substrings.
+    sec!(bloom_off, S::BloomOff, u32, ndocs1);
+    sec!(bloom, S::Bloom, u64, nwords);
+    sec!(long_off, S::LongOff, u32, ndocs1);
+    sec!(long, S::Long, u64, nlong);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
         &self.paths()[o[d as usize] as usize..o[d as usize + 1] as usize]
+    }
+
+    fn bloom_of(&self, d: u32) -> &[u64] {
+        let o = self.bloom_off();
+        &self.bloom()[o[d as usize] as usize..o[d as usize + 1] as usize]
+    }
+
+    fn long_of(&self, d: u32) -> &[u64] {
+        let o = self.long_off();
+        &self.long()[o[d as usize] as usize..o[d as usize + 1] as usize]
+    }
+
+    /// Can doc `d` hold every gram in `probes`, by its bloom filters?
+    fn may_contain(&self, d: u32, probes: &Probes) -> bool {
+        let has = |words: &[u64], h: u32| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0));
+        let (short, long) = (self.bloom_of(d), self.long_of(d));
+        probes.short.iter().all(|&h| has(short, h)) && probes.long.iter().all(|&h| has(long, h))
     }
 
     #[inline]
@@ -170,12 +201,34 @@ impl Segment {
         out
     }
 
-    fn postings(&self, tri: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        if let Ok(k) = self.tri_key().binary_search(&tri) {
-            self.list_into(k, &mut out);
+    fn list(&self, tri: u32) -> Option<List<'_>> {
+        let k = self.tri_key().binary_search(&tri).ok()?;
+        let o = self.tri_off();
+        let bytes = &self.post()[(o[k] & !BITSET) as usize..(o[k + 1] & !BITSET) as usize];
+        Some(if o[k] & BITSET != 0 { List::Bits(bytes) } else { List::Var(bytes) })
+    }
+
+    /// The live docs under `prefix` lie in this doc id range (exactly, for a
+    /// segment built from sorted paths; a superset after a merge, or when
+    /// most of the segment is under it). True if every doc is under it.
+    fn doc_range(&self, prefix: &[u8]) -> (std::ops::Range<u32>, bool) {
+        let bp = self.by_path();
+        let (Some(&first), Some(&last)) = (bp.first(), bp.last()) else { return (0..0, false) };
+        let (first, last) = (self.path(first), self.path(last));
+        if last < prefix || (first > prefix && !first.starts_with(prefix)) {
+            return (0..0, false);
         }
-        out
+        // Paths under the prefix are one run in path order.
+        if first.starts_with(prefix) && last.starts_with(prefix) {
+            return (0..self.ndocs as u32, true);
+        }
+        let a = bp.partition_point(|&d| self.path(d) < prefix);
+        let z = a + bp[a..].partition_point(|&d| self.path(d).starts_with(prefix));
+        if (z - a) * 2 > bp.len() {
+            return (0..self.ndocs as u32, false);
+        }
+        let (lo, hi) = bp[a..z].iter().fold((u32::MAX, 0), |(lo, hi), &d| (lo.min(d), hi.max(d + 1)));
+        (lo.min(hi)..hi, false)
     }
 
     fn list_into(&self, k: usize, out: &mut Vec<u32>) {
@@ -203,8 +256,8 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = unsafe { Mmap::map(&f) }.ok()?;
-        let [ndocs, ntri, plen, paths_len] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len));
+        let [ndocs, ntri, plen, paths_len, nwords, nlong] = fields(&map, MAGIC)?.map(|v| v as usize);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nlong));
         if map.len() < total {
             return None;
         }
@@ -215,7 +268,7 @@ impl Segment {
             }
         }
         let live_docs = ndocs - dead.iter().map(|w| w.count_ones() as usize).sum::<usize>();
-        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, off, dead, live_docs })
+        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, nlong, off, dead, live_docs })
     }
 
     fn save_dead(&self, dir: &Path) {
@@ -282,6 +335,63 @@ fn trigrams_small(s: &[u8]) -> Vec<u32> {
     t.sort_unstable();
     t.dedup();
     t
+}
+
+/// Bloom filters hold a doc's case-folded substrings of this many bytes: a
+/// match holds all of its pattern's grams, so a doc missing one of them
+/// can't match even if it has every trigram.
+const GRAM: usize = 5;
+/// A second filter holds the longer ones: it rules out a doc that has a
+/// word nearly like the pattern (multiplier for multipliers) and the rest
+/// of its grams elsewhere (suppliers), which every 5-gram check passes.
+const LONG: usize = 7;
+
+/// A gram's 24-bit hash (its folded bytes, big-endian in the low 40 bits).
+#[inline]
+fn gram_hash(g: u64) -> u32 {
+    (g.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as u32
+}
+
+/// The two bits a gram hash sets in a bloom filter of `words` u64s.
+#[inline]
+fn bloom_bits(h: u32, words: usize) -> [usize; 2] {
+    let at = |h: u32| ((h as u64 * words as u64 * 64) >> 24) as usize;
+    [at(h), at(h.wrapping_mul(0x9E37_79B1) & 0xFF_FFFF)]
+}
+
+/// Distinct hashes of a buffer's `n`-byte grams, into `out` (cleared).
+/// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
+fn grams(buf: &[u8], n: usize, seen: &mut [u64], out: &mut Vec<u32>) {
+    out.clear();
+    let mut g = 0u64;
+    for (i, &b) in buf.iter().enumerate() {
+        g = (g << 8 | fold(b) as u64) & ((1 << (8 * n)) - 1);
+        if i + 1 >= n {
+            let h = gram_hash(g);
+            let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
+            if seen[w] & bit == 0 {
+                seen[w] |= bit;
+                out.push(h);
+            }
+        }
+    }
+    for &h in out.iter() {
+        seen[(h >> 6) as usize] = 0;
+    }
+}
+
+/// Append a bloom filter of these gram hashes to `out`: `bits` per gram, two
+/// set per gram, in whole words. A gram the doc lacks still passes 24% of
+/// the time at three bits, 40% at two.
+fn bloom(hashes: &[u32], bits: usize, out: &mut Vec<u64>) {
+    let words = (hashes.len() * bits).div_ceil(64);
+    let at = out.len();
+    out.resize(at + words, 0);
+    for &h in hashes {
+        for b in bloom_bits(h, words) {
+            out[at + b / 64] |= 1 << (b % 64);
+        }
+    }
 }
 
 /// Keywords a definition starts with (`sym:` search).
@@ -383,17 +493,32 @@ struct DocMeta<'a> {
     size: u64,
     mtime: u32,
     rank: i8,
+    bloom: &'a [u64],
+    long: &'a [u64],
 }
 
-/// One rayon split's output: trigrams and definition keys of its docs,
-/// flat, plus where each doc's runs start. Reuses one read buffer and one
-/// 2 MiB seen-set.
+/// One rayon split's output: trigrams, definition keys and bloom filters of
+/// its docs, flat, plus where each doc's runs are. Reuses one read buffer
+/// and one 2 MiB seen-set.
 struct Split {
     seen: Vec<u64>,
     buf: Vec<u8>,
+    hashes: Vec<u32>,
     flat: Vec<u32>,
     syms: Vec<u32>,
-    docs: Vec<(usize, u32, u32, bool, u32, u32)>, // (doc, tri start, len, is_text, sym start, len)
+    blooms: Vec<u64>,
+    longs: Vec<u64>,
+    docs: Vec<SplitDoc>,
+}
+
+/// Where one doc's runs are in its split.
+struct SplitDoc {
+    i: usize,
+    text: bool,
+    tri: std::ops::Range<usize>,
+    sym: std::ops::Range<usize>,
+    bloom: std::ops::Range<usize>,
+    long: std::ops::Range<usize>,
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
@@ -405,24 +530,39 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         .into_par_iter()
         .with_min_len(256)
         .fold(
-            || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), syms: Vec::new(), docs: Vec::new() },
+            || Split {
+                seen: vec![0u64; (1 << 24) / 64],
+                buf: Vec::new(),
+                hashes: Vec::new(),
+                flat: Vec::new(),
+                syms: Vec::new(),
+                blooms: Vec::new(),
+                longs: Vec::new(),
+                docs: Vec::new(),
+            },
             |mut sp, i| {
                 sp.buf.clear();
-                let ok = open_regular(docs.path(i))
+                let text = open_regular(docs.path(i))
                     .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
                     .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
-                let (start, sym) = (sp.flat.len() as u32, sp.syms.len() as u32);
-                if ok {
+                let (tri, sym, bl, lo) = (sp.flat.len(), sp.syms.len(), sp.blooms.len(), sp.longs.len());
+                if text {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
                     symbols(&sp.buf, &mut sp.syms);
+                    grams(&sp.buf, GRAM, &mut sp.seen, &mut sp.hashes);
+                    bloom(&sp.hashes, 3, &mut sp.blooms);
+                    grams(&sp.buf, LONG, &mut sp.seen, &mut sp.hashes);
+                    bloom(&sp.hashes, 2, &mut sp.longs);
                 }
-                sp.docs.push((i, start, sp.flat.len() as u32 - start, ok, sym, sp.syms.len() as u32 - sym));
+                let (bloom, long) = (bl..sp.blooms.len(), lo..sp.longs.len());
+                sp.docs.push(SplitDoc { i, text, tri: tri..sp.flat.len(), sym: sym..sp.syms.len(), bloom, long });
                 sp
             },
         )
         .map(|mut sp| {
             sp.seen = Vec::new();
             sp.buf = Vec::new();
+            sp.hashes = Vec::new();
             sp
         })
         .collect();
@@ -431,20 +571,20 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let meta: Vec<DocMeta> = order
         .iter()
         .map(|&(si, k)| {
-            let (i, _, _, text, _, _) = splits[si].docs[k];
-            let (_, _, size, mtime) = docs.items[i];
-            DocMeta { path: docs.path(i), size, mtime, rank: if text { doc_rank(docs.path(i)) } else { NOT_TEXT } }
+            let sd = &splits[si].docs[k];
+            let (_, _, size, mtime) = docs.items[sd.i];
+            let rank = if sd.text { doc_rank(docs.path(sd.i)) } else { NOT_TEXT };
+            let (bloom, long) = (&splits[si].blooms[sd.bloom.clone()], &splits[si].longs[sd.long.clone()]);
+            DocMeta { path: docs.path(sd.i), size, mtime, rank, bloom, long }
         })
         .collect();
     let tris = |d: usize| {
         let (si, k) = order[d];
-        let (_, st, len, _, _, _) = splits[si].docs[k];
-        &splits[si].flat[st as usize..(st + len) as usize]
+        &splits[si].flat[splits[si].docs[k].tri.clone()]
     };
     let syms = |d: usize| {
         let (si, k) = order[d];
-        let (_, _, _, _, st, len) = splits[si].docs[k];
-        &splits[si].syms[st as usize..(st + len) as usize]
+        &splits[si].syms[splits[si].docs[k].sym.clone()]
     };
     // Definition keys sort after every trigram (they're above 2^24), so they
     // follow the trigrams as sorted (key, doc) pairs in either build.
@@ -520,7 +660,8 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
         for d in 0..s.ndocs as u32 {
             if !s.is_dead(d) {
                 r[d as usize] = meta.len() as u32;
-                meta.push(DocMeta { path: s.path(d), size: s.size()[d as usize], mtime: s.mtime()[d as usize], rank: s.rank()[d as usize] });
+                let (size, mtime, rank) = (s.size()[d as usize], s.mtime()[d as usize], s.rank()[d as usize]);
+                meta.push(DocMeta { path: s.path(d), size, mtime, rank, bloom: s.bloom_of(d), long: s.long_of(d) });
             }
         }
         remap.push(r);
@@ -587,9 +728,17 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
+    let (mut bloom_off, mut long_off) = (vec![0u32], vec![0u32]);
+    let (mut blooms, mut longs) = (Vec::new(), Vec::new());
+    for d in docs {
+        blooms.extend_from_slice(d.bloom);
+        bloom_off.push(blooms.len() as u32);
+        longs.extend_from_slice(d.long);
+        long_off.push(longs.len() as u32);
+    }
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len()));
-    let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64]);
+    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), longs.len()));
+    let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64, blooms.len() as u64, longs.len() as u64]);
     let sections: [&[u8]; NS] = [
         as_bytes(&keys),
         as_bytes(&tri_off),
@@ -600,6 +749,10 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         as_bytes(&mtime),
         as_bytes(&by_path),
         as_bytes(&rank),
+        as_bytes(&bloom_off),
+        as_bytes(&blooms),
+        as_bytes(&long_off),
+        as_bytes(&longs),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -651,6 +804,19 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
         return false;
     }
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
+}
+
+/// Does the name query let every indexed doc under its scope (if any)
+/// through: no words, extensions, ranges or patterns? Then a segment wholly
+/// in scope needn't be checked doc by doc.
+fn only_scope(q: &Query) -> bool {
+    q.tokens.is_empty()
+        && q.kind_ok(KIND_FILE)
+        && q.exts.is_empty()
+        && q.size == (0, u64::MAX)
+        && q.mtime == (0, u32::MAX)
+        && q.name_re.is_none()
+        && q.path_re.is_none()
 }
 
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.
@@ -744,6 +910,11 @@ impl Content {
                 s.save_dead(&self.dir);
             }
         }
+        let empty: Vec<u64> = self.segs.iter().filter(|s| s.live_docs == 0).map(|s| s.id).collect();
+        if !empty.is_empty() {
+            self.drop_segments(&empty);
+            self.save_manifest();
+        }
         todo.sort();
         todo
     }
@@ -783,7 +954,12 @@ impl Content {
     /// Tiered merging: 8 segments of the same size tier become one, so
     /// incremental updates never pile up thousands of tiny segments. Returns
     /// the group to merge (ids), capped so a merge's postings stay small.
+    /// First, a segment whose docs were mostly replaced is rewritten alone:
+    /// every query decodes the postings of its dead docs too.
     pub fn merge_plan(&self) -> Option<Vec<u64>> {
+        if let Some(s) = self.segs.iter().find(|s| s.live_docs > 0 && s.live_docs * 2 < s.ndocs) {
+            return Some(vec![s.id]);
+        }
         let tier = |s: &Segment| (s.plen.max(1) as f64).log(4.0) as u32;
         let mut by_tier: HashMap<u32, Vec<&Segment>> = HashMap::new();
         for s in &self.segs {
@@ -805,46 +981,225 @@ impl Content {
         self.segs.iter().filter(|s| ids.contains(&s.id)).collect()
     }
 
-    /// Swap merged segments for their replacement. Only the content worker
-    /// writes, so nothing was tombstoned while the merge ran.
+    /// Swap merged segments for their replacement, where the first of them
+    /// was (a rewritten segment keeps its place in the ranking's tie order).
+    /// Only the content worker writes, so nothing was tombstoned while the
+    /// merge ran.
     pub fn replace(&mut self, ids: &[u64], seg: Segment) {
+        let at = self.segs.iter().position(|s| ids.contains(&s.id)).unwrap_or(self.segs.len());
+        self.drop_segments(ids);
+        self.segs.insert(at, seg);
+        self.save_manifest();
+    }
+
+    fn drop_segments(&mut self, ids: &[u64]) {
         self.segs.retain(|s| !ids.contains(&s.id));
         for id in ids {
             let _ = std::fs::remove_file(seg_path(&self.dir, *id));
             let _ = std::fs::remove_file(dead_path(&self.dir, *id));
         }
-        self.segs.push(seg);
-        self.save_manifest();
     }
 
-    /// Candidate docs for a pattern, filtered by the name query.
-    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<(usize, u32)> {
-        // Your files before dot-dirs/logs, then most recently modified first;
-        // ties in segment, then doc order. Packed so the sort compares ints.
-        let mut out: Vec<(u64, u32, u32)> = self
-            .segs
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(si, s)| {
-                let ids = eval(s, plan).unwrap_or_else(|| (0..s.ndocs as u32).collect());
-                let (rank, mtime) = (s.rank(), s.mtime());
-                ids.into_iter()
-                    .filter(move |&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
-                    .filter(move |&d| filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                    .map(move |d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, si as u32, d))
-                    .collect::<Vec<_>>()
+    /// Candidate docs for a pattern, filtered by the name query: one list
+    /// per segment searched, with its `FIRST` best-ranked in front
+    /// (unordered).
+    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
+        // A scope narrows each segment to the doc range holding its paths.
+        let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
+        let only_scope = only_scope(filt);
+        let work: Vec<(usize, std::ops::Range<u32>, bool)> = (self.segs.iter().enumerate())
+            .filter(|(_, s)| s.live_docs > 0)
+            .map(|(si, s)| {
+                let (docs, whole) = prefix.as_ref().map_or((0..s.ndocs as u32, true), |p| s.doc_range(p));
+                (si, docs, !(only_scope && whole))
             })
+            .filter(|(_, docs, _)| !docs.is_empty())
             .collect();
-        out.par_sort_unstable();
-        out.into_iter().map(|(_, si, d)| (si as usize, d)).collect()
+        let one = |(si, docs, check): &(usize, std::ops::Range<u32>, bool)| {
+            let (s, check) = (&self.segs[*si], *check);
+            let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
+            let (rank, mtime) = (s.rank(), s.mtime());
+            let mut v: Vec<Ranked> = Vec::with_capacity(ids.len());
+            v.extend(
+                ids.into_iter()
+                    .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
+                    .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d)),
+            );
+            if v.len() > FIRST {
+                v.select_nth_unstable(FIRST);
+            }
+            v
+        };
+        // About a lane per 50k docs to search: a small index is done on this
+        // thread before a helper would wake.
+        let docs: usize = work.iter().map(|(_, docs, _)| docs.len()).sum();
+        par_claim(&work, (docs / 50_000).clamp(1, work.len().max(1)), one)
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
-        let plan = g.plan();
-        let cands = self.candidates(&plan, filt);
-        let paths: Vec<&[u8]> = cands.iter().map(|&(si, d)| self.segs[si].path(d)).collect();
-        verify(g, &paths, filt.limit)
+        let mut per = self.candidates(&g.plan(), filt);
+        let total = per.iter().map(Vec::len).sum();
+        // A candidate whose bloom filter lacks one of the pattern's grams
+        // can't match: skip it without opening the file.
+        let probes = g.probes();
+        let path = |&(_, si, d): &Ranked| {
+            let s = &self.segs[si as usize];
+            s.may_contain(d, &probes).then(|| s.path(d))
+        };
+        // Most searches are done within the best few hundred candidates:
+        // rank those first, and the rest only if reading gets that far.
+        let t = std::time::Instant::now();
+        let best = take_best(&mut per);
+        let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
+        if r.files.len() < filt.limit && done == best.len() && best.len() < total {
+            let mut rest: Vec<Ranked> = per.concat();
+            rest.par_sort_unstable();
+            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), READERS, t, |i| path(&rest[i]));
+            r.files.extend(more.files);
+            r.read += more.read;
+            r.complete = more.complete;
+        }
+        r.candidates = total;
+        r
     }
+}
+
+/// A candidate's place in the ranking, packed so sorting compares ints: your
+/// files before dot-dirs/logs, then most recently modified first; ties in
+/// segment, then doc order. Then its segment and doc.
+type Ranked = (u64, u32, u32);
+
+/// Candidates ranked in the first round.
+const FIRST: usize = 512;
+
+/// `items.iter().map(f).collect()` on `lanes` lanes (see `run_lanes`): each
+/// claims the next item.
+fn par_claim<T: Sync, R: Send>(items: &[T], lanes: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let next = AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    run_lanes(lanes, &|| {
+        let mut mine = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(x) = items.get(i) else { break };
+            mine.push((i, f(x)));
+        }
+        out.lock().unwrap().extend(mine);
+    });
+    let mut out = out.into_inner().unwrap();
+    out.sort_unstable_by_key(|r| r.0);
+    out.into_iter().map(|r| r.1).collect()
+}
+
+/// One search's lanes, shared with the helper threads.
+struct Lanes {
+    n: usize,
+    next: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicUsize,
+    panicked: std::sync::atomic::AtomicBool,
+    /// The search's job, its lifetime erased: it is only run for a lane
+    /// claimed below `n`, and `run_lanes` returns after all of those end.
+    job: *const (dyn Fn() + Sync),
+}
+
+// Safety: `job` is Sync and outlives every call (see the field).
+unsafe impl Send for Lanes {}
+unsafe impl Sync for Lanes {}
+
+impl Lanes {
+    fn work(&self) {
+        use std::sync::atomic::Ordering::*;
+        while self.next.fetch_add(1, Relaxed) < self.n {
+            let job = std::panic::AssertUnwindSafe(|| unsafe { (*self.job)() });
+            if std::panic::catch_unwind(job).is_err() {
+                self.panicked.store(true, Relaxed);
+            }
+            self.done.fetch_add(1, Release);
+        }
+    }
+}
+
+/// Threads that help searches: the latest search's lanes, and a bell.
+struct Helpers {
+    latest: std::sync::Mutex<(u64, Option<std::sync::Arc<Lanes>>)>,
+    bell: std::sync::Condvar,
+}
+
+fn helpers() -> &'static Helpers {
+    static H: std::sync::OnceLock<&'static Helpers> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let h: &'static Helpers = Box::leak(Box::new(Helpers { latest: Default::default(), bell: Default::default() }));
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get()).max(SCAN_READERS);
+        for i in 1..n {
+            let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
+                // Someone is waiting: keep off the slow cores and out of the
+                // throttled IO tiers, and never download iCloud placeholders.
+                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                crate::no_materialize();
+                let mut seen = 0;
+                loop {
+                    let lanes = {
+                        let mut g = h.latest.lock().unwrap();
+                        while g.0 == seen {
+                            g = h.bell.wait(g).unwrap();
+                        }
+                        seen = g.0;
+                        g.1.clone()
+                    };
+                    if let Some(l) = lanes {
+                        l.work();
+                    }
+                }
+            });
+            if spawned.is_err() {
+                break;
+            }
+        }
+        h
+    })
+}
+
+/// Run `job` on `n` lanes at once, this thread taking lanes too, and return
+/// when all are done. A lane goes to whichever thread claims it first, so
+/// this never waits on a helper still waking up (~0.1 ms when they sleep):
+/// one that wakes late finds no lane left.
+fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+    if n <= 1 {
+        return job();
+    }
+    let h = helpers();
+    let job: *const (dyn Fn() + Sync + '_) = job;
+    // Safety: see `Lanes::job`; the wait below is what makes it hold.
+    let job: *const (dyn Fn() + Sync + 'static) = unsafe { std::mem::transmute(job) };
+    let lanes = std::sync::Arc::new(Lanes { n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panicked: AtomicBool::new(false), job });
+    {
+        let mut g = h.latest.lock().unwrap();
+        g.0 += 1;
+        g.1 = Some(lanes.clone());
+    }
+    for _ in 1..n {
+        h.bell.notify_one();
+    }
+    lanes.work();
+    while lanes.done.load(Acquire) < n {
+        std::thread::yield_now();
+    }
+    assert!(!lanes.panicked.load(Relaxed), "a search lane panicked");
+}
+
+/// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
+/// with its own best in front), in order.
+fn take_best(per: &mut [Vec<Ranked>]) -> Vec<Ranked> {
+    let mut top: Vec<Ranked> = per.iter_mut().flat_map(|v| v.drain(..v.len().min(FIRST))).collect();
+    if top.len() > FIRST {
+        top.select_nth_unstable(FIRST);
+        per[0].extend(top.drain(FIRST..));
+    }
+    top.sort_unstable();
+    top
 }
 
 /// What the name index says should be indexed under `dir` (direct
@@ -910,7 +1265,12 @@ pub struct Grep {
     pub max_per_file: usize,
     /// Stop reading candidates after this long (None = read them all).
     pub budget: Option<std::time::Duration>,
-    re: Regex,
+    /// The matching regex, compiled when first needed (a plain ASCII
+    /// literal mostly isn't: `literal` finds it).
+    re: std::sync::OnceLock<Regex>,
+    src: String,
+    case_insensitive: bool,
+    literal: Option<Literal>,
 }
 
 impl Grep {
@@ -924,13 +1284,54 @@ impl Grep {
             // DFA path even in files with non-ASCII text.
             GrepMode::Symbol => format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?{}(?-u:\b)", regex::escape(pattern)),
         };
-        let re = RegexBuilder::new(&src)
-            .case_insensitive(smart_ci && mode != GrepMode::Symbol)
-            .multi_line(true)
-            .size_limit(1 << 26)
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Grep { pattern: pattern.to_string(), mode, max_per_file: 5, budget: Some(std::time::Duration::from_millis(250)), re })
+        let case_insensitive = smart_ci && mode != GrepMode::Symbol;
+        let short = (1..=4096).contains(&pattern.len());
+        let literal = match mode {
+            GrepMode::Symbol if short => Some(Literal::Definition(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned())),
+            GrepMode::Literal if short && pattern.is_ascii() => Some(match case_insensitive {
+                true => Literal::folded(pattern.as_bytes()),
+                false => Literal::Exact(memchr::memmem::Finder::new(pattern.as_bytes()).into_owned()),
+            }),
+            _ => None,
+        };
+        let g = Grep {
+            pattern: pattern.to_string(),
+            mode,
+            max_per_file: 5,
+            budget: Some(std::time::Duration::from_millis(250)),
+            re: std::sync::OnceLock::new(),
+            src,
+            case_insensitive,
+            literal,
+        };
+        if g.literal.is_none() {
+            g.re.set(g.build()?).ok();
+        }
+        Ok(g)
+    }
+
+    fn build(&self) -> Result<Regex, String> {
+        RegexBuilder::new(&self.src).case_insensitive(self.case_insensitive).multi_line(true).size_limit(1 << 26).build().map_err(|e| e.to_string())
+    }
+
+    fn re(&self) -> &Regex {
+        // A literal's regex always compiles (it was 4096 bytes at most).
+        self.re.get_or_init(|| self.build().expect("literal regex"))
+    }
+
+    /// Hashes of the grams every match holds (see `GRAM` and `LONG`).
+    fn probes(&self) -> Probes {
+        if self.mode == GrepMode::Regex {
+            return Probes::default();
+        }
+        let of = |n: usize| {
+            let mut out: Vec<u32> =
+                self.pattern.as_bytes().windows(n).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        Probes { short: of(GRAM), long: of(LONG) }
     }
 
     fn plan(&self) -> TQ {
@@ -944,6 +1345,13 @@ impl Grep {
     }
 }
 
+/// A pattern's gram hashes, for docs' bloom filters.
+#[derive(Default)]
+struct Probes {
+    short: Vec<u32>,
+    long: Vec<u32>,
+}
+
 #[derive(Default)]
 pub struct GrepResult {
     pub files: Vec<FileMatches>,
@@ -953,24 +1361,30 @@ pub struct GrepResult {
     pub complete: bool,
 }
 
-/// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
-/// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
-/// 16), so candidate reads get their own small pool.
-fn read_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .thread_name(|i| format!("fsearch-read-{i}"))
-            .start_handler(|_| {
-                // Someone is waiting on these reads: keep them off the slow
-                // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
-                crate::no_materialize()
-            })
-            .build()
-            .unwrap()
-    })
+/// Threads reading candidates (the searching one and helpers): file opens on
+/// this Mac stop scaling past ~4 (Endpoint Security clients tax every open;
+/// measured on hot files: 7.5 us/file at 4 threads, 9 at 8, 14 at 12).
+const READERS: usize = 4;
+/// Folders outside the index (`in:/etc`) are read with more threads: their
+/// files are mostly small and not in the page cache, so reads wait on the
+/// disk more than on the open() tax.
+const SCAN_READERS: usize = 8;
+
+/// Run `f` with this thread never downloading iCloud placeholders (as the
+/// helper threads), then restore its policy.
+fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
+    unsafe extern "C" {
+        fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    }
+    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
+    let prior = unsafe { getiopolicy_np(3, 1) };
+    crate::no_materialize();
+    let r = f();
+    if prior >= 0 {
+        unsafe { setiopolicy_np(3, 1, prior) };
+    }
+    r
 }
 
 pub struct FileMatches {
@@ -978,33 +1392,62 @@ pub struct FileMatches {
     pub lines: Vec<(usize, String)>,
 }
 
-/// Read candidates in rank order, in parallel batches, until `limit` files
-/// have matched or the time budget is spent (best-ranked results first, so a
-/// cut-short search still returns the ones you most likely wanted).
+/// Read candidates in rank order until `limit` files have matched or the
+/// time budget is spent (best-ranked results first, so a cut-short search
+/// still returns the ones you most likely wanted). Each read thread claims
+/// the next unread candidate, so the files read are always a prefix of the
+/// ranking and reading stops as soon as the `limit`th match is in.
 pub fn verify(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize) -> GrepResult {
-    let t = std::time::Instant::now();
-    let mut r = GrepResult { candidates: paths.len(), ..Default::default() };
-    let mut at = 0;
-    let mut batch = 64;
-    while at < paths.len() && r.files.len() < limit {
-        if g.budget.is_some_and(|b| t.elapsed() > b) {
-            break;
+    verify_from(g, paths.len(), limit, SCAN_READERS, std::time::Instant::now(), |i| Some(paths[i].as_ref())).0
+}
+
+/// `verify` over `n` candidates with `readers` threads, `path(i)` giving the
+/// i-th, or None if the index already rules it out; the budget counts from
+/// `t`. Also returns how many candidates it got through.
+fn verify_from<'a>(
+    g: &Grep,
+    n: usize,
+    limit: usize,
+    readers: usize,
+    t: std::time::Instant,
+    path: impl Fn(usize) -> Option<&'a [u8]> + Sync,
+) -> (GrepResult, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let (next, found, read) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let hits = std::sync::Mutex::new(Vec::new());
+    let work = || {
+        while found.load(Relaxed) < limit && g.budget.is_none_or(|b| t.elapsed() <= b) {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break;
+            }
+            let Some(p) = path(i) else { continue };
+            read.fetch_add(1, Relaxed);
+            if let Some(m) = match_file(g, p) {
+                found.fetch_add(1, Relaxed);
+                hits.lock().unwrap().push((i, m));
+            }
         }
-        let end = (at + batch).min(paths.len());
-        let found: Vec<Option<FileMatches>> = read_pool().install(|| paths[at..end].par_iter().map(|p| match_file(g, p.as_ref())).collect());
-        r.read += end - at;
-        r.files.extend(found.into_iter().flatten());
-        at = end;
-        batch = (batch * 2).min(1024);
-    }
-    r.complete = at >= paths.len() || r.files.len() >= limit;
-    r.files.truncate(limit);
-    r
+        // Don't sit on a big file's worth of buffer between searches.
+        READ_BUF.with_borrow_mut(|b| {
+            if b.capacity() > 256 << 10 {
+                *b = Vec::new();
+            }
+        });
+    };
+    without_materializing(|| run_lanes(readers, &work));
+    let mut hits = hits.into_inner().unwrap();
+    hits.sort_unstable_by_key(|h| h.0);
+    hits.truncate(limit);
+    let done = next.into_inner().min(n);
+    let complete = done == n || hits.len() >= limit;
+    (GrepResult { files: hits.into_iter().map(|h| h.1).collect(), candidates: n, read: read.into_inner(), complete }, done)
 }
 
 thread_local! {
     /// One read buffer per read-pool thread: a fresh ~1 MB Vec per file
-    /// costs page faults and an munmap every time.
+    /// costs page faults and an munmap every time. Kept only while a search
+    /// runs if it grew past 256 KB.
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1016,26 +1459,148 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
         if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
             return None;
         }
-        let mut lines = Vec::new();
-        let (mut line_no, mut counted) = (1usize, 0usize);
-        let mut last_line_start = usize::MAX;
-        for m in g.re.find_iter(buf) {
-            line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
-            counted = m.start();
-            let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
-            if ls == last_line_start {
-                continue;
-            }
-            last_line_start = ls;
-            let le = memchr::memchr(b'\n', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p);
-            let text = String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string();
-            lines.push((line_no, text));
-            if lines.len() >= g.max_per_file {
-                break;
-            }
-        }
+        let lines = match g.literal.as_ref().filter(|l| !l.needs_regex(buf)) {
+            Some(l) => lines_at(g, buf, l.starts(buf)),
+            None => lines_at(g, buf, g.re().find_iter(buf).map(|m| m.start())),
+        };
         (!lines.is_empty()).then(|| FileMatches { path: path.to_vec(), lines })
     })
+}
+
+/// The first `max_per_file` lines holding a match (by where matches start),
+/// numbered, as shown.
+fn lines_at(g: &Grep, buf: &[u8], starts: impl Iterator<Item = usize>) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let (mut line_no, mut counted) = (1usize, 0usize);
+    let mut last_line_start = usize::MAX;
+    for start in starts {
+        line_no += memchr::memchr_iter(b'\n', &buf[counted..start]).count();
+        counted = start;
+        let ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
+        if ls == last_line_start {
+            continue;
+        }
+        last_line_start = ls;
+        let le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
+        lines.push((line_no, String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string()));
+        if lines.len() >= g.max_per_file {
+            break;
+        }
+    }
+    lines
+}
+
+/// An ASCII literal pattern, found without a regex: its exact bytes (it has
+/// an upper-case letter), or else its letters in either case. That is what
+/// the case-insensitive regex matches too, but for two non-ASCII letters it
+/// folds onto ASCII ones (ſ for s, the Kelvin sign for k): a file holding
+/// one of those goes to the regex.
+enum Literal {
+    Exact(memchr::memmem::Finder<'static>),
+    /// A `sym:` name: as a whole word after a declaring keyword on its line
+    /// (the definition regex, with its keyword part compiled once).
+    Definition(memchr::memmem::Finder<'static>),
+    Folded {
+        needle: Vec<u8>,
+        pair: (usize, usize),
+        odd: Vec<memchr::memmem::Finder<'static>>,
+    },
+}
+
+impl Literal {
+    fn folded(pattern: &[u8]) -> Literal {
+        let needle: Vec<u8> = pattern.iter().map(|&b| fold(b)).collect();
+        // Scan for the two rarest bytes first.
+        let common = |b: u8| match b {
+            b' ' | b'e' | b't' | b'a' | b'o' | b'i' | b'n' | b's' | b'r' => 3,
+            b'h' | b'l' | b'd' | b'c' | b'u' | b'm' | b'\n' | b'\t' => 2,
+            b'f' | b'p' | b'g' | b'w' | b'y' | b'b' | b'.' | b',' | b'_' | b'(' | b')' | b'"' | b'=' | b'0'..=b'9' => 1,
+            _ => 0,
+        };
+        let mut by_rarity: Vec<usize> = (0..needle.len()).collect();
+        by_rarity.sort_by_key(|&i| (common(needle[i]), i));
+        let (a, b) = (by_rarity[0], *by_rarity.get(1).unwrap_or(&by_rarity[0]));
+        let odd = [(b's', "\u{17F}"), (b'k', "\u{212A}")].iter().filter(|(c, _)| needle.contains(c));
+        let odd = odd.map(|(_, u)| memchr::memmem::Finder::new(u.as_bytes()).into_owned()).collect();
+        Literal::Folded { needle, pair: (a.min(b), a.max(b)), odd }
+    }
+
+    fn needs_regex(&self, hay: &[u8]) -> bool {
+        matches!(self, Literal::Folded { odd, .. } if odd.iter().any(|f| f.find(hay).is_some()))
+    }
+
+    /// Where its matches start, left to right.
+    fn starts<'a>(&'a self, hay: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+        let len = match self {
+            Literal::Exact(f) | Literal::Definition(f) => f.needle().len(),
+            Literal::Folded { needle, .. } => needle.len(),
+        };
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            loop {
+                let p = match self {
+                    Literal::Exact(f) | Literal::Definition(f) => f.find(hay.get(at..)?).map(|p| at + p),
+                    Literal::Folded { needle, pair, .. } => find_folded(hay, at, needle, *pair),
+                }?;
+                if !matches!(self, Literal::Definition(_)) {
+                    at = p + len;
+                    return Some(p);
+                }
+                at = p + 1;
+                if defined_at(hay, p, len) {
+                    return Some(p);
+                }
+            }
+        })
+    }
+}
+
+/// Is the name at `hay[p..p + len]` defined there: an ASCII word boundary
+/// after it, and before it on its line a declaring keyword, maybe generics,
+/// spaces or `*&`, maybe `mut` (what `sym:`'s regex asks, split at the name)?
+fn defined_at(hay: &[u8], p: usize, len: usize) -> bool {
+    static KEYWORD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let word = |b: Option<&u8>| b.is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_');
+    if word(hay[..p + len].last()) == word(hay.get(p + len)) {
+        return false;
+    }
+    let re = KEYWORD.get_or_init(|| Regex::new(&format!(r"(?-u:\b)(?:{DEFINES})(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?\z")).unwrap());
+    let line = memchr::memrchr(b'\n', &hay[..p]).map_or(0, |i| i + 1);
+    re.is_match(&hay[line..p])
+}
+
+/// The first place at or after `from` where `hay` holds `needle` (lower
+/// case) in either case; `pair` are two positions of rare bytes in it, the
+/// ones checked first.
+fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> Option<usize> {
+    let k = needle.len();
+    let last = hay.len().checked_sub(k)?;
+    let at = |c: usize| hay[c..c + k].iter().zip(needle).all(|(&x, &y)| fold(x) == y);
+    let mut i = from;
+    #[cfg(target_arch = "aarch64")]
+    // Safety: every load reads 16 bytes at i + pair.1 at most, and the loop
+    // keeps i + 16 <= last + 1, so they end by hay.len().
+    unsafe {
+        use std::arch::aarch64::*;
+        let (c1, c2) = (needle[pair.0], needle[pair.1]);
+        let case = |c: u8| vdupq_n_u8(if c.is_ascii_lowercase() { 0x20 } else { 0 });
+        let (v1, v2, m1, m2) = (vdupq_n_u8(c1), vdupq_n_u8(c2), case(c1), case(c2));
+        while i + 16 <= last + 1 {
+            let p = hay.as_ptr().add(i);
+            let eq = vandq_u8(vceqq_u8(vorrq_u8(vld1q_u8(p.add(pair.0)), m1), v1), vceqq_u8(vorrq_u8(vld1q_u8(p.add(pair.1)), m2), v2));
+            // Four bits per byte lane.
+            let mut bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(eq))));
+            while bits != 0 {
+                let c = i + (bits.trailing_zeros() / 4) as usize;
+                if at(c) {
+                    return Some(c);
+                }
+                bits &= !(0xF << ((c - i) * 4));
+            }
+            i += 16;
+        }
+    }
+    (i..=last).find(|&c| at(c))
 }
 
 /// A trigram query: which docs could possibly match.
@@ -1054,28 +1619,151 @@ fn literal_plan(s: &[u8]) -> TQ {
     TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect())
 }
 
-/// Docs matching `q` in a segment; None means "every doc".
-fn eval(s: &Segment, q: &TQ) -> Option<Vec<u32>> {
+/// A posting list as stored.
+#[derive(Clone, Copy)]
+enum List<'a> {
+    /// Bit d: doc d has the trigram.
+    Bits(&'a [u8]),
+    /// Ascending doc ids as delta varints.
+    Var(&'a [u8]),
+}
+
+/// Decodes a delta-varint list.
+struct Varints<'a> {
+    b: &'a [u8],
+    last: u32,
+}
+
+impl Iterator for Varints<'_> {
+    type Item = u32;
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        let x = *self.b.first()?;
+        let (v, n) = if x < 0x80 { (x as u32, 1) } else { varint(self.b) };
+        self.b = &self.b[n..];
+        self.last += v;
+        Some(self.last)
+    }
+}
+
+impl List<'_> {
+    /// Append its docs within `docs`, ascending.
+    fn decode(self, docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
+        match self {
+            List::Bits(b) => and_bits(&[b], docs, out),
+            List::Var(b) => out.extend(Varints { b, last: 0 }.skip_while(|&d| d < docs.start).take_while(|&d| d < docs.end)),
+        }
+    }
+
+    /// Keep the docs of `acc` (ascending) that are in the list.
+    fn retain(self, acc: &mut Vec<u32>) {
+        match self {
+            List::Bits(b) => acc.retain(|&d| b.get(d as usize / 8).is_some_and(|x| x >> (d % 8) & 1 != 0)),
+            List::Var(b) => {
+                let mut it = Varints { b, last: 0 };
+                let mut cur = it.next();
+                acc.retain(|&d| {
+                    while cur.is_some_and(|c| c < d) {
+                        cur = it.next();
+                    }
+                    cur == Some(d)
+                });
+            }
+        }
+    }
+}
+
+/// Append the docs within `docs` set in every bitset, ascending.
+fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
+    let end = (docs.end as usize).div_ceil(8).min(lists.iter().map(|l| l.len()).min().unwrap_or(0));
+    // A list's 64 docs from byte i (none past its end).
+    let word = |l: &[u8], i: usize| match l.get(i..i + 8) {
+        Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+        None => l[i..].iter().rev().fold(0, |w, &b| w << 8 | b as u64),
+    };
+    let mut i = docs.start as usize / 8;
+    while i < end {
+        let mut w = u64::MAX;
+        for l in lists {
+            w &= word(l, i);
+            if w == 0 {
+                break;
+            }
+        }
+        while w != 0 {
+            let d = i as u32 * 8 + w.trailing_zeros();
+            if docs.contains(&d) {
+                out.push(d);
+            }
+            w &= w - 1;
+        }
+        i += 8;
+    }
+}
+
+/// Docs within `docs` matching `q` in a segment, ascending; None means
+/// every doc. An AND starts from its shortest list and only tests the
+/// others, so common trigrams' long lists are never decoded in full.
+fn eval(s: &Segment, q: &TQ, docs: std::ops::Range<u32>) -> Option<Vec<u32>> {
     match q {
         TQ::All => None,
-        TQ::Tri(t) => Some(s.postings(*t)),
+        TQ::Tri(t) => {
+            let mut out = Vec::new();
+            if let Some(l) = s.list(*t) {
+                l.decode(docs, &mut out);
+            }
+            Some(out)
+        }
         TQ::And(qs) => {
-            let mut lists: Vec<Vec<u32>> = qs.iter().filter_map(|q| eval(s, q)).collect();
-            lists.sort_by_key(Vec::len);
-            let mut it = lists.into_iter();
-            let mut acc = it.next()?;
-            for l in it {
-                if acc.is_empty() {
+            let (mut bits, mut vars, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+            for q in qs {
+                match q {
+                    TQ::Tri(t) => match s.list(*t) {
+                        Some(List::Bits(b)) => bits.push(b),
+                        Some(List::Var(b)) => vars.push(b),
+                        None => return Some(Vec::new()),
+                    },
+                    TQ::All => {}
+                    q => rest.push(q),
+                }
+            }
+            vars.sort_by_key(|b| b.len());
+            let mut acc = None;
+            if let Some((first, vars)) = vars.split_first() {
+                let mut v = Vec::new();
+                List::Var(first).decode(docs.clone(), &mut v);
+                for &b in &bits {
+                    List::Bits(b).retain(&mut v);
+                }
+                for &b in vars {
+                    if v.is_empty() {
+                        break;
+                    }
+                    List::Var(b).retain(&mut v);
+                }
+                acc = Some(v);
+            } else if !bits.is_empty() {
+                let mut v = Vec::new();
+                and_bits(&bits, docs.clone(), &mut v);
+                acc = Some(v);
+            }
+            for q in rest {
+                if acc.as_ref().is_some_and(Vec::is_empty) {
                     break;
                 }
-                acc = intersect(&acc, &l);
+                if let Some(r) = eval(s, q, docs.clone()) {
+                    acc = Some(match acc {
+                        Some(a) => intersect(&a, &r),
+                        None => r,
+                    });
+                }
             }
-            Some(acc)
+            acc
         }
         TQ::Or(qs) => {
             let mut acc: Vec<u32> = Vec::new();
             for q in qs {
-                acc.extend(eval(s, q)?);
+                acc.extend(eval(s, q, docs.clone())?);
             }
             acc.sort_unstable();
             acc.dedup();
@@ -1101,22 +1789,64 @@ fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-/// What a regex fragment tells us: either a small set of exact strings it
-/// can match, or just a trigram query every match must satisfy.
+/// What a regex fragment tells us about its matches, as small sets of
+/// (case-folded) strings: every match is one of `exact`, starts with one of
+/// `prefix` and ends with one of `suffix` (None: no small such set); and
+/// every doc holding a match satisfies `q`.
 struct Info {
-    exact: Option<Vec<Vec<u8>>>,
+    exact: Option<Set>,
+    prefix: Option<Set>,
+    suffix: Option<Set>,
     q: TQ,
 }
 
+type Set = Vec<Vec<u8>>;
+
 const MAX_EXACT: usize = 16;
 
-/// What a fragment's exact set requires of a doc (All when there is no set,
-/// or a string in it is too short to have a trigram).
-fn exact_query(set: Option<Vec<Vec<u8>>>) -> TQ {
-    match set {
-        Some(set) if set.iter().all(|s| s.len() >= 3) => TQ::Or(set.iter().map(|s| literal_plan(s)).collect()),
-        _ => TQ::All,
+impl Info {
+    fn exact(set: Set) -> Info {
+        Info { exact: Some(set.clone()), prefix: Some(set.clone()), suffix: Some(set), q: TQ::All }
     }
+
+    fn any() -> Info {
+        Info { exact: None, prefix: None, suffix: None, q: TQ::All }
+    }
+
+    /// All it says about a doc, as one trigram query.
+    fn query(self) -> TQ {
+        match self.exact {
+            Some(_) => and(self.q, exact_query(self.exact)),
+            None => and(and(self.q, exact_query(self.prefix)), exact_query(self.suffix)),
+        }
+    }
+}
+
+/// Every string of `a` followed by one of `b`, if that's few enough.
+fn cross(a: &Option<Set>, b: &Option<Set>) -> Option<Set> {
+    let (a, b) = (a.as_ref()?, b.as_ref()?);
+    if a.len() * b.len() > MAX_EXACT {
+        return None;
+    }
+    let mut set: Set = a.iter().flat_map(|x| b.iter().map(move |y| [x.as_slice(), y].concat())).collect();
+    set.sort();
+    set.dedup();
+    Some(set)
+}
+
+/// What a set of strings requires of a doc: one of them (All when there is
+/// no set, it is empty, or a string in it is too short to have a trigram).
+/// Trigrams all of them share are required once, not per string.
+fn exact_query(set: Option<Set>) -> TQ {
+    let Some(set) = set.filter(|set| !set.is_empty() && set.iter().all(|s| s.len() >= 3)) else { return TQ::All };
+    let tris: Vec<Vec<u32>> = set.iter().map(|s| trigrams_small(s)).collect();
+    let common: Vec<u32> = tris[0].iter().copied().filter(|t| tris.iter().all(|ts| ts.binary_search(t).is_ok())).collect();
+    let rest: Vec<TQ> = tris.iter().map(|ts| TQ::And(ts.iter().filter(|t| !common.contains(t)).map(|&t| TQ::Tri(t)).collect())).collect();
+    let mut q = TQ::And(common.into_iter().map(TQ::Tri).collect());
+    if rest.iter().all(|r| !matches!(r, TQ::And(v) if v.is_empty())) {
+        q = and(q, TQ::Or(rest));
+    }
+    q
 }
 
 fn and(a: TQ, b: TQ) -> TQ {
@@ -1135,78 +1865,94 @@ fn and(a: TQ, b: TQ) -> TQ {
 }
 
 fn info(h: &Hir) -> Info {
-    let all = || Info { exact: None, q: TQ::All };
     match h.kind() {
-        HirKind::Empty | HirKind::Look(_) => Info { exact: Some(vec![Vec::new()]), q: TQ::All },
-        HirKind::Literal(l) => Info { exact: Some(vec![l.0.iter().map(|&b| fold(b)).collect()]), q: TQ::All },
-        HirKind::Class(c) => {
-            // Up to 8 members: each is an exact string.
-            let mut set: Vec<Vec<u8>> = match c {
-                Class::Unicode(u) => {
-                    u.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|ch| ch.to_string().bytes().map(fold).collect()).collect()
-                }
-                Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|x| vec![fold(x)]).collect(),
-            };
-            if set.len() > 8 {
-                return all();
-            }
-            set.sort();
-            set.dedup();
-            Info { exact: Some(set), q: TQ::All }
-        }
+        HirKind::Empty | HirKind::Look(_) => Info::exact(vec![Vec::new()]),
+        HirKind::Literal(l) => Info::exact(vec![l.0.iter().map(|&b| fold(b)).collect()]),
+        HirKind::Class(c) => class(c),
         HirKind::Capture(c) => info(&c.sub),
         HirKind::Repetition(r) => {
             if r.min == 0 {
-                return all();
+                return Info::any();
             }
             let i = info(&r.sub);
             if r.min == 1 && r.max == Some(1) {
                 return i;
             }
-            // At least one copy must appear.
-            Info { exact: None, q: and(i.q, exact_query(i.exact)) }
+            // At least one copy, which starts it; one ends it.
+            Info { q: and(i.q, exact_query(i.exact)), exact: None, prefix: i.prefix, suffix: i.suffix }
         }
-        HirKind::Concat(hs) => {
-            let mut cur = Info { exact: Some(vec![Vec::new()]), q: TQ::All };
-            for h in hs {
-                let n = info(h);
-                cur = match (cur.exact, n.exact) {
-                    (Some(a), Some(b)) if a.len() * b.len() <= MAX_EXACT => {
-                        let mut set: Vec<Vec<u8>> = a.iter().flat_map(|x| b.iter().map(move |y| [x.as_slice(), y].concat())).collect();
-                        set.sort();
-                        set.dedup();
-                        Info { exact: Some(set), q: and(cur.q, n.q) }
-                    }
-                    (a, b) => {
-                        let q = and(and(cur.q, exact_query(a)), n.q);
-                        match b {
-                            Some(b) if b.len() <= MAX_EXACT => Info { exact: Some(b), q },
-                            b => Info { exact: None, q: and(q, exact_query(b)) },
-                        }
-                    }
-                };
-            }
-            cur
-        }
+        HirKind::Concat(hs) => hs.iter().map(info).fold(Info::exact(vec![Vec::new()]), concat),
         HirKind::Alternation(hs) => {
             let parts: Vec<Info> = hs.iter().map(info).collect();
-            if parts.iter().all(|p| p.exact.is_some()) {
-                let mut set: Vec<Vec<u8>> = parts.iter().flat_map(|p| p.exact.clone().unwrap()).collect();
+            let union = |f: fn(&Info) -> &Option<Set>| {
+                let mut set = Set::new();
+                for p in &parts {
+                    set.extend(f(p).clone()?);
+                }
                 set.sort();
                 set.dedup();
-                if set.len() <= MAX_EXACT {
-                    return Info { exact: Some(set), q: TQ::All };
-                }
+                (set.len() <= MAX_EXACT).then_some(set)
+            };
+            let (exact, prefix, suffix) = (union(|p| &p.exact), union(|p| &p.prefix), union(|p| &p.suffix));
+            if exact.is_some() {
+                return Info { exact, prefix, suffix, q: TQ::All };
             }
-            let ors: Vec<TQ> = parts.into_iter().map(|p| and(p.q, exact_query(p.exact))).collect();
-            if ors.iter().any(|q| matches!(q, TQ::All)) { all() } else { Info { exact: None, q: TQ::Or(ors) } }
+            let ors: Vec<TQ> = parts.into_iter().map(Info::query).collect();
+            let q = if ors.iter().any(|q| matches!(q, TQ::All)) { TQ::All } else { TQ::Or(ors) };
+            Info { exact, prefix, suffix, q }
         }
     }
 }
 
+/// Up to 8 members are each an exact string; with more, their first bytes,
+/// if few (`\s`: tab to CR, space, and four UTF-8 lead bytes), start it.
+fn class(c: &Class) -> Info {
+    let mut set: Set = match c {
+        Class::Unicode(u) => {
+            u.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|ch| ch.to_string().bytes().map(fold).collect()).collect()
+        }
+        Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).take(9).map(|x| vec![fold(x)]).collect(),
+    };
+    if set.len() <= 8 {
+        set.sort();
+        set.dedup();
+        return Info::exact(set);
+    }
+    let lead = |c: char| c.to_string().as_bytes()[0];
+    let mut first: Vec<u8> = match c {
+        Class::Unicode(u) => u.ranges().iter().flat_map(|r| lead(r.start())..=lead(r.end())).map(fold).collect(),
+        Class::Bytes(b) => b.ranges().iter().flat_map(|r| r.start()..=r.end()).map(fold).collect(),
+    };
+    first.sort();
+    first.dedup();
+    Info { prefix: (first.len() <= MAX_EXACT).then(|| first.into_iter().map(|b| vec![b]).collect()), ..Info::any() }
+}
+
+/// `a` then `b`. A match holds a's suffix right before b's prefix; that
+/// pairing is carried up in the prefix or suffix when one side is exact,
+/// else required here.
+fn concat(a: Info, b: Info) -> Info {
+    let exact = cross(&a.exact, &b.exact);
+    let ab_prefix = a.exact.as_ref().and(cross(&a.exact, &b.prefix));
+    let ab_suffix = b.exact.as_ref().and(cross(&a.suffix, &b.exact));
+    let mut q = and(a.q, b.q);
+    if exact.is_none() && ab_prefix.is_none() && ab_suffix.is_none() {
+        q = match cross(&a.suffix, &b.prefix) {
+            Some(j) => and(q, exact_query(Some(j))),
+            None => {
+                let sa = if a.exact.is_none() { exact_query(a.suffix.clone()) } else { TQ::All };
+                let pb = if b.exact.is_none() { exact_query(b.prefix.clone()) } else { TQ::All };
+                and(and(q, sa), pb)
+            }
+        };
+    }
+    let prefix = if a.exact.is_some() { ab_prefix.or(a.exact) } else { a.prefix };
+    let suffix = if b.exact.is_some() { ab_suffix.or(b.exact) } else { b.suffix };
+    Info { exact, prefix, suffix, q }
+}
+
 fn regex_plan(h: &Hir) -> TQ {
-    let i = info(h);
-    and(i.q, exact_query(i.exact))
+    info(h).query()
 }
 
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
