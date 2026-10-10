@@ -486,13 +486,10 @@ struct DocMeta<'a> {
     bloom: &'a [u64],
 }
 
-/// One rayon split's output: trigrams, definition keys and bloom filters of
-/// its docs, flat, plus where each doc's runs are. Reuses one read buffer
-/// and one 2 MiB seen-set.
+/// One run of docs' output: trigrams, definition keys and bloom filters,
+/// flat, plus where each doc's runs are.
+#[derive(Default)]
 struct Split {
-    seen: Vec<u64>,
-    buf: Vec<u8>,
-    hashes: Vec<u32>,
     flat: Vec<u32>,
     syms: Vec<u32>,
     blooms: Vec<u64>,
@@ -512,42 +509,40 @@ struct SplitDoc {
 /// to be text are recorded with no trigrams.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
     use std::io::Read;
-    let splits: Vec<Split> = range
-        .clone()
-        .into_par_iter()
-        .with_min_len(256)
-        .fold(
-            || Split {
-                seen: vec![0u64; (1 << 24) / 64],
-                buf: Vec::new(),
-                hashes: Vec::new(),
-                flat: Vec::new(),
-                syms: Vec::new(),
-                blooms: Vec::new(),
-                docs: Vec::new(),
-            },
-            |mut sp, i| {
-                sp.buf.clear();
-                let text = open_regular(docs.path(i))
-                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
+    // Docs in runs of 256, a run on one thread with its next 8 files open
+    // and their reads started (`open_ahead`): on a cold cache those reads
+    // overlap the work on earlier files. A read buffer and a 2 MiB seen-set
+    // go back to a pool after each run, so a build holds one per thread.
+    const RUN: usize = 256;
+    const AHEAD: usize = 8;
+    let scratch = std::sync::Mutex::new(Vec::new());
+    let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
+    let splits: Vec<Split> = (runs.into_par_iter())
+        .map(|run| {
+            let (mut seen, mut buf, mut hashes) =
+                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; (1 << 24) / 64], Vec::new(), Vec::new()));
+            let mut sp = Split::default();
+            let mut ahead = std::collections::VecDeque::new();
+            for i in run.clone() {
+                while ahead.len() <= AHEAD && i + ahead.len() < run.end {
+                    ahead.push_back(open_ahead(docs.path(i + ahead.len())));
+                }
+                buf.clear();
+                let text = (ahead.pop_front().flatten())
+                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut buf).ok())
+                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &buf[..n.min(8192)]).is_none());
                 let (tri, sym, bl) = (sp.flat.len(), sp.syms.len(), sp.blooms.len());
                 if text {
-                    trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
-                    symbols(&sp.buf, &mut sp.syms);
-                    grams(&sp.buf, GRAM, &mut sp.seen, &mut sp.hashes);
+                    trigrams(&buf, &mut seen, &mut sp.flat);
+                    symbols(&buf, &mut sp.syms);
+                    grams(&buf, GRAM, &mut seen, &mut hashes);
                     // Big files are candidates far more often (per byte of
                     // filter too): three bits a gram for them, two for others.
-                    bloom(&sp.hashes, if sp.buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
+                    bloom(&hashes, if buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
                 }
                 sp.docs.push(SplitDoc { i, text, tri: tri..sp.flat.len(), sym: sym..sp.syms.len(), bloom: bl..sp.blooms.len() });
-                sp
-            },
-        )
-        .map(|mut sp| {
-            sp.seen = Vec::new();
-            sp.buf = Vec::new();
-            sp.hashes = Vec::new();
+            }
+            scratch.lock().unwrap().push((seen, buf, hashes));
             sp
         })
         .collect();
@@ -2102,8 +2097,24 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 /// "don't materialize dataless files" policy keeps iCloud placeholders from
 /// being downloaded just because we searched.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
+    open_sized(path).map(|(f, _)| f)
+}
+
+/// `open_regular`, and the file's size.
+fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+    let m = f.metadata().ok()?;
+    m.is_file().then_some((f, m.len()))
+}
+
+/// `open_regular` for a file about to be indexed, telling the kernel to
+/// start reading it now (as much as indexing reads).
+fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let (f, len) = open_sized(path)?;
+    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
+    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    Some(f)
 }
