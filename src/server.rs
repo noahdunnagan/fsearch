@@ -22,16 +22,27 @@ pub fn check_socket(dir: &Path) -> Result<(), String> {
     if n > 103 { Err(format!("socket path too long ({n} bytes, at most 103): {}", sock.display())) } else { Ok(()) }
 }
 
+/// The login agent's launchd label.
+pub const LABEL: &str = "mt.nd.fsearch";
+
+/// The socket lock, or None if another daemon holds it. The login agent's
+/// daemon stops a stray one (say, started on first use mid-install) and
+/// takes over: giving way, launchd would respawn it over and over.
+fn take_socket_lock(dir: &Path, as_agent: bool) -> Option<std::fs::File> {
+    // Opened without truncating: a loser must not wipe the owner's pid.
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")).ok()?;
+    (try_lock(&lock) || (as_agent && stop(dir).is_ok() && try_lock(&lock))).then_some(lock)
+}
+
 pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
-    // Opened without truncating: a loser must not wipe the owner's pid.
-    let Ok(mut lock) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")) else { return };
-    if !try_lock(&lock) {
+    let as_agent = std::env::var("XPC_SERVICE_NAME").is_ok_and(|n| n == LABEL);
+    let Some(mut lock) = take_socket_lock(&dir, as_agent) else {
         eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
         return;
-    }
+    };
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
@@ -748,6 +759,24 @@ mod tests {
         drop(held);
         assert!(r.is_err());
         assert!(alive, "signalled a non-daemon fsearch process");
+    }
+
+    /// A stray daemon (started on first use, say mid-install) holds the
+    /// lock: a plain second daemon gives way, but the login agent's stops it
+    /// and takes over (giving way, launchd would respawn it forever).
+    #[test]
+    fn the_agents_daemon_takes_over_from_a_stray() {
+        let dir = root().join("agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        let mut c = holder(&path);
+        assert!(take_socket_lock(&dir, false).is_none());
+        assert!(c.try_wait().unwrap().is_none(), "a plain daemon leaves it running");
+        let got = take_socket_lock(&dir, true);
+        let _ = c.kill();
+        assert!(got.is_some(), "the agent's daemon takes the lock");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
 
     /// The lock's holder hasn't written its pid yet, and the file still

@@ -72,7 +72,7 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
-const LABEL: &str = "mt.nd.fsearch";
+use server::LABEL;
 
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
