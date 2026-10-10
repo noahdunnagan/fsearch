@@ -205,12 +205,14 @@ impl Live {
                 continue;
             }
             let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
-            let was_dir = match cur.get(name) {
-                Some(Some(c)) => self.base.kind()[*c as usize] & 3 == KIND_DIR,
-                Some(None) => self.over.get(&join(&f.path, name)).is_some_and(|o| o.kind & 3 == KIND_DIR),
-                None => false,
+            // Scanned now unless it stays the same shape of folder (a mount
+            // point that's gone, too, comes back as a folder to list).
+            let was = match cur.get(name) {
+                Some(Some(c)) => Some(shape(self.base.kind()[*c as usize])),
+                Some(None) => self.over.get(&join(&f.path, name)).map(|o| shape(o.kind)),
+                None => None,
             };
-            if !was_dir {
+            if was != Some(shape(r.kind)) {
                 let child = join(&f.path, name);
                 let ls = walk::scan(&child, 4);
                 f.scans.insert(child, ls);
@@ -846,7 +848,11 @@ mod tests {
             comps.iter().enumerate().map(|(i, c)| crate::index::tests::lst(i as u32, &[(c, KIND_DIR, 0, i as u32 + 1)])).collect();
         ls.push(crate::index::tests::lst(k, &[(b"d", KIND_DIR | FLAG_MOUNT, 0, NONE)]));
         let mut live = Live::new(Index::build(ls, 0, 0, b""));
-        live.apply_dir(root, false);
+        // Its contents are scanned in fetch (under the read lock), not in
+        // apply under the write lock.
+        let f = live.fetch(root, false);
+        assert!(f.scans.contains_key(&join(root, b"d")), "d scanned ahead");
+        live.apply(f);
         let inner = join(&join(root, b"d"), b"inner.txt");
         assert!(live.over.contains_key(&inner), "d's contents after it was unmounted");
     }
