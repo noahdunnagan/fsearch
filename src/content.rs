@@ -31,7 +31,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG04";
+const MAGIC: &[u8; 8] = b"FSCSEG05";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -135,10 +135,7 @@ impl Segment {
     /// Can doc `d` hold every gram in `probes`, by its bloom filter?
     fn may_contain(&self, d: u32, probes: &[u32]) -> bool {
         let words = self.bloom_of(d);
-        probes.iter().all(|&h| {
-            let b = bloom_bit(h, words.len());
-            words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0)
-        })
+        probes.iter().all(|&h| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0)))
     }
 
     #[inline]
@@ -339,10 +336,11 @@ fn gram_hash(g: u64) -> u32 {
     (g.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as u32
 }
 
-/// Where a gram hash lands in a bloom filter of `words` u64s.
+/// The two bits a gram hash sets in a bloom filter of `words` u64s.
 #[inline]
-fn bloom_bit(h: u32, words: usize) -> usize {
-    ((h as u64 * words as u64 * 64) >> 24) as usize
+fn bloom_bits(h: u32, words: usize) -> [usize; 2] {
+    let at = |h: u32| ((h as u64 * words as u64 * 64) >> 24) as usize;
+    [at(h), at(h.wrapping_mul(0x9E37_79B1) & 0xFF_FFFF)]
 }
 
 /// Distinct gram hashes of a buffer, into `out` (cleared). `seen` is a
@@ -366,16 +364,17 @@ fn grams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
     }
 }
 
-/// Append a bloom filter of these gram hashes to `out`: two bits per gram
-/// (a gram the doc lacks still passes 39% of the time; one bit, 63%), in
-/// whole words.
+/// Append a bloom filter of these gram hashes to `out`: three bits per gram
+/// and two set per gram (a gram the doc lacks still passes 24% of the time;
+/// at two bits and one set, 39%), in whole words.
 fn bloom(hashes: &[u32], out: &mut Vec<u64>) {
-    let words = (hashes.len() * 2).div_ceil(64);
+    let words = (hashes.len() * 3).div_ceil(64);
     let at = out.len();
     out.resize(at + words, 0);
     for &h in hashes {
-        let b = bloom_bit(h, words);
-        out[at + b / 64] |= 1 << (b % 64);
+        for b in bloom_bits(h, words) {
+            out[at + b / 64] |= 1 << (b % 64);
+        }
     }
 }
 
