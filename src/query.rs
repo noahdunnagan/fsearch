@@ -800,6 +800,49 @@ impl TopK {
     }
 }
 
+/// `f(state, i)` for each `i` in `0..n`, results in order, on the pool: the
+/// calling thread starts at once, taking items in order from a shared
+/// counter; one helper is queued, and each helper once running queues the
+/// next before it takes items too. Threads asleep wake one after another off
+/// the caller's path, and a helper that runs after the items are gone (the
+/// caller runs any still queued when it is done) returns at once: no one
+/// waits for a thread to wake, and no thread sits on a share of the work
+/// while it does. `state` is each thread's scratch.
+fn par_each<S, T: Send + Sync>(n: usize, state: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> T + Sync) -> Vec<T> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let out: Vec<std::sync::OnceLock<T>> = (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut st = state();
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break;
+            }
+            let _ = out[i].set(f(&mut st, i));
+        }
+    };
+    // Helpers still to queue (each one queues the next).
+    let left = AtomicUsize::new((rayon::current_num_threads() - 1).min(n.saturating_sub(1)));
+    fn helper<'s>(s: &rayon::Scope<'s>, left: &'s AtomicUsize, next: &'s AtomicUsize, n: usize, work: &'s (dyn Fn() + Sync)) {
+        s.spawn(move |s| {
+            if next.load(Relaxed) < n {
+                if left.fetch_sub(1, Relaxed) > 1 {
+                    helper(s, left, next, n, work);
+                }
+                work();
+            }
+        });
+    }
+    rayon::scope(|s| {
+        if left.load(Relaxed) > 0 {
+            helper(s, &left, &next, n, &work);
+        }
+        work();
+    });
+    out.into_iter().map(|x| x.into_inner().unwrap()).collect()
+}
+
 /// Top `k` over `0..n` items with keys above `floor`: a few contiguous
 /// pieces per thread, each with its own heap, then one selection over their
 /// survivors (merging heaps pairwise costs more than the scan when `k` is
@@ -1470,12 +1513,16 @@ impl Searcher<'_> {
         let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
         spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
         let scratch = || vec![Line([(0, 0, 0); 2]); toks.len()];
+        let chunks = bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare);
         let out: Vec<(Vec<NameHit>, usize)> = if few {
-            let (chunks, mut per) = (bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare), scratch());
+            let mut per = scratch();
             chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h, &mut per)).collect()
         } else {
-            let chunks = bits.par_chunks_mut(CHUNK_WORDS).zip(rank.par_chunks_mut(CHUNK_WORDS)).zip(spare);
-            chunks.enumerate().map_init(scratch, |per, (c, ((b, r), h))| chunk(c, b, r, h, per)).collect()
+            let slots: Vec<_> = chunks.map(|x| std::sync::Mutex::new(Some(x))).collect();
+            par_each(slots.len(), scratch, |per, c| {
+                let ((b, r), h) = slots[c].lock().unwrap().take().unwrap();
+                chunk(c, b, r, h, per)
+            })
         };
         let ok_entries = out.iter().map(|c| c.1).sum();
         let hits: Vec<Vec<NameHit>> = out.into_iter().map(|c| c.0).collect();
