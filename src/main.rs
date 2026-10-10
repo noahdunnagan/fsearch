@@ -184,9 +184,13 @@ fn bench(qs: &str) {
         let first = |f: &fsearch::FileMatches| f.lines.first().map_or(String::new(), |(n, t)| format!("{n}: {}", t.trim()));
         r.files.iter().map(|f| format!("{}:{}", String::from_utf8_lossy(&f.path), first(f))).collect()
     };
+    // Between runs, another name search: a repeat would be answered from
+    // the names cache, which only a repeat of the last query hits.
+    let other = query::Query::parse("zzzzzz", &home).unwrap();
     let mut times = Vec::new();
     let mut out = Vec::new();
     for _ in 0..20 {
+        pool.install(|| query::Searcher { live: &live }.search(&other));
         let t = Instant::now();
         out = run();
         times.push(t.elapsed());
