@@ -304,6 +304,9 @@ impl Live {
         for (name, c) in cur {
             self.remove_child(&join(&p, &name), c);
         }
+        // A child that changed shape was removed and re-added: resync once.
+        self.trees.sort();
+        self.trees.dedup();
         Applied::Done
     }
 
@@ -864,6 +867,10 @@ mod tests {
         let f = live.fetch(root, false);
         assert!(f.scans.contains_key(&join(root, b"d")), "d scanned ahead");
         live.apply(f);
+        // Removed and re-added, but resynced once.
+        let mut t = live.trees.clone();
+        t.dedup();
+        assert_eq!(t.len(), live.trees.len(), "{:?}", live.trees);
         let inner = join(&join(root, b"d"), b"inner.txt");
         assert!(live.over.contains_key(&inner), "d's contents after it was unmounted");
     }
