@@ -159,7 +159,7 @@ impl Engine {
             }
         };
         if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
+            walk::set_skip(skip);
         }
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -365,12 +365,13 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
 const SKIPPED: &str = "skipped";
 
 fn note_skipped(dir: &Path) {
+    walk::prune_denied();
     let mut out = Vec::new();
     for p in walk::SKIP.get().into_iter().flatten().chain(walk::DENIED.lock().unwrap().iter()) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
-    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+    if let Err(e) = crate::index::write_atomic(&dir.join(SKIPPED), &out) {
         log(format!("save failed: {e}"));
     }
 }
@@ -393,7 +394,7 @@ fn rescan_unskipped(shared: &Shared) {
         if readable {
             now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 });
         } else {
-            walk::DENIED.lock().unwrap().push(path);
+            walk::DENIED.lock().unwrap().insert(path);
         }
     }
     if now.is_empty() {
@@ -422,7 +423,9 @@ const GATED_IN_HOME: &[&str] = &[
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
-    GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+    // However home is written: "/Users/me/" would give "//Desktop".
+    let home = crate::live::trim_dir(home.as_bytes());
+    GATED_IN_HOME.iter().map(|d| crate::live::join(home, d.as_bytes())).chain([b"/Volumes".to_vec()]).collect()
 }
 
 /// The system TCC database is readable only with Full Disk Access, and
@@ -457,7 +460,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
                 for (d, t) in std::iter::once(first).chain(rx.try_iter()) {
                     for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
                         // Most of the disk's churn (Library, caches) is outside the indexed area.
-                        if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
+                        if content::follows(&key.0, key.1, &home) {
                             pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                         }
                     }
@@ -532,16 +535,15 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     let started = crate::query::now_secs();
     let ls = walk::scan(b"/", SCAN_THREADS);
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    if let Err(e) = idx.save(&path) {
+    let n = idx.n;
+    let (idx, saved) = idx.persist(&shared.dir.join("index.bin"));
+    if let Err(e) = saved {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
+    log(format!("indexed {n} entries in {:.2?}", t.elapsed()));
     release_memory();
-    // Re-map from the file so the index is clean, evictable page cache
-    // rather than anonymous memory.
-    Index::load(&path).unwrap_or(idx)
+    idx
 }
 
 unsafe extern "C" {
@@ -562,12 +564,11 @@ fn compact(shared: &Shared) {
         (live.to_listings(), live.event_id, live.synced_at)
     };
     let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    if let Err(e) = idx.save(&path) {
+    let (idx, saved) = idx.persist(&shared.dir.join("index.bin"));
+    if let Err(e) = saved {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    let idx = Index::load(&path).unwrap_or(idx);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
     release_memory();
