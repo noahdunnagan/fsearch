@@ -850,9 +850,9 @@ impl TopK {
 /// caller runs any still queued when it is done) returns at once: no one
 /// waits for a thread to wake, and no thread sits on a share of the work
 /// while it does. `state` is each thread's scratch.
-fn par_each<S, T: Send + Sync>(n: usize, state: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> T + Sync) -> Vec<T> {
+fn par_each<S, T: Send>(n: usize, state: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> T + Sync) -> Vec<T> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let out: Vec<std::sync::OnceLock<T>> = (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    let out = Cells::new((0..n).map(|_| None));
     let next = AtomicUsize::new(0);
     let work = || {
         let mut st = state();
@@ -861,7 +861,8 @@ fn par_each<S, T: Send + Sync>(n: usize, state: impl Fn() -> S + Sync, f: impl F
             if i >= n {
                 break;
             }
-            let _ = out[i].set(f(&mut st, i));
+            // Safety: the counter hands each index to one thread only.
+            unsafe { out.set(i, Some(f(&mut st, i))) };
         }
     };
     // Helpers still to queue (each one queues the next).
@@ -882,7 +883,33 @@ fn par_each<S, T: Send + Sync>(n: usize, state: impl Fn() -> S + Sync, f: impl F
         }
         work();
     });
-    out.into_iter().map(|x| x.into_inner().unwrap()).collect()
+    out.0.into_iter().map(|x| x.into_inner().unwrap()).collect()
+}
+
+/// One value per index that threads read and write without locks: each
+/// index belongs to one thread at a time (in `par_each`, the one the
+/// counter handed it to).
+struct Cells<T>(Vec<std::cell::UnsafeCell<T>>);
+
+unsafe impl<T: Send> Sync for Cells<T> {}
+
+impl<T> Cells<T> {
+    fn new(v: impl Iterator<Item = T>) -> Cells<T> {
+        Cells(v.map(std::cell::UnsafeCell::new).collect())
+    }
+
+    /// Safety: no other thread uses index `i` meanwhile.
+    unsafe fn set(&self, i: usize, v: T) {
+        unsafe { *self.0[i].get() = v };
+    }
+
+    /// Safety: no other thread uses index `i` meanwhile.
+    unsafe fn take(&self, i: usize) -> T
+    where
+        T: Default,
+    {
+        unsafe { std::mem::take(&mut *self.0[i].get()) }
+    }
 }
 
 /// Top `k` over `0..n` items with keys above `floor`: a few contiguous
@@ -1563,9 +1590,10 @@ impl Searcher<'_> {
             let mut per = scratch();
             chunks.enumerate().map(|(c, ((b, r), h))| chunk(c, b, r, h, &mut per)).collect()
         } else {
-            let slots: Vec<_> = chunks.map(|x| std::sync::Mutex::new(Some(x))).collect();
-            par_each(slots.len(), scratch, |per, c| {
-                let ((b, r), h) = slots[c].lock().unwrap().take().unwrap();
+            let slots = Cells::new(chunks.map(Some));
+            par_each(slots.0.len(), scratch, |per, c| {
+                // Safety: par_each runs each chunk once.
+                let ((b, r), h) = unsafe { slots.take(c) }.unwrap();
                 chunk(c, b, r, h, per)
             })
         };
