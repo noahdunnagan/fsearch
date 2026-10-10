@@ -599,17 +599,18 @@ fn sync(shared: &Shared, pool: &rayon::ThreadPool, home: &[u8], dirs: &[Vec<u8>]
     let n = todo.len();
     shared.content_pending.store(n, Ordering::Relaxed);
     // A first build (fresh install, format change) is a one-time wait the
-    // user is watching: every core at user-initiated QoS, and three batches
-    // in flight, so one's single-threaded tail and big-file splits run beside
-    // the others' reads. Measured on HOME (730k files, 16 cores): 104-134 s
-    // on the 4 utility threads; on all cores 47.6 s with one batch at a time,
-    // 35.4 s with two, 30.9 s with three (28.4 s with four, but each batch in
-    // flight holds ~160 MB; three peak at ~660 MB, under the name build's).
+    // user is watching: every core at user-initiated QoS, and two batches in
+    // flight, so one's single-threaded parts (a run of big files, the
+    // segment write) run beside the other's reads. Each batch in flight holds
+    // ~270 MB at its peak, so a third (5% faster) would take the build to
+    // ~1 GB. Measured on HOME (730k files, 16 cores): 104-134 s on the 4
+    // utility threads; on all cores 27.7-29.5 s one at a time, 22.6-25.2 s
+    // two in flight.
     let fast;
     let (pool, inflight) = if first {
         let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
         fast = content_pool(cores, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
-        (&fast, 3)
+        (&fast, 2)
     } else {
         (pool, 1)
     };
