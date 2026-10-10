@@ -67,8 +67,8 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
     let me = std::process::id() as i32;
-    let (mut killed, mut named, mut looked) = (None, None, false);
-    for _ in 0..timeout.as_millis().div_ceil(100) {
+    let (mut killed, mut named) = (None, None);
+    for tick in 0..timeout.as_millis().div_ceil(100) {
         if try_lock(&lock) {
             return Ok(());
         }
@@ -82,10 +82,10 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
             killed = Some(p);
         }
         // No pid at all: a daemon from before they were recorded (the first
-        // upgrade). Find it by who has the file open.
-        if pid.is_none() && killed.is_none() && !looked {
-            looked = true;
-            if let Some(p) = holders(&path).into_iter().find(|&p| p != me && is_fsearch(p)) {
+        // upgrade). Find it among the processes with the file open (another
+        // install may have it open too); look again every second or so.
+        if pid.is_none() && killed.is_none() && tick % 10 == 0 {
+            if let Some(p) = holders(&path).into_iter().find(|&p| p != me && is_fsearch(p) && is_daemon(p)) {
                 unsafe { libc::kill(p, libc::SIGTERM) };
                 killed = Some(p);
             }
@@ -108,6 +108,12 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
 fn holders(path: &Path) -> Vec<i32> {
     let out = std::process::Command::new("/usr/sbin/lsof").arg("-t").arg("--").arg(path).stderr(std::process::Stdio::null()).output();
     out.map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default()
+}
+
+/// Whether `pid` is a daemon: `fsearch serve` (`serve` on its command line).
+fn is_daemon(pid: i32) -> bool {
+    let out = std::process::Command::new("/bin/ps").args(["-o", "args=", "-p", &pid.to_string()]).output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().any(|a| a == "serve"))
 }
 
 /// Whether `pid` runs an fsearch binary (the daemon, or its test harness).
@@ -547,9 +553,20 @@ mod tests {
         c
     }
 
+    /// Not a daemon: only has the file open (another `fsearch install`).
+    #[test]
+    #[ignore]
+    fn file_opener() {
+        let Some(p) = std::env::var_os("FSEARCH_TEST_OPEN") else { return };
+        let _f = std::fs::File::open(p).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
     fn spawn_holder(lock: &Path, delay_ms: u64) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "server::tests::lock_holder", "--ignored", "--nocapture"])
+            // "serve" on its command line, like a daemon's (an extra test
+            // filter that matches nothing else).
+            .args(["--exact", "server::tests::lock_holder", "serve", "--ignored", "--nocapture"])
             .env("FSEARCH_TEST_HOLD", lock)
             .env("FSEARCH_TEST_HOLD_DELAY", delay_ms.to_string())
             .stdout(std::process::Stdio::null())
@@ -644,6 +661,34 @@ mod tests {
         let r = stop_within(&dir, Duration::from_secs(5));
         let _ = c.kill();
         assert_eq!(r, Ok(()));
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// Without a pid, the daemon is found among the processes with the
+    /// file open, not taken to be the first of them (another install).
+    #[test]
+    fn stop_signals_the_daemon_not_another_opener() {
+        let dir = root().join("stop7");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        std::fs::write(&path, "").unwrap();
+        let mut opener = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::tests::file_opener", "--ignored"])
+            .env("FSEARCH_TEST_OPEN", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for("the opener", || holders(&path).contains(&(opener.id() as i32)));
+        let mut c = spawn_holder(&path, 60_000);
+        wait_for("the holder's lock", || !try_lock(&std::fs::File::open(&path).unwrap()));
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let opener_alive = opener.try_wait().unwrap().is_none();
+        let _ = opener.kill();
+        let _ = opener.wait();
+        let _ = c.kill();
+        assert_eq!(r, Ok(()));
+        assert!(opener_alive, "signalled the other opener");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
