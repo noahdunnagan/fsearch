@@ -260,7 +260,7 @@ impl Live {
                 Some(Some(c)) => {
                     let c = c as usize;
                     let was_kind = self.base.kind()[c];
-                    if was_kind & 3 != now.kind & 3 {
+                    if shape(was_kind) != shape(now.kind) {
                         if was_kind & 3 == KIND_DIR {
                             self.trees.push(child.clone());
                         }
@@ -276,7 +276,7 @@ impl Live {
                 }
                 Some(None) => {
                     let old = self.over[&child];
-                    if old.kind & 3 != now.kind & 3 {
+                    if shape(old.kind) != shape(now.kind) {
                         if old.kind & 3 == KIND_DIR {
                             self.trees.push(child.clone());
                         }
@@ -462,6 +462,12 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut hi = lo.clone();
     *hi.last_mut().unwrap() += 1; // '/' + 1 == '0'
     (lo, hi)
+}
+
+/// What decides how an entry is indexed: its kind, and for a folder
+/// whether it's a mount point (listed, or not crossed).
+fn shape(kind: u8) -> u8 {
+    kind & (3 | FLAG_MOUNT)
 }
 
 /// Just the mtime: one lstat, no mount check (changed_dirs asks this of
@@ -842,6 +848,26 @@ mod tests {
         seen.sort();
         assert_eq!(seen, [(b"/r/d".to_vec(), KIND_DIR), (b"/r/d/e".to_vec(), KIND_FILE)]);
         assert_eq!(stat_pool().current_num_threads(), 12);
+    }
+
+    /// A folder that stops being a mount point (or becomes one) changes
+    /// shape: its parent's relist must list what's really there now.
+    #[test]
+    fn unmounted_folder_is_listed_on_relist() {
+        let t = Tmp::new("unmount");
+        std::fs::create_dir_all(t.p("d")).unwrap();
+        std::fs::write(t.p("d/inner.txt"), "x").unwrap();
+        // The index from while a volume was mounted on d: d flagged, no contents.
+        let root = t.bytes();
+        let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let k = comps.len() as u32;
+        let mut ls: Vec<Listing> =
+            comps.iter().enumerate().map(|(i, c)| crate::index::tests::lst(i as u32, &[(c, KIND_DIR, 0, i as u32 + 1)])).collect();
+        ls.push(crate::index::tests::lst(k, &[(b"d", KIND_DIR | FLAG_MOUNT, 0, NONE)]));
+        let mut live = Live::new(Index::build(ls, 0, 0, b""));
+        live.apply_dir(root, false);
+        let inner = join(&join(root, b"d"), b"inner.txt");
+        assert!(live.over.contains_key(&inner), "d's contents after it was unmounted");
     }
 
     /// lstat flags a mount point the way a scan does, so a recursive event
