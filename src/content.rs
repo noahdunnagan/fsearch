@@ -1086,12 +1086,31 @@ impl Content {
         let best = take_best(&mut per);
         let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
         if r.files.len() < filt.limit && done == best.len() && best.len() < total {
+            // Then the next best few thousand, and the others only if
+            // reading gets past those too.
             let mut rest: Vec<Ranked> = par_claim(&per, per.len().min(8), |c| c.rest(&self.segs)).concat();
-            rest.par_sort_unstable();
-            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), READERS, t, |i| path(&rest[i]));
-            r.files.extend(more.files);
-            r.read += more.read;
-            r.complete = more.complete;
+            let next = rest.len().min(8 * FIRST);
+            if next < rest.len() {
+                rest.select_nth_unstable(next);
+            }
+            rest[..next].sort_unstable();
+            let mut at = 0;
+            for end in [next, rest.len()] {
+                if at == end {
+                    continue;
+                }
+                if at > 0 {
+                    rest[at..].par_sort_unstable();
+                }
+                let (more, done) = verify_from(g, end - at, filt.limit - r.files.len(), READERS, t, |i| path(&rest[at + i]));
+                r.files.extend(more.files);
+                r.read += more.read;
+                r.complete = more.complete;
+                if r.files.len() >= filt.limit || done < end - at {
+                    break;
+                }
+                at = end;
+            }
         }
         r.candidates = total;
         r
