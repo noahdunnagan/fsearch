@@ -13,6 +13,14 @@ pub struct Event {
     pub path: Vec<u8>,
     pub flags: u32,
     pub id: u64,
+    /// Which `watch` delivered it (its `stream` number).
+    pub stream: u32,
+}
+
+/// A stream's callback context.
+struct Info {
+    tx: Sender<Vec<Event>>,
+    stream: u32,
 }
 
 #[repr(C)]
@@ -92,11 +100,14 @@ unsafe extern "C" {
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
-    let tx = unsafe { &*(info as *const Sender<Vec<Event>>) };
+    let info = unsafe { &*(info as *const Info) };
     let paths = paths as *const *const i8;
-    let batch =
-        (0..n).map(|i| unsafe { Event { path: CStr::from_ptr(*paths.add(i)).to_bytes().to_vec(), flags: *flags.add(i), id: *ids.add(i) } }).collect();
-    let _ = tx.send(batch);
+    let batch = (0..n)
+        .map(|i| unsafe {
+            Event { path: CStr::from_ptr(*paths.add(i)).to_bytes().to_vec(), flags: *flags.add(i), id: *ids.add(i), stream: info.stream }
+        })
+        .collect();
+    let _ = info.tx.send(batch);
 }
 
 /// A running stream; dropping it stops it.
@@ -117,9 +128,9 @@ impl Drop for Stream {
     }
 }
 
-/// Watch `/` from `since` (an event id). Batches of directory-level events
-/// arrive on `tx` until the returned stream is dropped.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
+/// Watch `/` from `since` (an event id). Batches of directory-level events,
+/// stamped with `stream`, arrive on `tx` until the returned stream is dropped.
+pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> Stream {
     let a = api();
     unsafe {
         let root = (a.string)(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
@@ -128,7 +139,7 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
         // stream stops, and streams are replaced rarely.
         let ctx = Context {
             version: 0,
-            info: Box::into_raw(Box::new(tx)) as *mut c_void,
+            info: Box::into_raw(Box::new(Info { tx, stream })) as *mut c_void,
             retain: std::ptr::null(),
             release: std::ptr::null(),
             copy_description: std::ptr::null(),

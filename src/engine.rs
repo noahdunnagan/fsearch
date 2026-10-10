@@ -29,6 +29,9 @@ const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
 const FOLLOW_EVERY: Duration = Duration::from_secs(10);
 /// Seconds before the last known-good moment that a relist also covers.
 const SYNC_MARGIN: u32 = 120;
+/// How long FSEvents must go without dropping events before the gap is
+/// replayed: restarting mid-burst only drops more.
+const REPLAY_QUIET: Duration = Duration::from_secs(2);
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -95,6 +98,10 @@ struct Shared {
     owner: AtomicBool,
     lock: std::fs::File,
     stream: Mutex<Option<fsevents::Stream>>,
+    /// Number of the current stream (events carry the one they came from)
+    /// and the event id it started from.
+    streams: std::sync::atomic::AtomicU32,
+    since: AtomicU64,
     /// The stream is still replaying history (until HISTORY_DONE).
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
@@ -224,6 +231,8 @@ impl Engine {
             owner: AtomicBool::new(owner),
             lock,
             stream: Mutex::new(None),
+            streams: Default::default(),
+            since: AtomicU64::new(0),
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
         });
@@ -381,7 +390,9 @@ impl Shared {
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
     fn watch(&self, since: u64) {
         self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(since, 0.1, self.wake.clone());
+        self.since.store(since, Ordering::Relaxed);
+        let n = self.streams.fetch_add(1, Ordering::Relaxed) + 1;
+        let new = fsevents::watch(since, 0.1, self.wake.clone(), n);
         *self.stream.lock().unwrap() = Some(new);
     }
 
@@ -461,7 +472,7 @@ fn rescan_unskipped(shared: &Shared) {
         }
         let readable = std::fs::read_dir(std::ffi::OsStr::from_bytes(&path)).map_or_else(|e| e.raw_os_error() != Some(libc::EPERM), |_| true);
         if readable {
-            now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 });
+            now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0, stream: 0 });
         } else {
             walk::DENIED.lock().unwrap().push(path);
         }
@@ -743,8 +754,13 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
     let ours = shared.dir.as_os_str().as_bytes();
+    // Events fseventsd dropped before we read them: (replay from, last drop).
+    let mut gap: Option<(u64, Instant)> = None;
+    // Replays in a row that dropped again; the third falls back to a relist.
+    let mut replays = 0;
     loop {
-        let mut events = match rx.recv_timeout(Duration::from_secs(60)) {
+        let wait = if gap.is_some() { Duration::from_millis(250) } else { Duration::from_secs(60) };
+        let mut events = match rx.recv_timeout(wait) {
             Ok(b) => b,
             Err(RecvTimeoutError::Timeout) => Vec::new(),
             Err(RecvTimeoutError::Disconnected) => return,
@@ -753,22 +769,42 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
-        if !events.is_empty() {
+        let (mut rebuild, mut root_flags, had_events) = (false, 0, !events.is_empty());
+        if had_events {
             let mut dirs: HashMap<Vec<u8>, bool> = HashMap::new();
-            let (mut max_id, mut root_flags) = (0, 0);
+            let mut max_id = 0;
+            let mut last_good = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
+            let current = shared.streams.load(Ordering::Relaxed);
             for e in events {
-                max_id = max_id.max(e.id);
                 if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
+                    // fseventsd still logged what it dropped for us (a kernel
+                    // drop never reached it): replay from the last event we
+                    // did get, once the drops stop; a drop during a replay
+                    // starts that replay over. A replaced stream's drop is
+                    // covered by the stream that replaced it.
+                    if e.flags & (USER_DROPPED | KERNEL_DROPPED) == USER_DROPPED {
+                        if e.stream == current {
+                            let from = if shared.replaying.load(Ordering::Relaxed) { shared.since.load(Ordering::Relaxed) } else { last_good };
+                            gap = Some((gap.map_or(from, |(g, _)| g.min(from)), Instant::now()));
+                        }
+                        continue;
+                    }
                     root_flags |= e.flags;
+                }
+                max_id = max_id.max(e.id);
+                if gap.is_none() {
+                    last_good = last_good.max(e.id);
                 }
                 if e.flags & HISTORY_DONE != 0 {
                     log("replay done");
                     shared.replaying.store(false, Ordering::Relaxed);
+                    if gap.is_none() {
+                        replays = 0;
+                    }
                     continue;
                 }
                 *dirs.entry(crate::live::normalize(&e.path)).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
             }
-            let mut rebuild = false;
             let mut trees = Vec::new();
             // Read the disk under the read lock, then apply in memory: a
             // search never waits on a folder listing or a new subtree's scan.
@@ -785,24 +821,34 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                         rebuild = true;
                     }
                 }
-                live.event_id = live.event_id.max(max_id);
+                // With a gap, everything is applied only up to its start.
+                live.event_id = match gap {
+                    Some((from, _)) => live.event_id.min(from),
+                    None => live.event_id.max(max_id),
+                };
                 trees.append(&mut live.trees);
             }
             let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, r)| *r);
             trees.extend(rec.into_iter().map(|(p, _)| p));
             let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
-            if rebuild {
-                let why = match root_flags {
-                    f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
-                    f if f & USER_DROPPED != 0 => "events dropped before we read them",
-                    _ => "history unavailable",
-                };
-                relist_changed(shared, why, root_flags);
-            } else if !shared.replaying.load(Ordering::Relaxed) {
-                // Everything up to this batch is applied (a change's event can
-                // trail it by the stream latency; relisting keeps a margin).
-                shared.live.write().unwrap().as_mut().unwrap().synced_at = crate::query::now_secs();
-            }
+        }
+        let replay = gap.filter(|(_, at)| at.elapsed() >= REPLAY_QUIET).map(|(from, _)| from);
+        if rebuild || (replay.is_some() && replays >= 3) {
+            let why = match root_flags {
+                f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
+                0 => "events dropped again while replaying",
+                _ => "history unavailable",
+            };
+            relist_changed(shared, why, root_flags);
+            (gap, replays) = (None, 0);
+        } else if let Some(from) = replay {
+            log(format!("FSEvents dropped events before we read them: replaying from {from}"));
+            shared.watch(from);
+            (gap, replays) = (None, replays + 1);
+        } else if had_events && gap.is_none() && !shared.replaying.load(Ordering::Relaxed) {
+            // Everything up to this batch is applied (a change's event can
+            // trail it by the stream latency; relisting keeps a margin).
+            shared.live.write().unwrap().as_mut().unwrap().synced_at = crate::query::now_secs();
         }
         if let Some(l) = shared.live.read().unwrap().as_ref() {
             l.names_cache.trim_if_idle(Duration::from_secs(60));
