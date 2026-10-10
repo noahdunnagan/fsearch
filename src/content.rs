@@ -950,8 +950,9 @@ pub struct Grep {
     plan: TQ,
 }
 
-/// Smart case: does the pattern spell an uppercase letter? In a regex only
-/// literals count, not escapes (`\S`, `\W`), flags (`(?U)`) or group names.
+/// Smart case: does the pattern spell an uppercase letter? In a regex
+/// literals and uppercase classes (`\p{Lu}`, `[[:upper:]]`) count, not
+/// escapes (`\S`, `\W`), flags (`(?U)`) or group names.
 fn has_upper(pattern: &str, ast: Option<&regex_syntax::ast::Ast>) -> bool {
     use regex_syntax::ast::{self, Ast, ClassSetItem};
     struct Upper;
@@ -964,6 +965,7 @@ fn has_upper(pattern: &str, ast: Option<&regex_syntax::ast::Ast>) -> bool {
         fn visit_pre(&mut self, a: &Ast) -> Result<(), ()> {
             match a {
                 Ast::Literal(l) if l.c.is_uppercase() => Err(()),
+                Ast::ClassUnicode(c) if upper_class(c) => Err(()),
                 _ => Ok(()),
             }
         }
@@ -971,9 +973,22 @@ fn has_upper(pattern: &str, ast: Option<&regex_syntax::ast::Ast>) -> bool {
             match i {
                 ClassSetItem::Literal(l) if l.c.is_uppercase() => Err(()),
                 ClassSetItem::Range(r) if r.start.c.is_uppercase() || r.end.c.is_uppercase() => Err(()),
+                ClassSetItem::Unicode(c) if upper_class(c) => Err(()),
+                ClassSetItem::Ascii(a) if a.kind == ast::ClassAsciiKind::Upper => Err(()),
                 _ => Ok(()),
             }
         }
+    }
+    /// A class that means uppercase (`\p{Lu}`, `\p{Lt}`, `\p{Uppercase}`,
+    /// `\p{gc=Lu}`): writing one says case matters.
+    fn upper_class(c: &ast::ClassUnicode) -> bool {
+        let name = match &c.kind {
+            ast::ClassUnicodeKind::OneLetter(_) => return false,
+            ast::ClassUnicodeKind::Named(n) => n.as_str(),
+            ast::ClassUnicodeKind::NamedValue { value, .. } => value.as_str(),
+        };
+        let n: String = name.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        matches!(n.as_str(), "lu" | "lt" | "upper" | "uppercase" | "uppercaseletter" | "titlecaseletter")
     }
     match ast {
         Some(a) => ast::visit(a, Upper).is_err(),
@@ -1741,6 +1756,18 @@ mod tests {
         assert_eq!(lines(b"a\rfoo\rb", "b$", GrepMode::Regex), [(3, "b".to_string())]);
         assert_eq!(lines(b"x\r\nfoo\r\ny", "^foo$", GrepMode::Regex), [(2, "foo".to_string())]);
         assert_eq!(lines(b"one\ntwo\rthree\r\nfour", "four", GrepMode::Literal), [(4, "four".to_string())]);
+    }
+
+    /// An uppercase class (`\p{Lu}`, `[[:upper:]]`) says case matters, as an
+    /// uppercase letter would: the search stays case-sensitive.
+    #[test]
+    fn uppercase_classes_keep_case() {
+        let body = b"Xerror\nxerror\n";
+        for pat in [r"^\p{Lu}error", r"^[[:upper:]]error", r"^\p{Uppercase}error", r"^\p{Lt}?\p{Lu}error"] {
+            assert_eq!(lines(body, pat, GrepMode::Regex), [(1, "Xerror".to_string())], "{pat}");
+        }
+        // Lowercase classes and escapes still leave it case-insensitive.
+        assert_eq!(lines(body, r"^\p{Ll}error", GrepMode::Regex).len(), 2);
     }
 
     #[test]
