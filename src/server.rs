@@ -310,8 +310,9 @@ mod tests {
     #[unsafe(link_section = "__DATA,__mod_init_func")]
     static SET_ROOT: extern "C" fn() = {
         extern "C" fn init() {
-            // Not in the lock-holder child: it is killed, never exits cleanly.
-            if std::env::var_os("FSEARCH_TEST_HOLD").is_none() {
+            // Not in the helper children (lock holder, file opener): they are
+            // killed, never exit cleanly.
+            if std::env::var_os("FSEARCH_TEST_HOLD").is_none() && std::env::var_os("FSEARCH_TEST_OPEN").is_none() {
                 root();
             }
         }
