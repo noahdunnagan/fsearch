@@ -363,7 +363,6 @@ fn start_content(s: &Arc<Shared>) {
     spawn("fsearch-content", move || content_loop(&s, rx));
 }
 
-/// A follower takes over the index files once their owner is gone.
 /// Become the owner if the lock is free: from now on this engine writes the
 /// index files.
 fn take_lock(s: &Shared) -> bool {
@@ -376,6 +375,7 @@ fn take_lock(s: &Shared) -> bool {
     true
 }
 
+/// A follower takes over the index files once their owner is gone.
 fn try_upgrade(s: &Arc<Shared>) -> bool {
     if s.owner() {
         return true;
@@ -638,11 +638,9 @@ fn compact(shared: &Shared) {
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
 }
 
-/// FSEvents lost track of / (dropped events, or no history back to our
-/// save): relist every folder modified since we were last in sync, plus the
-/// folders of indexed text files edited since (an edit in place doesn't
-/// touch its folder). Seconds, instead of recrawling the whole disk.
-/// Folders whose listing may have changed since `from`.
+/// Folders whose listing may have changed since `from`: modified ones,
+/// plus the folders of indexed text files edited since (an edit in place
+/// doesn't touch its folder).
 fn to_relist(shared: &Shared, from: u32) -> Vec<Vec<u8>> {
     let mut dirs = shared.live.read().unwrap().as_ref().unwrap().changed_dirs(from);
     dirs.extend(shared.content.read().unwrap().changed_dirs(from));
@@ -654,6 +652,9 @@ fn to_relist(shared: &Shared, from: u32) -> Vec<Vec<u8>> {
     dirs
 }
 
+/// FSEvents lost track of the root (dropped events, or no history back to
+/// our save): relist what `to_relist` finds. Seconds, instead of recrawling
+/// the whole disk.
 fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let t = Instant::now();
     let started = crate::query::now_secs();
