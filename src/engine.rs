@@ -694,9 +694,10 @@ fn owner_wrote(events: &[fsevents::Event], data_dir: &[u8]) -> bool {
 /// FSEvents lost track of the whole watched root (dropped events, or no
 /// history back to our save).
 fn lost_track(e: &fsevents::Event, root: &[u8]) -> bool {
-    // Reported for the root, or for a folder above it (`/`): either way the
-    // root's history is gone.
-    e.flags & MUST_SCAN_SUBDIRS != 0 && crate::live::is_ancestor(&crate::live::normalize(&e.path), root)
+    // Reported for the root itself, or as dropped events for a folder above
+    // it (`/`). A plain must-scan above the root is activity elsewhere.
+    let at = crate::live::normalize(&e.path);
+    e.flags & MUST_SCAN_SUBDIRS != 0 && crate::live::is_ancestor(&at, root) && (at == root || e.flags & (USER_DROPPED | KERNEL_DROPPED) != 0)
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
@@ -910,7 +911,10 @@ mod tests {
         // Reported for a folder above the root (or `/`): the root's history
         // is lost too.
         assert!(lost_track(&ev(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED), b"/tmp/r"));
-        assert!(lost_track(&ev(b"/tmp", MUST_SCAN_SUBDIRS), b"/tmp/r"));
+        assert!(lost_track(&ev(b"/tmp", MUST_SCAN_SUBDIRS | KERNEL_DROPPED), b"/tmp/r"));
+        // Above the root, a plain must-scan is activity elsewhere, not lost
+        // history: only dropped events count there.
+        assert!(!lost_track(&ev(b"/tmp", MUST_SCAN_SUBDIRS), b"/tmp/r"));
         assert!(!lost_track(&ev(b"/tmp/rx", MUST_SCAN_SUBDIRS), b"/tmp/r"));
     }
 
