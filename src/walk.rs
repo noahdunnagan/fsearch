@@ -9,7 +9,7 @@ use rayon::Scope;
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const NONE: u32 = u32::MAX;
 
@@ -23,12 +23,16 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// tracked, i.e. while SKIP is set.
 pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Entries listed by scans so far: the first scan's progress.
+pub static LISTED: AtomicUsize = AtomicUsize::new(0);
+
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
+const SF_FIRMLINK: u32 = 0x0080_0000;
 
 pub const KIND_FILE: u8 = 0;
 pub const KIND_DIR: u8 = 1;
@@ -39,6 +43,10 @@ pub const KIND_OTHER: u8 = 3;
 pub const FLAG_HIDDEN: u8 = 1 << 2;
 /// Directory that is a mount point we did not descend into.
 pub const FLAG_MOUNT: u8 = 1 << 3;
+/// Only while a listing is parsed: a directory its parent reports empty.
+/// Firmlinks report 0 too (their entries live on the data volume), so they
+/// never get it; grafts (MobileAsset images) do, so `finish_dir` checks.
+const MAYBE_EMPTY: u8 = 1 << 7;
 
 #[derive(Clone, Copy)]
 pub struct RawEnt {
@@ -76,7 +84,12 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     // Paths are only tracked when there is something to skip.
     let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
     pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
-    ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
+    let parts: Vec<Vec<Listing>> = ctx.out.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for p in parts {
+        out.extend(p);
+    }
+    out
 }
 
 fn raise_fd_limit() {
@@ -93,7 +106,13 @@ pub fn list_one(path: &[u8]) -> Option<Listing> {
         return None;
     }
     let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
-    list_into(path, &mut l).then_some(l)
+    if !list_into(path, &mut l) {
+        return None;
+    }
+    for e in &mut l.ents {
+        e.kind &= !MAYBE_EMPTY;
+    }
+    Some(l)
 }
 
 const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -110,6 +129,8 @@ impl Drop for Fd {
 // never get rebuilt and PATH_MAX never bites. Measured on this Mac: open() +
 // close() is ~19us per directory (two Endpoint Security clients tax every
 // open), getattrlistbulk ~14us; past ~8 threads the kernel side stops scaling.
+// 18% of directories are empty: those the parent's listing already says
+// so (rechecked with one lookup) are never opened.
 fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
     if fd < 0 {
@@ -119,7 +140,10 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
     list_fd(fd, &mut l);
     let me = std::sync::Arc::new(Fd(fd));
     let mut kids = Vec::new();
+    let mut empty = Vec::new();
     for e in l.ents.iter_mut() {
+        let maybe_empty = e.kind & MAYBE_EMPTY != 0;
+        e.kind &= !MAYBE_EMPTY;
         if e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0 {
             let name = &l.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
             let child_path = path.as_ref().map(|p| crate::live::join(p, name));
@@ -127,10 +151,19 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
                 continue;
             }
             e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
-            kids.push((CString::new(name).unwrap_or_default(), e.child, child_path));
+            let name = CString::new(name).unwrap_or_default();
+            // (With paths tracked, opening is how refusals get recorded.)
+            if maybe_empty && child_path.is_none() && entry_count(fd, &name) == Some(0) {
+                empty.push(e.child);
+            } else {
+                kids.push((name, e.child, child_path));
+            }
         }
     }
     push(l, ctx);
+    for id in empty {
+        push(Listing { id, names: Vec::new(), ents: Vec::new() }, ctx);
+    }
     for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
@@ -147,7 +180,18 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
     }
 }
 
+/// Entries in the directory `name` (in `dir`) resolves to.
+fn entry_count(dir: i32, name: &CString) -> Option<u32> {
+    let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
+    al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    al.dirattr = libc::ATTR_DIR_ENTRYCOUNT;
+    let mut b = [0u32; 2];
+    let r = unsafe { libc::getattrlistat(dir, name.as_ptr(), (&raw mut al).cast(), b.as_mut_ptr().cast(), 8, libc::FSOPT_NOFOLLOW as _) };
+    (r == 0).then_some(b[1])
+}
+
 fn push(l: Listing, ctx: &Ctx) {
+    LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
     let slot = rayon::current_thread_index().unwrap_or(ctx.out.len() - 1);
     ctx.out[slot].lock().unwrap().push(l);
 }
@@ -177,7 +221,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     al.commonattr =
         libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_FLAGS;
-    al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
+    al.dirattr = libc::ATTR_DIR_ENTRYCOUNT | libc::ATTR_DIR_MOUNTSTATUS;
     al.fileattr = libc::ATTR_FILE_DATALENGTH;
     BUF.with_borrow_mut(|buf| {
         loop {
@@ -185,6 +229,19 @@ fn list_fd(fd: i32, l: &mut Listing) {
             if n <= 0 {
                 break;
             }
+            // Size the listing exactly: 8M entries' worth of growth slack
+            // would be ~150 MB at the scan's peak.
+            let (mut p, mut bytes) = (0usize, 0usize);
+            for _ in 0..n {
+                let (b, common) = (&buf[p..], rd32(buf, p + 4));
+                if common & libc::ATTR_CMN_NAME != 0 {
+                    let f = if common & ATTR_CMN_ERROR != 0 { 28 } else { 24 };
+                    bytes += (rd32(b, f + 4) as usize).saturating_sub(1);
+                }
+                p += rd32(b, 0) as usize;
+            }
+            l.ents.reserve_exact(n as usize);
+            l.names.reserve_exact(bytes);
             let mut p = 0usize;
             for _ in 0..n {
                 let len = rd32(buf, p) as usize;
@@ -226,9 +283,17 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
         mtime = (rd64(b, f) as i64).clamp(0, u32::MAX as i64) as u32;
         f += 16;
     }
+    let mut flags = 0;
     if common & libc::ATTR_CMN_FLAGS != 0 {
-        if rd32(b, f) & libc::UF_HIDDEN != 0 {
+        flags = rd32(b, f);
+        if flags & libc::UF_HIDDEN != 0 {
             kind |= FLAG_HIDDEN;
+        }
+        f += 4;
+    }
+    if dirattr & libc::ATTR_DIR_ENTRYCOUNT != 0 {
+        if rd32(b, f) == 0 && flags & SF_FIRMLINK == 0 {
+            kind |= MAYBE_EMPTY;
         }
         f += 4;
     }
