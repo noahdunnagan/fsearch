@@ -67,7 +67,7 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
     let me = std::process::id() as i32;
-    let (mut killed, mut named) = (None, None);
+    let (mut killed, mut named, mut looked) = (None, None, false);
     for _ in 0..timeout.as_millis().div_ceil(100) {
         if try_lock(&lock) {
             return Ok(());
@@ -81,6 +81,15 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
             unsafe { libc::kill(p, libc::SIGTERM) };
             killed = Some(p);
         }
+        // No pid at all: a daemon from before they were recorded (the first
+        // upgrade). Find it by who has the file open.
+        if pid.is_none() && killed.is_none() && !looked {
+            looked = true;
+            if let Some(p) = holders(&path).into_iter().find(|&p| p != me && is_fsearch(p)) {
+                unsafe { libc::kill(p, libc::SIGTERM) };
+                killed = Some(p);
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(match (killed, named) {
@@ -93,6 +102,12 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
         }
         (None, None) => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
+}
+
+/// Processes that have `path` open (lsof).
+fn holders(path: &Path) -> Vec<i32> {
+    let out = std::process::Command::new("/usr/sbin/lsof").arg("-t").arg("--").arg(path).stderr(std::process::Stdio::null()).output();
+    out.map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default()
 }
 
 /// Whether `pid` runs an fsearch binary (the daemon, or its test harness).
@@ -611,6 +626,23 @@ mod tests {
         let _ = c.kill();
         let _ = stranger.kill();
         let _ = stranger.wait();
+        assert_eq!(r, Ok(()));
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// A daemon from before pids were recorded holds the lock with an empty
+    /// file (the first upgrade): find it by who has the file open.
+    #[test]
+    fn stop_finds_a_holder_that_never_recorded_its_pid() {
+        let dir = root().join("stop6");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        std::fs::write(&path, "").unwrap();
+        let mut c = spawn_holder(&path, 60_000);
+        wait_for("the holder's lock", || !try_lock(&std::fs::File::open(&path).unwrap()));
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let _ = c.kill();
         assert_eq!(r, Ok(()));
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
