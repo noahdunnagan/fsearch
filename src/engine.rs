@@ -650,19 +650,24 @@ fn compact(shared: &Shared) {
 /// save): relist every folder modified since we were last in sync, plus the
 /// folders of indexed text files edited since (an edit in place doesn't
 /// touch its folder). Seconds, instead of recrawling the whole disk.
+/// Folders whose listing may have changed since `from`.
+fn to_relist(shared: &Shared, from: u32) -> Vec<Vec<u8>> {
+    let mut dirs = shared.live.read().unwrap().as_ref().unwrap().changed_dirs(from);
+    dirs.extend(shared.content.read().unwrap().changed_dirs(from));
+    // Under a root, the folders above it are scaffolding: listing them would
+    // pull in the rest of the disk.
+    dirs.retain(|d| crate::live::is_ancestor(&shared.root, d));
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let t = Instant::now();
     let started = crate::query::now_secs();
     // synced_at 0 (unknown) relists everything: a full crawl, done in place.
-    let (from, mut dirs) = {
-        let g = shared.live.read().unwrap();
-        let live = g.as_ref().unwrap();
-        let from = live.synced_at.saturating_sub(SYNC_MARGIN);
-        (from, live.changed_dirs(from))
-    };
-    dirs.extend(shared.content.read().unwrap().changed_dirs(from));
-    dirs.sort();
-    dirs.dedup();
+    let from = shared.live.read().unwrap().as_ref().unwrap().synced_at.saturating_sub(SYNC_MARGIN);
+    let dirs = to_relist(shared, from);
     let stat_time = t.elapsed();
     // Disk reads under the read lock, one folder per write, so searches keep
     // answering meanwhile.
@@ -860,6 +865,21 @@ mod tests {
             }
             wait_for("a relist", || synced_at(&e) <= crate::query::now_secs());
         }
+    }
+
+    /// Recovery under a root relists only folders inside it: the one-child
+    /// folders above the root (and `/`) are scaffolding, and listing them
+    /// would pull the rest of the disk into the index.
+    #[test]
+    fn recovery_stays_inside_the_root() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let r = root();
+        let home = r.join("home").to_string_lossy().into_owned();
+        let e = Engine::start(Options { dir: r.join("data-relist"), home, skip: Some(vec![]) }).unwrap();
+        wait_for("the index", || e.status().ready);
+        let dirs = to_relist(&e.s, crate::query::now_secs().saturating_sub(2 * 86400));
+        let out: Vec<_> = dirs.iter().filter(|d| !crate::live::is_ancestor(&e.s.root, d)).map(|d| String::from_utf8_lossy(d)).collect();
+        assert!(out.is_empty(), "outside the root: {out:?}");
     }
 
     /// Under `FSEARCH_ROOT`, lost history is reported for the root, not `/`.
