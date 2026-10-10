@@ -440,9 +440,19 @@ impl Index {
         fields::<6>(&h, MAGIC).map(|f| f[4])
     }
 
+    /// Save, then re-map from the file so the index is clean, evictable page
+    /// cache rather than anonymous memory.
+    pub(crate) fn persist(self, path: &Path) -> (Index, std::io::Result<()>) {
+        // Only a file this save wrote: after a failure the one there is older.
+        match self.save(path) {
+            Ok(()) => (Index::load_own(path).unwrap_or(self), Ok(())),
+            Err(e) => (self, Err(e)),
+        }
+    }
+
     /// Reload a file this process just built and saved: its ids are known
     /// good, so the load-time check is skipped.
-    pub(crate) fn load_own(path: &Path) -> Option<Index> {
+    fn load_own(path: &Path) -> Option<Index> {
         let f = std::fs::File::open(path).ok()?;
         Index::from_map(unsafe { Mmap::map(&f) }.ok()?, false)
     }
@@ -913,6 +923,21 @@ pub(crate) mod tests {
         std::fs::write(&path, bytes).unwrap();
         // Refused at load, so no walk up ever meets the loop.
         assert!(Index::load(&path).is_none());
+    }
+
+    /// A save that fails keeps the index just built: the file on disk is
+    /// older, maybe the very one load refused.
+    #[test]
+    fn failed_persist_keeps_the_new_index() {
+        let t = Tmp::new("idx-persist");
+        let path = t.p("index.bin");
+        sample().save(&path).unwrap();
+        // The save writes index.tmp first: a folder there makes it fail.
+        std::fs::create_dir_all(t.p("index.tmp")).unwrap();
+        let fresh = Index::build(vec![lst(0, &[(b"only", F, 1, NONE)])], 0, 0, b"");
+        let (idx, saved) = fresh.persist(&path);
+        assert!(saved.is_err());
+        assert_eq!(idx.n, 2, "the new index, not the old file's {}", sample().n);
     }
 
     #[test]

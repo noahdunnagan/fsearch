@@ -533,16 +533,15 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     let started = crate::query::now_secs();
     let ls = walk::scan(b"/", SCAN_THREADS);
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    if let Err(e) = idx.save(&path) {
+    let n = idx.n;
+    let (idx, saved) = idx.persist(&shared.dir.join("index.bin"));
+    if let Err(e) = saved {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
+    log(format!("indexed {n} entries in {:.2?}", t.elapsed()));
     release_memory();
-    // Re-map from the file so the index is clean, evictable page cache
-    // rather than anonymous memory.
-    Index::load_own(&path).unwrap_or(idx)
+    idx
 }
 
 unsafe extern "C" {
@@ -563,12 +562,11 @@ fn compact(shared: &Shared) {
         (live.to_listings(), live.event_id, live.synced_at)
     };
     let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    if let Err(e) = idx.save(&path) {
+    let (idx, saved) = idx.persist(&shared.dir.join("index.bin"));
+    if let Err(e) = saved {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    let idx = Index::load_own(&path).unwrap_or(idx);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
     release_memory();
