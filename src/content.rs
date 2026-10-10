@@ -1135,22 +1135,30 @@ fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
         let mut lines = Vec::new();
         let (mut line_no, mut counted) = (1usize, 0usize);
         let mut last_line_start = usize::MAX;
+        let has_cr = memchr::memchr(b'\r', buf).is_some();
         for m in g.re.find_iter(buf) {
             // An empty match after the final newline (`^`, `$`, `x*`) is
             // not on any line.
             if m.start() == buf.len() && buf.last().is_none_or(|&b| b == b'\n' || b == b'\r') {
                 break;
             }
-            // Lines end at \n, \r\n or a lone \r, as the regex (crlf mode) has it.
-            let ends_line = |i: usize| buf[i] == b'\n' || buf.get(i + 1) != Some(&b'\n');
-            line_no += memchr::memchr2_iter(b'\n', b'\r', &buf[counted..m.start()]).filter(|&i| ends_line(counted + i)).count();
+            // Lines end at \n, \r\n or a lone \r, as the regex (crlf mode) has
+            // it. Files without a \r (nearly all) take the plain \n path.
+            let (ls, le) = if has_cr {
+                let ends_line = |i: usize| buf[i] == b'\n' || buf.get(i + 1) != Some(&b'\n');
+                line_no += memchr::memchr2_iter(b'\n', b'\r', &buf[counted..m.start()]).filter(|&i| ends_line(counted + i)).count();
+                let ls = memchr::memrchr2_iter(b'\n', b'\r', &buf[..m.start()]).find(|&i| ends_line(i)).map_or(0, |p| p + 1);
+                (ls, memchr::memchr2(b'\n', b'\r', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p))
+            } else {
+                line_no += memchr::memchr_iter(b'\n', &buf[counted..m.start()]).count();
+                let ls = memchr::memrchr(b'\n', &buf[..m.start()]).map_or(0, |p| p + 1);
+                (ls, memchr::memchr(b'\n', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p))
+            };
             counted = m.start();
-            let ls = memchr::memrchr2_iter(b'\n', b'\r', &buf[..m.start()]).find(|&i| ends_line(i)).map_or(0, |p| p + 1);
             if ls == last_line_start {
                 continue;
             }
             last_line_start = ls;
-            let le = memchr::memchr2(b'\n', b'\r', &buf[m.start()..]).map_or(buf.len(), |p| m.start() + p);
             let text = String::from_utf8_lossy(&buf[ls..le.min(ls + 400)]).trim_end().to_string();
             lines.push((line_no, text));
             if lines.len() >= g.max_per_file {
