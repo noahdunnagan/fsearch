@@ -657,6 +657,8 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 
 /// Is this path (file or directory) inside the indexed area?
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
+    // However home is written ("/h/", or "/" for the whole disk).
+    let home = &home[..home.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1)];
     if !crate::live::is_ancestor(home, path) {
         return false;
     }
@@ -2218,6 +2220,15 @@ mod tests {
         assert!(eligible(b"/h/cache", 10, b"/h"));
         assert!(!eligible(b"/h/proj/build/out.rs", 10, b"/h"));
         assert!(!eligible(b"/h/node_modules/x/index.js", 10, b"/h"));
+    }
+
+    /// Files directly in home count, however home is written.
+    #[test]
+    fn files_directly_in_home_are_in_scope() {
+        assert!(eligible(b"/h/a.rs", 10, b"/h"));
+        assert!(eligible(b"/h/a.rs", 10, b"/h/"));
+        assert!(eligible(b"/a.rs", 10, b"/"));
+        assert!(!eligible(b"/hx/a.rs", 10, b"/h/"));
     }
 
     /// Home written with a trailing slash still holds its files, and a
