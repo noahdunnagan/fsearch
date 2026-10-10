@@ -1,8 +1,8 @@
 //! Content search: a trigram index over the user's text files.
 //!
 //! Segments are immutable, mmap'd files: a doc table plus, per trigram, the
-//! ids of the docs containing it (delta varints), and per doc bloom filters
-//! of its 5- and 7-byte substrings. A query becomes an AND/OR of trigrams,
+//! ids of the docs containing it (delta varints), and per doc a bloom filter
+//! of its 6-byte substrings. A query becomes an AND/OR of trigrams,
 //! the posting lists pick candidate files, the bloom filters drop most of
 //! those that only contain the pattern's trigrams scattered about, and the
 //! rest are read fresh from disk and matched for real. Results therefore never
@@ -31,7 +31,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG06";
+const MAGIC: &[u8; 8] = b"FSCSEG09";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -83,7 +83,6 @@ pub struct Segment {
     plen: usize,
     paths_len: usize,
     nwords: usize,
-    nlong: usize,
     off: [usize; NS],
     dead: Vec<u64>,
     pub live_docs: usize,
@@ -102,14 +101,13 @@ enum S {
     Rank,
     BloomOff,
     Bloom,
-    LongOff,
-    Long,
+    ByRank,
 }
-const NS: usize = 13;
+const NS: usize = 12;
 
 #[rustfmt::skip]
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nlong: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, (ndocs + 1) * 4, nwords * 8, (ndocs + 1) * 4, nlong * 8]
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize) -> [usize; NS] {
+    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, (ndocs + 1) * 4, nwords * 8, ndocs * 4]
 }
 
 impl Segment {
@@ -122,11 +120,11 @@ impl Segment {
     sec!(mtime, S::Mtime, u32, ndocs);
     sec!(by_path, S::ByPath, u32, ndocs);
     sec!(rank, S::Rank, i8, ndocs);
-    // Per doc, bloom filters of its GRAM-byte and LONG-byte substrings.
+    // Per doc, a bloom filter of its GRAM-byte substrings.
     sec!(bloom_off, S::BloomOff, u32, ndocs1);
     sec!(bloom, S::Bloom, u64, nwords);
-    sec!(long_off, S::LongOff, u32, ndocs1);
-    sec!(long, S::Long, u64, nlong);
+    // Doc ids, best-ranked first.
+    sec!(by_rank, S::ByRank, u32, ndocs);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -138,16 +136,10 @@ impl Segment {
         &self.bloom()[o[d as usize] as usize..o[d as usize + 1] as usize]
     }
 
-    fn long_of(&self, d: u32) -> &[u64] {
-        let o = self.long_off();
-        &self.long()[o[d as usize] as usize..o[d as usize + 1] as usize]
-    }
-
-    /// Can doc `d` hold every gram in `probes`, by its bloom filters?
-    fn may_contain(&self, d: u32, probes: &Probes) -> bool {
-        let has = |words: &[u64], h: u32| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0));
-        let (short, long) = (self.bloom_of(d), self.long_of(d));
-        probes.short.iter().all(|&h| has(short, h)) && probes.long.iter().all(|&h| has(long, h))
+    /// Can doc `d` hold every gram in `probes`, by its bloom filter?
+    fn may_contain(&self, d: u32, probes: &[u32]) -> bool {
+        let words = self.bloom_of(d);
+        probes.iter().all(|&h| bloom_bits(h, words.len()).iter().all(|&b| words.get(b / 64).is_some_and(|w| w >> (b % 64) & 1 != 0)))
     }
 
     #[inline]
@@ -256,8 +248,8 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = unsafe { Mmap::map(&f) }.ok()?;
-        let [ndocs, ntri, plen, paths_len, nwords, nlong] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nlong));
+        let [ndocs, ntri, plen, paths_len, nwords] = fields(&map, MAGIC)?.map(|v| v as usize);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords));
         if map.len() < total {
             return None;
         }
@@ -268,7 +260,7 @@ impl Segment {
             }
         }
         let live_docs = ndocs - dead.iter().map(|w| w.count_ones() as usize).sum::<usize>();
-        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, nlong, off, dead, live_docs })
+        Some(Segment { map, id, ndocs, ndocs1: ndocs + 1, ntri, ntri1: ntri + 1, plen, paths_len, nwords, off, dead, live_docs })
     }
 
     fn save_dead(&self, dir: &Path) {
@@ -307,26 +299,48 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     out.push(v as u8);
 }
 
-/// Append the sorted distinct case-folded trigrams of a buffer to `out`.
-/// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
-fn trigrams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
-    let start = out.len();
-    if buf.len() < 3 {
+/// A file's distinct trigrams and its end-of-file key into `tri`, and the
+/// distinct hashes of its GRAM-byte grams into `grams` (both cleared,
+/// unordered). One pass, with no branch on whether a gram is new. `seen` is
+/// two 2 MiB bitsets, all zero on entry and exit.
+fn index_grams(buf: &[u8], seen: &mut [u64], tri: &mut Vec<u32>, grams: &mut Vec<u32>) {
+    tri.clear();
+    grams.clear();
+    let n = buf.len();
+    if n < 2 {
         return;
     }
-    let mut t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
-    for &b in &buf[2..] {
-        t = ((t << 8) | fold(b) as u32) & 0xFF_FFFF;
+    let (st, sg) = seen.split_at_mut(seen.len() / 2);
+    // Its last two bytes and a 0: so a two-byte search finds them too.
+    let eof = (fold(buf[n - 2]) as u32) << 16 | (fold(buf[n - 1]) as u32) << 8;
+    st[(eof >> 6) as usize] |= 1 << (eof & 63);
+    tri.resize(n, 0);
+    tri[0] = eof;
+    grams.resize(n, 0);
+    let (mut nt, mut ng) = (1, 0);
+    let mut g = (fold(buf[0]) as u64) << 8 | fold(buf[1]) as u64;
+    for (i, &c) in buf.iter().enumerate().skip(2) {
+        g = g << 8 | fold(c) as u64;
+        let t = (g & 0xFF_FFFF) as u32;
         let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
-        if seen[w] & bit == 0 {
-            seen[w] |= bit;
-            out.push(t);
-        }
+        tri[nt] = t;
+        nt += (st[w] & bit == 0) as usize;
+        st[w] |= bit;
+        let full = i + 1 >= GRAM;
+        let h = gram_hash(g & ((1 << (8 * GRAM)) - 1));
+        let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
+        grams[ng] = h;
+        ng += (full & (sg[w] & bit == 0)) as usize;
+        sg[w] |= bit & 0u64.wrapping_sub(full as u64);
     }
-    for &t in &out[start..] {
-        seen[(t >> 6) as usize] = 0;
+    tri.truncate(nt);
+    grams.truncate(ng);
+    for &t in tri.iter() {
+        st[(t >> 6) as usize] = 0;
     }
-    out[start..].sort_unstable();
+    for &h in grams.iter() {
+        sg[(h >> 6) as usize] = 0;
+    }
 }
 
 /// Trigrams of a short string (query side), no scratch needed.
@@ -340,11 +354,7 @@ fn trigrams_small(s: &[u8]) -> Vec<u32> {
 /// Bloom filters hold a doc's case-folded substrings of this many bytes: a
 /// match holds all of its pattern's grams, so a doc missing one of them
 /// can't match even if it has every trigram.
-const GRAM: usize = 5;
-/// A second filter holds the longer ones: it rules out a doc that has a
-/// word nearly like the pattern (multiplier for multipliers) and the rest
-/// of its grams elsewhere (suppliers), which every 5-gram check passes.
-const LONG: usize = 7;
+const GRAM: usize = 6;
 
 /// A gram's 24-bit hash (its folded bytes, big-endian in the low 40 bits).
 #[inline]
@@ -357,27 +367,6 @@ fn gram_hash(g: u64) -> u32 {
 fn bloom_bits(h: u32, words: usize) -> [usize; 2] {
     let at = |h: u32| ((h as u64 * words as u64 * 64) >> 24) as usize;
     [at(h), at(h.wrapping_mul(0x9E37_79B1) & 0xFF_FFFF)]
-}
-
-/// Distinct hashes of a buffer's `n`-byte grams, into `out` (cleared).
-/// `seen` is a 2 MiB scratch bitset, all zero on entry and exit.
-fn grams(buf: &[u8], n: usize, seen: &mut [u64], out: &mut Vec<u32>) {
-    out.clear();
-    let mut g = 0u64;
-    for (i, &b) in buf.iter().enumerate() {
-        g = (g << 8 | fold(b) as u64) & ((1 << (8 * n)) - 1);
-        if i + 1 >= n {
-            let h = gram_hash(g);
-            let (w, bit) = ((h >> 6) as usize, 1u64 << (h & 63));
-            if seen[w] & bit == 0 {
-                seen[w] |= bit;
-                out.push(h);
-            }
-        }
-    }
-    for &h in out.iter() {
-        seen[(h >> 6) as usize] = 0;
-    }
 }
 
 /// Append a bloom filter of these gram hashes to `out`: `bits` per gram, two
@@ -494,20 +483,15 @@ struct DocMeta<'a> {
     mtime: u32,
     rank: i8,
     bloom: &'a [u64],
-    long: &'a [u64],
 }
 
-/// One rayon split's output: trigrams, definition keys and bloom filters of
-/// its docs, flat, plus where each doc's runs are. Reuses one read buffer
-/// and one 2 MiB seen-set.
+/// One run of docs' output: its (trigram, doc) pairs in 256 buckets by the
+/// trigram's first byte (the doc numbered within the run), and definition
+/// keys and bloom filters, flat, plus where each doc's are.
 struct Split {
-    seen: Vec<u64>,
-    buf: Vec<u8>,
-    hashes: Vec<u32>,
-    flat: Vec<u32>,
+    pairs: Vec<Vec<u64>>,
     syms: Vec<u32>,
     blooms: Vec<u64>,
-    longs: Vec<u64>,
     docs: Vec<SplitDoc>,
 }
 
@@ -515,54 +499,50 @@ struct Split {
 struct SplitDoc {
     i: usize,
     text: bool,
-    tri: std::ops::Range<usize>,
     sym: std::ops::Range<usize>,
     bloom: std::ops::Range<usize>,
-    long: std::ops::Range<usize>,
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
 /// to be text are recorded with no trigrams.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
     use std::io::Read;
-    let splits: Vec<Split> = range
-        .clone()
-        .into_par_iter()
-        .with_min_len(256)
-        .fold(
-            || Split {
-                seen: vec![0u64; (1 << 24) / 64],
-                buf: Vec::new(),
-                hashes: Vec::new(),
-                flat: Vec::new(),
-                syms: Vec::new(),
-                blooms: Vec::new(),
-                longs: Vec::new(),
-                docs: Vec::new(),
-            },
-            |mut sp, i| {
-                sp.buf.clear();
-                let text = open_regular(docs.path(i))
-                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
-                let (tri, sym, bl, lo) = (sp.flat.len(), sp.syms.len(), sp.blooms.len(), sp.longs.len());
-                if text {
-                    trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
-                    symbols(&sp.buf, &mut sp.syms);
-                    grams(&sp.buf, GRAM, &mut sp.seen, &mut sp.hashes);
-                    bloom(&sp.hashes, 3, &mut sp.blooms);
-                    grams(&sp.buf, LONG, &mut sp.seen, &mut sp.hashes);
-                    bloom(&sp.hashes, 2, &mut sp.longs);
+    // Docs in runs of 256, a run on one thread with its next 8 files open
+    // and their reads started (`open_ahead`): on a cold cache those reads
+    // overlap the work on earlier files. A read buffer and a 2 MiB seen-set
+    // go back to a pool after each run, so a build holds one per thread.
+    const RUN: usize = 256;
+    const AHEAD: usize = 8;
+    let scratch = std::sync::Mutex::new(Vec::new());
+    let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
+    let splits: Vec<Split> = (runs.into_par_iter())
+        .map(|run| {
+            let (mut seen, mut buf, mut hashes, mut tri) =
+                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 2 << 18], Vec::new(), Vec::new(), Vec::new()));
+            let mut sp = Split { pairs: vec![Vec::new(); 256], syms: Vec::new(), blooms: Vec::new(), docs: Vec::new() };
+            let mut ahead = std::collections::VecDeque::new();
+            for i in run.clone() {
+                while ahead.len() <= AHEAD && i + ahead.len() < run.end {
+                    ahead.push_back(open_ahead(docs.path(i + ahead.len())));
                 }
-                let (bloom, long) = (bl..sp.blooms.len(), lo..sp.longs.len());
-                sp.docs.push(SplitDoc { i, text, tri: tri..sp.flat.len(), sym: sym..sp.syms.len(), bloom, long });
-                sp
-            },
-        )
-        .map(|mut sp| {
-            sp.seen = Vec::new();
-            sp.buf = Vec::new();
-            sp.hashes = Vec::new();
+                buf.clear();
+                let text = (ahead.pop_front().flatten())
+                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut buf).ok())
+                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &buf[..n.min(8192)]).is_none());
+                let (k, sym, bl) = (sp.docs.len() as u64, sp.syms.len(), sp.blooms.len());
+                if text {
+                    index_grams(&buf, &mut seen, &mut tri, &mut hashes);
+                    for &t in &tri {
+                        sp.pairs[(t >> 16) as usize].push((t as u64) << 32 | k);
+                    }
+                    symbols(&buf, &mut sp.syms);
+                    // Big files are candidates far more often (per byte of
+                    // filter too): three bits a gram for them, two for others.
+                    bloom(&hashes, if buf.len() >= 4 << 10 { 3 } else { 2 }, &mut sp.blooms);
+                }
+                sp.docs.push(SplitDoc { i, text, sym: sym..sp.syms.len(), bloom: bl..sp.blooms.len() });
+            }
+            scratch.lock().unwrap().push((seen, buf, hashes, tri));
             sp
         })
         .collect();
@@ -574,80 +554,39 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             let sd = &splits[si].docs[k];
             let (_, _, size, mtime) = docs.items[sd.i];
             let rank = if sd.text { doc_rank(docs.path(sd.i)) } else { NOT_TEXT };
-            let (bloom, long) = (&splits[si].blooms[sd.bloom.clone()], &splits[si].longs[sd.long.clone()]);
-            DocMeta { path: docs.path(sd.i), size, mtime, rank, bloom, long }
+            DocMeta { path: docs.path(sd.i), size, mtime, rank, bloom: &splits[si].blooms[sd.bloom.clone()] }
         })
         .collect();
-    let tris = |d: usize| {
-        let (si, k) = order[d];
-        &splits[si].flat[splits[si].docs[k].tri.clone()]
-    };
     let syms = |d: usize| {
         let (si, k) = order[d];
         &splits[si].syms[splits[si].docs[k].sym.clone()]
     };
-    // Definition keys sort after every trigram (they're above 2^24), so they
-    // follow the trigrams as sorted (key, doc) pairs in either build.
-    let mut sym_pairs: Vec<u64> = (0..order.len()).flat_map(|d| syms(d).iter().map(move |&t| (t as u64) << 32 | d as u64)).collect();
-    sym_pairs.sort_unstable();
-    let pairs: usize = (0..order.len()).map(|d| tris(d).len()).sum();
-    if pairs < 1 << 22 {
-        // Small batch (the usual incremental update): sort the pairs. Cost
-        // scales with the batch, not with the 16.7M-slot trigram space.
-        let mut v: Vec<u64> = Vec::with_capacity(pairs + sym_pairs.len());
-        for d in 0..order.len() {
-            v.extend(tris(d).iter().map(|&t| (t as u64) << 32 | d as u64));
-        }
-        v.sort_unstable();
-        v.extend_from_slice(&sym_pairs);
-        let mut i = 0;
-        return write_segment(dir, id, &meta, |list| {
-            let t = (*v.get(i)? >> 32) as u32;
-            while i < v.len() && (v[i] >> 32) as u32 == t {
-                list.push(v[i] as u32);
-                i += 1;
+    let base: Vec<u64> = splits.iter().scan(0, |n, sp| Some(std::mem::replace(n, *n + sp.docs.len() as u64))).collect();
+    // Postings, built in parallel over runs of keys: a run of trigrams takes
+    // its bucket of every split, the definition keys every doc's.
+    let parts = key_runs()
+        .map(|keys| {
+            let mut pairs: Vec<u64> = Vec::new();
+            if keys.start < 1 << 24 {
+                for (sp, &b) in splits.iter().zip(&base) {
+                    pairs.extend(sp.pairs[(keys.start >> 16) as usize].iter().map(|&p| p + b));
+                }
+            } else {
+                for d in 0..order.len() {
+                    pairs.extend(syms(d).iter().map(|&x| (x as u64) << 32 | d as u64));
+                }
             }
-            Some(t)
-        });
-    }
-    // Big batch (initial build): counting sort over the whole trigram space.
-    let mut count = vec![0u32; 1 << 24];
-    for d in 0..order.len() {
-        for &x in tris(d) {
-            count[x as usize] += 1;
-        }
-    }
-    let keys: Vec<u32> = (0..1u32 << 24).filter(|&t| count[t as usize] != 0).collect();
-    let mut start = vec![0usize; keys.len() + 1];
-    for (k, &t) in keys.iter().enumerate() {
-        start[k + 1] = start[k] + count[t as usize] as usize;
-        count[t as usize] = k as u32; // reuse as trigram -> key index
-    }
-    let mut raw = vec![0u32; start[keys.len()]];
-    let mut cur = start.clone();
-    for d in 0..order.len() {
-        for &x in tris(d) {
-            let k = count[x as usize] as usize;
-            raw[cur[k]] = d as u32;
-            cur[k] += 1;
-        }
-    }
-    drop(count);
-    drop(cur);
-    let (mut k, mut i) = (0, 0);
-    write_segment(dir, id, &meta, |list| {
-        if let Some(&t) = keys.get(k) {
-            list.extend_from_slice(&raw[start[k]..start[k + 1]]);
-            k += 1;
-            return Some(t);
-        }
-        let t = (*sym_pairs.get(i)? >> 32) as u32;
-        while i < sym_pairs.len() && (sym_pairs[i] >> 32) as u32 == t {
-            list.push(sym_pairs[i] as u32);
-            i += 1;
-        }
-        Some(t)
-    })
+            pairs.sort_unstable();
+            let (mut part, mut list) = (Postings::default(), Vec::new());
+            for run in pairs.chunk_by(|a, b| a >> 32 == b >> 32) {
+                list.clear();
+                list.extend(run.iter().map(|&p| p as u32));
+                part.push(order.len(), (run[0] >> 32) as u32, &list);
+            }
+            part
+        })
+        .collect();
+    write_segment(dir, id, &meta, parts)
 }
 
 /// Merge segments into one, dropping tombstoned docs. Postings stay in
@@ -661,61 +600,90 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
             if !s.is_dead(d) {
                 r[d as usize] = meta.len() as u32;
                 let (size, mtime, rank) = (s.size()[d as usize], s.mtime()[d as usize], s.rank()[d as usize]);
-                meta.push(DocMeta { path: s.path(d), size, mtime, rank, bloom: s.bloom_of(d), long: s.long_of(d) });
+                meta.push(DocMeta { path: s.path(d), size, mtime, rank, bloom: s.bloom_of(d) });
             }
         }
         remap.push(r);
     }
-    let mut pos = vec![0usize; segs.len()];
-    let mut part = Vec::new();
-    write_segment(dir, id, &meta, |list| {
-        loop {
-            let t = segs.iter().zip(&pos).filter_map(|(s, &p)| s.tri_key().get(p).copied()).min()?;
-            for (si, s) in segs.iter().enumerate() {
-                if s.tri_key().get(pos[si]) == Some(&t) {
-                    part.clear();
-                    s.list_into(pos[si], &mut part);
-                    list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
-                    pos[si] += 1;
+    // Postings, merged in parallel over runs of keys.
+    let parts = key_runs()
+        .map(|keys| {
+            let k = |s: &Segment, x: u64| s.tri_key().partition_point(|&t| (t as u64) < x);
+            let mut pos: Vec<std::ops::Range<usize>> = segs.iter().map(|s| k(s, keys.start)..k(s, keys.end)).collect();
+            let (mut out, mut list, mut part) = (Postings::default(), Vec::new(), Vec::new());
+            while let Some(t) = segs.iter().zip(&pos).filter(|(_, p)| !p.is_empty()).map(|(s, p)| s.tri_key()[p.start]).min() {
+                list.clear();
+                for (si, s) in segs.iter().enumerate() {
+                    if !pos[si].is_empty() && s.tri_key()[pos[si].start] == t {
+                        part.clear();
+                        s.list_into(pos[si].start, &mut part);
+                        list.extend(part.iter().map(|&d| remap[si][d as usize]).filter(|&d| d != u32::MAX));
+                        pos[si].start += 1;
+                    }
+                }
+                if !list.is_empty() {
+                    out.push(meta.len(), t, &list);
                 }
             }
-            if !list.is_empty() {
-                return Some(t);
-            }
-        }
-    })
+            out
+        })
+        .collect();
+    write_segment(dir, id, &meta, parts)
 }
 
-/// Encode postings (bitset when dense, delta varints otherwise) and write
-/// the segment file. `next` fills one trigram's sorted doc ids into the
-/// (cleared) buffer and returns the trigram, ascending, until None.
-fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut(&mut Vec<u32>) -> Option<u32>) -> Option<Segment> {
+/// The key space in runs that postings are built in, in parallel: the
+/// trigrams 64k at a time, then the definition keys (above 2^24).
+fn key_runs() -> impl IndexedParallelIterator<Item = std::ops::Range<u64>> {
+    (0..257usize).into_par_iter().map(|r| if r < 256 { (r as u64) << 16..(r as u64 + 1) << 16 } else { 1 << 24..1 << 32 })
+}
+
+/// Posting lists for a run of keys, encoded: the keys (ascending), where
+/// each list starts in `post` (with BITSET for a bitset), and the bytes.
+#[derive(Default)]
+struct Postings {
+    keys: Vec<u32>,
+    offs: Vec<u32>,
+    post: Vec<u8>,
+}
+
+impl Postings {
+    /// Add `key`'s docs (ascending) in a segment of `ndocs`: a bitset when
+    /// dense, delta varints otherwise.
+    fn push(&mut self, ndocs: usize, key: u32, list: &[u32]) {
+        self.keys.push(key);
+        if list.len() * 8 > ndocs {
+            self.offs.push(self.post.len() as u32 | BITSET);
+            let at = self.post.len();
+            self.post.resize(at + ndocs.div_ceil(8), 0);
+            for &d in list {
+                self.post[at + d as usize / 8] |= 1 << (d % 8);
+            }
+        } else {
+            self.offs.push(self.post.len() as u32);
+            let mut last = 0u32;
+            for &d in list {
+                put_varint(&mut self.post, d - last);
+                last = d;
+            }
+        }
+    }
+}
+
+/// Write the segment file: docs, and their postings in runs of keys
+/// (ascending).
+fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], parts: Vec<Postings>) -> Option<Segment> {
     if docs.is_empty() {
         return None;
     }
     let ndocs = docs.len();
     let (mut keys, mut tri_off, mut post) = (Vec::new(), Vec::new(), Vec::new());
-    let mut list = Vec::new();
-    loop {
-        list.clear();
-        let Some(t) = next(&mut list) else { break };
-        keys.push(t);
-        if list.len() * 8 > ndocs {
-            tri_off.push(post.len() as u32 | BITSET);
-            let at = post.len();
-            post.resize(at + ndocs.div_ceil(8), 0);
-            for &d in &list {
-                post[at + d as usize / 8] |= 1 << (d % 8);
-            }
-        } else {
-            tri_off.push(post.len() as u32);
-            let mut last = 0u32;
-            for &d in &list {
-                put_varint(&mut post, d - last);
-                last = d;
-            }
-        }
+    for p in &parts {
+        let base = post.len() as u32;
+        keys.extend_from_slice(&p.keys);
+        tri_off.extend(p.offs.iter().map(|&o| ((o & !BITSET) + base) | (o & BITSET)));
+        post.extend_from_slice(&p.post);
     }
+    drop(parts);
     tri_off.push(post.len() as u32);
     let mut paths = Vec::new();
     let mut path_off = vec![0u32];
@@ -728,17 +696,16 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
-    let (mut bloom_off, mut long_off) = (vec![0u32], vec![0u32]);
-    let (mut blooms, mut longs) = (Vec::new(), Vec::new());
+    let mut by_rank: Vec<u32> = (0..ndocs as u32).collect();
+    by_rank.sort_by_key(|&d| (rank_key(docs[d as usize].rank, docs[d as usize].mtime), d));
+    let (mut bloom_off, mut blooms) = (vec![0u32], Vec::new());
     for d in docs {
         blooms.extend_from_slice(d.bloom);
         bloom_off.push(blooms.len() as u32);
-        longs.extend_from_slice(d.long);
-        long_off.push(longs.len() as u32);
     }
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), longs.len()));
-    let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64, blooms.len() as u64, longs.len() as u64]);
+    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len()));
+    let hdr = header(MAGIC, &[ndocs as u64, keys.len() as u64, post.len() as u64, paths.len() as u64, blooms.len() as u64]);
     let sections: [&[u8]; NS] = [
         as_bytes(&keys),
         as_bytes(&tri_off),
@@ -751,8 +718,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         as_bytes(&rank),
         as_bytes(&bloom_off),
         as_bytes(&blooms),
-        as_bytes(&long_off),
-        as_bytes(&longs),
+        as_bytes(&by_rank),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -1000,10 +966,9 @@ impl Content {
         }
     }
 
-    /// Candidate docs for a pattern, filtered by the name query: one list
-    /// per segment searched, with its `FIRST` best-ranked in front
-    /// (unordered).
-    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
+    /// Candidate docs for a pattern, filtered by the name query, per segment
+    /// searched.
+    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Cands> {
         // A scope narrows each segment to the doc range holding its paths.
         let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
         let only_scope = only_scope(filt);
@@ -1015,31 +980,57 @@ impl Content {
             })
             .filter(|(_, docs, _)| !docs.is_empty())
             .collect();
-        let one = |(si, docs, check): &(usize, std::ops::Range<u32>, bool)| {
-            let (s, check) = (&self.segs[*si], *check);
-            let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
+        let one = |&(si, ref docs, check): &(usize, std::ops::Range<u32>, bool)| {
+            let s = &self.segs[si];
             let (rank, mtime) = (s.rank(), s.mtime());
+            let ranked = |d: u32| (rank_key(rank[d as usize], mtime[d as usize]), si as u32, d);
+            let ids = match (!check && docs.len() == s.ndocs).then(|| and_dense(s, plan)).flatten() {
+                // A common pattern (its lists all bitsets, over 1 in 8 docs
+                // holding them all): walk the docs best-ranked first through
+                // the AND's bits, to the segment's FIRST best.
+                Some((mut bits, total)) if total * 8 > s.ndocs => {
+                    let mut top = Vec::with_capacity(FIRST);
+                    for &d in s.by_rank() {
+                        if top.len() == FIRST {
+                            break;
+                        }
+                        let w = &mut bits[d as usize / 64];
+                        if *w >> (d % 64) & 1 != 0 {
+                            *w &= !(1 << (d % 64));
+                            top.push(ranked(d));
+                        }
+                    }
+                    return Cands::Walk { si, bits, top, total };
+                }
+                Some((bits, total)) => set_bits(&bits, total),
+                None => eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect()),
+            };
             let mut v: Vec<Ranked> = Vec::with_capacity(ids.len());
             v.extend(
                 ids.into_iter()
                     .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
                     .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d)),
+                    .map(ranked),
             );
             if v.len() > FIRST {
                 v.select_nth_unstable(FIRST);
             }
-            v
+            Cands::List(v)
         };
-        // About a lane per 50k docs to search: a small index is done on this
-        // thread before a helper would wake.
+        // About a lane per 25k docs to search, at most 8: helpers start
+        // within ~10 us, but past 8 lanes they get in each other's way.
         let docs: usize = work.iter().map(|(_, docs, _)| docs.len()).sum();
-        par_claim(&work, (docs / 50_000).clamp(1, work.len().max(1)), one)
+        par_claim(&work, (docs / 25_000).clamp(1, work.len().max(1)).min(8), one)
     }
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
         let mut per = self.candidates(&g.plan(), filt);
-        let total = per.iter().map(Vec::len).sum();
+        let total: usize = (per.iter())
+            .map(|c| match c {
+                Cands::List(v) => v.len(),
+                Cands::Walk { total, .. } => *total,
+            })
+            .sum();
         // A candidate whose bloom filter lacks one of the pattern's grams
         // can't match: skip it without opening the file.
         let probes = g.probes();
@@ -1053,12 +1044,31 @@ impl Content {
         let best = take_best(&mut per);
         let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
         if r.files.len() < filt.limit && done == best.len() && best.len() < total {
-            let mut rest: Vec<Ranked> = per.concat();
-            rest.par_sort_unstable();
-            let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), READERS, t, |i| path(&rest[i]));
-            r.files.extend(more.files);
-            r.read += more.read;
-            r.complete = more.complete;
+            // Then the next best few thousand, and the others only if
+            // reading gets past those too.
+            let mut rest: Vec<Ranked> = par_claim(&per, per.len().min(8), |c| c.rest(&self.segs)).concat();
+            let next = rest.len().min(8 * FIRST);
+            if next < rest.len() {
+                rest.select_nth_unstable(next);
+            }
+            rest[..next].sort_unstable();
+            let mut at = 0;
+            for end in [next, rest.len()] {
+                if at == end {
+                    continue;
+                }
+                if at > 0 {
+                    rest[at..].par_sort_unstable();
+                }
+                let (more, done) = verify_from(g, end - at, filt.limit - r.files.len(), READERS, t, |i| path(&rest[at + i]));
+                r.files.extend(more.files);
+                r.read += more.read;
+                r.complete = more.complete;
+                if r.files.len() >= filt.limit || done < end - at {
+                    break;
+                }
+                at = end;
+            }
         }
         r.candidates = total;
         r
@@ -1070,8 +1080,50 @@ impl Content {
 /// segment, then doc order. Then its segment and doc.
 type Ranked = (u64, u32, u32);
 
+/// The first part of `Ranked`.
+fn rank_key(rank: i8, mtime: u32) -> u64 {
+    (((127 - rank as i32) as u64) << 32) | (u32::MAX - mtime) as u64
+}
+
 /// Candidates ranked in the first round.
 const FIRST: usize = 512;
+
+/// One segment's candidates.
+enum Cands {
+    /// All of them, its `FIRST` best in front (unordered).
+    List(Vec<Ranked>),
+    /// `total` of them: `top`, its `FIRST` best (in order), and the rest,
+    /// set in `bits`.
+    Walk { si: usize, bits: Vec<u64>, top: Vec<Ranked>, total: usize },
+}
+
+impl Cands {
+    /// What `take_best` left, unordered.
+    fn rest(&self, segs: &[Segment]) -> Vec<Ranked> {
+        match self {
+            Cands::List(v) => v.clone(),
+            Cands::Walk { si, bits, total, .. } => {
+                let s = &segs[*si];
+                let (rank, mtime) = (s.rank(), s.mtime());
+                let docs = set_bits(bits, *total).into_iter();
+                docs.map(|d| (rank_key(rank[d as usize], mtime[d as usize]), *si as u32, d)).collect()
+            }
+        }
+    }
+}
+
+/// The docs set in `bits` (`n` of them), ascending.
+fn set_bits(bits: &[u64], n: usize) -> Vec<u32> {
+    let mut ids = Vec::with_capacity(n);
+    for (w, &x) in bits.iter().enumerate() {
+        let mut x = x;
+        while x != 0 {
+            ids.push(w as u32 * 64 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    ids
+}
 
 /// `items.iter().map(f).collect()` on `lanes` lanes (see `run_lanes`): each
 /// claims the next item.
@@ -1190,13 +1242,18 @@ fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
     assert!(!lanes.panicked.load(Relaxed), "a search lane panicked");
 }
 
-/// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
-/// with its own best in front), in order.
-fn take_best(per: &mut [Vec<Ranked>]) -> Vec<Ranked> {
-    let mut top: Vec<Ranked> = per.iter_mut().flat_map(|v| v.drain(..v.len().min(FIRST))).collect();
+/// Take the `FIRST` best-ranked candidates out of the segments', in order.
+fn take_best(per: &mut Vec<Cands>) -> Vec<Ranked> {
+    let mut top = Vec::new();
+    for c in per.iter_mut() {
+        match c {
+            Cands::List(v) => top.extend(v.drain(..v.len().min(FIRST))),
+            Cands::Walk { top: t, .. } => top.append(t),
+        }
+    }
     if top.len() > FIRST {
         top.select_nth_unstable(FIRST);
-        per[0].extend(top.drain(FIRST..));
+        per.push(Cands::List(top.split_off(FIRST)));
     }
     top.sort_unstable();
     top
@@ -1319,19 +1376,15 @@ impl Grep {
         self.re.get_or_init(|| self.build().expect("literal regex"))
     }
 
-    /// Hashes of the grams every match holds (see `GRAM` and `LONG`).
-    fn probes(&self) -> Probes {
+    /// Hashes of the grams every match holds (see `GRAM`).
+    fn probes(&self) -> Vec<u32> {
         if self.mode == GrepMode::Regex {
-            return Probes::default();
+            return Vec::new();
         }
-        let of = |n: usize| {
-            let mut out: Vec<u32> =
-                self.pattern.as_bytes().windows(n).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect();
-            out.sort_unstable();
-            out.dedup();
-            out
-        };
-        Probes { short: of(GRAM), long: of(LONG) }
+        let mut out: Vec<u32> = self.pattern.as_bytes().windows(GRAM).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     fn plan(&self) -> TQ {
@@ -1343,13 +1396,6 @@ impl Grep {
             GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
         }
     }
-}
-
-/// A pattern's gram hashes, for docs' bloom filters.
-#[derive(Default)]
-struct Probes {
-    short: Vec<u32>,
-    long: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -1608,15 +1654,19 @@ fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> 
 pub enum TQ {
     All,
     Tri(u32),
+    /// Any trigram starting with these two bytes (the high two of three), or
+    /// a doc ending in them.
+    Pair(u32),
     And(Vec<TQ>),
     Or(Vec<TQ>),
 }
 
 fn literal_plan(s: &[u8]) -> TQ {
-    if s.len() < 3 {
-        return TQ::All;
+    match s {
+        [] | [_] => TQ::All,
+        &[a, b] => TQ::Pair((fold(a) as u32) << 16 | (fold(b) as u32) << 8),
+        _ => TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect()),
     }
-    TQ::And(trigrams_small(s).into_iter().map(TQ::Tri).collect())
 }
 
 /// A posting list as stored.
@@ -1701,6 +1751,42 @@ fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
     }
 }
 
+/// For a plan of trigrams whose lists in `s` are all bitsets (or of none):
+/// the live docs holding all of them (the live text docs), as bits, and how
+/// many.
+fn and_dense(s: &Segment, q: &TQ) -> Option<(Vec<u64>, usize)> {
+    let lists: Vec<&[u8]> = match q {
+        TQ::All => Vec::new(),
+        TQ::And(qs) if !qs.is_empty() => qs
+            .iter()
+            .map(|q| match q {
+                TQ::Tri(t) => s.list(*t).and_then(|l| if let List::Bits(b) = l { Some(b) } else { None }),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    let mut bits: Vec<u64> = s.dead.iter().map(|w| !w).collect();
+    if lists.is_empty() {
+        for (d, _) in s.rank().iter().enumerate().filter(|&(_, &r)| r == NOT_TEXT) {
+            bits[d / 64] &= !(1 << (d % 64));
+        }
+        if let Some(w) = bits.last_mut().filter(|_| !s.ndocs.is_multiple_of(64)) {
+            *w &= (1 << (s.ndocs % 64)) - 1;
+        }
+    }
+    for l in lists {
+        for (w, b) in bits.iter_mut().zip(l.chunks(8)) {
+            *w &= match <[u8; 8]>::try_from(b) {
+                Ok(b) => u64::from_le_bytes(b),
+                Err(_) => b.iter().rev().fold(0, |x, &y| x << 8 | y as u64),
+            };
+        }
+    }
+    let total = bits.iter().map(|w| w.count_ones() as usize).sum();
+    Some((bits, total))
+}
+
 /// Docs within `docs` matching `q` in a segment, ascending; None means
 /// every doc. An AND starts from its shortest list and only tests the
 /// others, so common trigrams' long lists are never decoded in full.
@@ -1713,6 +1799,22 @@ fn eval(s: &Segment, q: &TQ, docs: std::ops::Range<u32>) -> Option<Vec<u32>> {
                 l.decode(docs, &mut out);
             }
             Some(out)
+        }
+        TQ::Pair(p) => {
+            let keys = s.tri_key();
+            let mut bits = vec![0u64; s.ndocs.div_ceil(64)];
+            for &k in &keys[keys.partition_point(|&k| k < *p)..keys.partition_point(|&k| k <= p | 0xFF)] {
+                match s.list(k) {
+                    Some(List::Bits(b)) => {
+                        for (w, c) in bits.iter_mut().zip(b.chunks(8)) {
+                            *w |= c.iter().rev().fold(0, |x, &y| x << 8 | y as u64);
+                        }
+                    }
+                    Some(List::Var(b)) => Varints { b, last: 0 }.for_each(|d| bits[d as usize / 64] |= 1 << (d % 64)),
+                    None => {}
+                }
+            }
+            Some(set_bits(&bits, 0).into_iter().filter(|d| docs.contains(d)).collect())
         }
         TQ::And(qs) => {
             let (mut bits, mut vars, mut rest) = (Vec::new(), Vec::new(), Vec::new());
@@ -1984,8 +2086,24 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 /// "don't materialize dataless files" policy keeps iCloud placeholders from
 /// being downloaded just because we searched.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
+    open_sized(path).map(|(f, _)| f)
+}
+
+/// `open_regular`, and the file's size.
+fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+    let m = f.metadata().ok()?;
+    m.is_file().then_some((f, m.len()))
+}
+
+/// `open_regular` for a file about to be indexed, telling the kernel to
+/// start reading it now (as much as indexing reads).
+fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let (f, len) = open_sized(path)?;
+    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
+    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    Some(f)
 }
