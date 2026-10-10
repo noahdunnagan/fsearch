@@ -955,7 +955,7 @@ fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
 const SELECTIVE: usize = 60_000;
 /// Bitset words (64 name ids each) per chunk of a name table: the unit of
 /// parallel scoring and of hit storage (so a chunk's rank fits a u16).
-const CHUNK_WORDS: usize = 256;
+const CHUNK_WORDS: usize = 64;
 /// Restricted scoring with at most this many words to look at runs on the
 /// calling thread.
 const INLINE_WORDS: usize = 4096;
