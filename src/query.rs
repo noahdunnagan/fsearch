@@ -962,8 +962,10 @@ const INLINE_WORDS: usize = 4096;
 /// Entry scoring with at most this many entries to visit runs on the
 /// calling thread.
 const INLINE_VISITS: usize = 4096;
-/// One-token searches expected to match this many names go `ranked`.
+/// One-token searches expected to match this many names go `ranked`;
+/// below BORDERLINE they do not, in between the bitmaps tell (`rankable`).
 const RANKED_MIN: f64 = 20_000.0;
+const BORDERLINE: f64 = 1_000.0;
 /// `driven` tries a token expected to match at most this many names.
 const DRIVEN_NAMES: f64 = 20_000.0;
 /// Cheap bounds `ranked` tells apart: BINS of them from -BIN0.
@@ -1000,9 +1002,9 @@ impl Searcher<'_> {
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
         let Some((lo, hi)) = self.scope_range(q) else { return Vec::new() };
-        if let Some(t) = self.rankable(q, lo, hi) {
+        if let Some((t, tentative)) = self.rankable(q, lo, hi) {
             let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then(|| self.scope_names(lo, hi));
-            if let Some(hits) = self.ranked(q, t, lo, hi, scope.as_deref()) {
+            if let Some(hits) = self.ranked(q, t, lo, hi, scope.as_deref(), tentative) {
                 return hits;
             }
         }
@@ -1030,8 +1032,13 @@ impl Searcher<'_> {
 
     /// The query's token if `ranked` can answer it: one fuzzy token (and any
     /// negated ones), no filter on the entries themselves, and broad enough
-    /// to be worth it (going by how many names have each of its classes).
-    fn rankable<'q>(&self, q: &'q Query, lo: usize, hi: usize) -> Option<&'q Token> {
+    /// to be worth it, going by how many names have each of its classes.
+    /// That guess misses words whose letters go together ("delivery": 1,349
+    /// names guessed, 25k candidates): an unscoped word (letters only; with
+    /// a dot, digit or delimiter a token names a file) it puts between
+    /// BORDERLINE and RANKED_MIN names gets its candidates counted in every
+    /// 64th bitmap word, and if those are many, a tentative try (true).
+    fn rankable<'q>(&self, q: &'q Query, lo: usize, hi: usize) -> Option<(&'q Token, bool)> {
         let mut pos = q.tokens.iter().filter(|t| !t.negate);
         let (Some(t), None) = (pos.next(), pos.next()) else { return None };
         if t.mode != Mode::Fuzzy || q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX) || q.path_re.is_some() || q.limit == 0 {
@@ -1044,9 +1051,18 @@ impl Searcher<'_> {
         if self.live.names_cache.last.lock().unwrap().as_ref().is_some_and(|p| key.narrows(&p.key)) {
             return None;
         }
-        let (counts, u) = (self.live.base.class_counts(), self.live.base.u as f64);
+        let (idx, u) = (&self.live.base, self.live.base.u as f64);
+        let counts = idx.class_counts();
         let est = (0..CLASSES).filter(|&c| t.mask & (1 << c) != 0).fold(u, |e, c| e * counts[c] as f64 / u);
-        (est >= RANKED_MIN).then_some(t)
+        if est >= RANKED_MIN {
+            return Some((t, false));
+        }
+        if est < BORDERLINE || q.scope.is_some() || !t.text.iter().all(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        let tb = TokenBits::new(idx, t);
+        let found = (0..idx.words).step_by(64).map(|w| tb.word(w).0.count_ones() as f64).sum::<f64>() * 64.0;
+        (found >= RANKED_MIN).then_some((t, true))
     }
 
     /// A broad one-token search ("a", "de"): its top `limit` comes from a few
@@ -1062,7 +1078,7 @@ impl Searcher<'_> {
     /// None if fewer than `limit` hits turn up among the few thousand names
     /// with the best bounds: then a name table, which typing can narrow from,
     /// costs about the same.
-    fn ranked(&self, q: &Query, t: &Token, lo: usize, hi: usize, within: Option<&NameSet>) -> Option<Vec<Hit>> {
+    fn ranked(&self, q: &Query, t: &Token, lo: usize, hi: usize, within: Option<&NameSet>, tentative: bool) -> Option<Vec<Hit>> {
         let idx = &self.live.base;
         let (prior, info, ne_off, ne) = (idx.name_prior(), idx.name_info(), idx.name_ents_off(), idx.name_ents());
         let tb = TokenBits::new(idx, t);
@@ -1251,6 +1267,11 @@ impl Searcher<'_> {
             (hits, floor, fkey) = best(hits.into_iter().chain(visit(&batch, fkey)).collect());
             top = cut;
             want *= 4;
+            // A tentative try that one batch does not settle has few good
+            // matches: a name table costs no more and typing can narrow it.
+            if tentative && !(done(floor, top) && floor >= base + by_key.cover) {
+                return None;
+            }
         }
         // Then, if the floor is low, every other name that can still beat
         // it, in one pass.
