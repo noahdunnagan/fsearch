@@ -1526,14 +1526,13 @@ impl Searcher<'_> {
         let idx = &self.live.base;
         let de = idx.dir_entry();
         let en = idx.ent_name();
+        // Each dir's own name, written in parallel into a spare buffer.
         let mut out = MEMO_POOL.lock().unwrap().pop().unwrap_or_default();
-        out.clear();
-        out.resize(idx.d, DirMemo::default());
-        out.par_iter_mut().enumerate().with_min_len(1 << 12).for_each(|(k, slot)| {
-            if k > 0 {
-                *slot = DirMemo::own(names.get(en[de[k] as usize]));
-            }
-        });
+        (0..idx.d)
+            .into_par_iter()
+            .with_min_len(1 << 12)
+            .map(|k| if k > 0 { DirMemo::own(names.get(en[de[k] as usize])) } else { DirMemo::default() })
+            .collect_into_vec(&mut out);
         // Fold ancestors in, parents first. A dir's descendants are one
         // contiguous id range, so the children of huge dirs go one by one,
         // then every small subtree in parallel.
@@ -1904,7 +1903,10 @@ impl NameTable {
     fn dense(&self, idx: &Index) -> &[Short] {
         self.dense.get_or_init(|| {
             let mut d = DENSE_POOL.lock().unwrap().pop().unwrap_or_default();
-            d.resize(idx.words * 64, Short::default());
+            if d.len() != idx.words * 64 {
+                d.clear();
+                d.par_extend(rayon::iter::repeat_n(Short::default(), idx.words * 64));
+            }
             let flags = [idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP)];
             d.par_chunks_mut(CHUNK_WORDS * 64).enumerate().for_each(|(c, out)| {
                 out.fill(Short::default());
