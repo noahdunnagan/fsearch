@@ -152,6 +152,8 @@ impl Query {
                 }
             }
             "kind" => {
+                // The last kind-setting filter wins: no app widening after it.
+                self.apps = false;
                 self.kind = Some(match v {
                     "file" | "f" => KIND_FILE,
                     "dir" | "folder" | "d" => KIND_DIR,
@@ -1584,6 +1586,11 @@ mod tests {
         let f = q("type:app kind:file");
         assert!(f.kind_ok(KIND_FILE));
         assert!(!f.kind_ok(KIND_LINK));
+        // The last kind-setting filter wins: an explicit kind:dir means real
+        // folders, without the app widening.
+        assert!(!q("type:app kind:dir").kind_ok(KIND_LINK));
+        assert!(q("kind:dir type:app").kind_ok(KIND_LINK));
+        assert!(!q("type:app kind:link").kind_ok(KIND_DIR));
     }
 
     /// No `<`/`>`: that whole unit, like `find -mtime 3` (3 to 4 days ago).
