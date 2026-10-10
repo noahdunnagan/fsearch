@@ -1019,12 +1019,13 @@ impl Content {
             let (s, check) = (&self.segs[*si], *check);
             let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
             let (rank, mtime) = (s.rank(), s.mtime());
-            let mut v: Vec<Ranked> = ids
-                .into_iter()
-                .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
-                .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d))
-                .collect();
+            let mut v: Vec<Ranked> = Vec::with_capacity(ids.len());
+            v.extend(
+                ids.into_iter()
+                    .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
+                    .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
+                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d)),
+            );
             if v.len() > FIRST {
                 v.select_nth_unstable(FIRST);
             }
@@ -1675,14 +1676,19 @@ impl List<'_> {
 /// Append the docs within `docs` set in every bitset, ascending.
 fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
     let end = (docs.end as usize).div_ceil(8).min(lists.iter().map(|l| l.len()).min().unwrap_or(0));
+    // A list's 64 docs from byte i (none past its end).
+    let word = |l: &[u8], i: usize| match l.get(i..i + 8) {
+        Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+        None => l[i..].iter().rev().fold(0, |w, &b| w << 8 | b as u64),
+    };
     let mut i = docs.start as usize / 8;
     while i < end {
-        let k = (end - i).min(8);
         let mut w = u64::MAX;
         for l in lists {
-            let mut b = [0u8; 8];
-            b[..k].copy_from_slice(&l[i..i + k]);
-            w &= u64::from_le_bytes(b);
+            w &= word(l, i);
+            if w == 0 {
+                break;
+            }
         }
         while w != 0 {
             let d = i as u32 * 8 + w.trailing_zeros();
@@ -1691,7 +1697,7 @@ fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
             }
             w &= w - 1;
         }
-        i += k;
+        i += 8;
     }
 }
 
