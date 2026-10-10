@@ -5,6 +5,7 @@ use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
 use fsearch::{Engine, GrepMode, Options, Query, try_lock};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,30 +67,39 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
     let me = std::process::id() as i32;
-    let (mut killed, mut stale) = (None, false);
+    let (mut killed, mut named) = (None, None);
     for _ in 0..timeout.as_millis().div_ceil(100) {
         if try_lock(&lock) {
             return Ok(());
         }
-        if killed.is_none() {
-            // Our own pid: left by an earlier daemon, and the holder hasn't
-            // written its own yet. Never signal ourselves; read again.
-            let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
-            stale = pid == Some(me);
-            killed = pid.filter(|&p| p != me);
-            if let Some(pid) = killed {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-            }
+        // Read every time: a new holder writes its pid only after taking the
+        // lock, so until then the file may name a crashed daemon's pid, now
+        // ours or a stranger's. Only an fsearch process gets the signal.
+        let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+        named = pid.or(named);
+        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_fsearch(p)) {
+            unsafe { libc::kill(p, libc::SIGTERM) };
+            killed = Some(p);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(match killed {
-        Some(pid) => format!("daemon {pid} did not exit"),
-        None if stale => {
+    Err(match (killed, named) {
+        (Some(pid), _) => format!("daemon {pid} did not exit"),
+        (None, Some(p)) if p == me => {
             format!("socket.lock holds a stale pid ({me}, this process); the daemon holding the lock never recorded its own: stop it by hand")
         }
-        None => "a daemon is running but did not record its pid; stop it by hand".into(),
+        (None, Some(p)) => {
+            format!("socket.lock holds a stale pid ({p}, not fsearch); the daemon holding the lock never recorded its own: stop it by hand")
+        }
+        (None, None) => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
+}
+
+/// Whether `pid` runs an fsearch binary (the daemon, or its test harness).
+fn is_fsearch(pid: i32) -> bool {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    n > 0 && Path::new(std::ffi::OsStr::from_bytes(&buf[..n as usize])).file_name().is_some_and(|f| f.as_bytes().starts_with(b"fsearch"))
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
@@ -505,22 +515,31 @@ mod tests {
     #[ignore]
     fn lock_holder() {
         let Some(p) = std::env::var_os("FSEARCH_TEST_HOLD") else { return };
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(p).unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(p).unwrap();
         assert!(try_lock(&f));
+        // Like a daemon between taking the lock and recording its pid.
+        let delay = std::env::var("FSEARCH_TEST_HOLD_DELAY").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(delay));
+        f.set_len(0).unwrap();
         write!(f, "{}", std::process::id()).unwrap();
         std::thread::sleep(Duration::from_secs(60));
     }
 
     fn holder(lock: &Path) -> std::process::Child {
-        let c = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "server::tests::lock_holder", "--ignored", "--nocapture"])
-            .env("FSEARCH_TEST_HOLD", lock)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let c = spawn_holder(lock, 0);
         let pid = c.id().to_string();
         wait_for("the holder", || std::fs::read_to_string(lock).is_ok_and(|s| s == pid));
         c
+    }
+
+    fn spawn_holder(lock: &Path, delay_ms: u64) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::tests::lock_holder", "--ignored", "--nocapture"])
+            .env("FSEARCH_TEST_HOLD", lock)
+            .env("FSEARCH_TEST_HOLD_DELAY", delay_ms.to_string())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     #[test]
@@ -542,8 +561,6 @@ mod tests {
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
 
-    /// The lock's holder hasn't written its pid yet, and the file still
-    /// names a stale pid that is now ours: never signal ourselves.
     /// A stale pid that is now ours, with someone else still holding the
     /// lock: say so, rather than claim no pid was recorded.
     #[test]
@@ -559,6 +576,48 @@ mod tests {
         drop(held);
     }
 
+    /// A crashed daemon's pid, since reused by an unrelated process, while
+    /// the new holder hasn't written its own: never signal the stranger.
+    #[test]
+    fn stop_never_signals_a_stranger() {
+        let dir = root().join("stop4");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        let mut stranger = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        std::fs::write(&path, stranger.id().to_string()).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock(&held));
+        let r = stop_within(&dir, Duration::from_millis(300));
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        drop(held);
+        assert!(r.is_err());
+        assert!(alive, "signalled an unrelated process");
+    }
+
+    /// The file names a stranger until the holder records its own pid:
+    /// keep reading, and stop the holder once it does.
+    #[test]
+    fn stop_waits_for_the_holder_to_record_its_pid() {
+        let dir = root().join("stop5");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        let mut stranger = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        std::fs::write(&path, stranger.id().to_string()).unwrap();
+        let mut c = spawn_holder(&path, 400);
+        wait_for("the holder's lock", || !try_lock(&std::fs::File::open(&path).unwrap()));
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let _ = c.kill();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert_eq!(r, Ok(()));
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// The lock's holder hasn't written its pid yet, and the file still
+    /// names a stale pid that is now ours: never signal ourselves.
     #[test]
     fn stop_never_signals_itself() {
         let dir = root().join("stop2");
