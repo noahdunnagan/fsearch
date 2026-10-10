@@ -200,7 +200,7 @@ impl Query {
     pub fn kind_ok(&self, kind: u8) -> bool {
         match self.kind {
             None => true,
-            Some(want) => kind & 3 == want || (self.apps && kind & 3 == KIND_LINK),
+            Some(want) => kind & 3 == want || (self.apps && want == KIND_DIR && kind & 3 == KIND_LINK),
         }
     }
 
@@ -1573,6 +1573,17 @@ mod tests {
         // Older than the epoch: lower bound clamps to 0.
         assert_eq!(q("mtime:<200y").mtime.0, 0);
         assert_eq!(q("mtime:99999999999999999999999y").mtime, (0, 0));
+    }
+
+    /// `type:app` lets symlinks stand in for folders (system apps link into
+    /// the cryptex), not for files: a later `kind:file` means files.
+    #[test]
+    fn apps_admit_links_only_as_folders() {
+        assert!(q("type:app").kind_ok(KIND_LINK));
+        assert!(q("type:app").kind_ok(KIND_DIR));
+        let f = q("type:app kind:file");
+        assert!(f.kind_ok(KIND_FILE));
+        assert!(!f.kind_ok(KIND_LINK));
     }
 
     /// No `<`/`>`: that whole unit, like `find -mtime 3` (3 to 4 days ago).
