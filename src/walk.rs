@@ -16,6 +16,7 @@ pub const NONE: u32 = u32::MAX;
 /// Folders never to open: set when the daemon runs without Full Disk
 /// Access, where opening a consent-gated folder (Downloads, Desktop, ...)
 /// pops a privacy prompt and blocks the call until someone answers it.
+/// Set it with `set_skip`, which normalizes the entries.
 pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 /// Folders a scan was refused (EPERM): without Full Disk Access macOS also
@@ -51,14 +52,15 @@ pub fn prune_denied() {
     }
 }
 
+/// Set SKIP once, its entries normalized: trailing slashes trimmed (they
+/// still name the folder), empty ones dropped (they name nothing). False if
+/// it was already set.
+pub fn set_skip(entries: Vec<Vec<u8>>) -> bool {
+    SKIP.set(entries.iter().filter(|e| !e.is_empty()).map(|e| crate::live::trim_dir(e).to_vec()).collect()).is_ok()
+}
+
 pub fn blocked(path: &[u8]) -> bool {
-    // An entry may be written with trailing slashes; it still names the
-    // folder (`/` itself stays `/`). An empty one names nothing.
-    fn folder(s: &[u8]) -> &[u8] {
-        let end = s.iter().rposition(|&b| b != b'/').map_or(s.len().min(1), |i| i + 1);
-        &s[..end]
-    }
-    SKIP.get().is_some_and(|v| v.iter().filter(|s| !s.is_empty()).any(|s| crate::live::is_ancestor(folder(s), path)))
+    SKIP.get().is_some_and(|v| v.iter().any(|s| crate::live::is_ancestor(s, path)))
 }
 
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -117,26 +119,36 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
 /// as listings of one child each, so index paths stay absolute (as FSEvents
 /// reports them). For `/` it's just the scan.
 pub fn scan_rooted(root: &[u8], threads: usize) -> Vec<Listing> {
+    let mut up = ancestors(root);
+    let k = up.len() as u32;
     let mut ls = scan(root, threads);
-    let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-    let k = comps.len() as u32;
-    if k == 0 {
-        return ls;
-    }
     for l in &mut ls {
         l.id += k;
         for e in l.ents.iter_mut().filter(|e| e.child != NONE) {
             e.child += k;
         }
     }
+    up.append(&mut ls);
+    up
+}
+
+/// The folders above `root` as listings 0..k, each holding only the next
+/// one down (the last pointing at listing k, `root` itself).
+pub fn ancestors(root: &[u8]) -> Vec<Listing> {
     let mut path = Vec::new();
-    for (i, c) in (0..).zip(comps) {
-        path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
-        let mtime = crate::live::mtime_of(&path).unwrap_or(0);
-        let ent = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime, child: i + 1 };
-        ls.push(Listing { id: i, names: c.to_vec(), ents: vec![ent] });
-    }
-    ls
+    let comps = root.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    (0..)
+        .zip(comps)
+        .map(|(i, c)| {
+            path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
+            let mtime = crate::live::mtime_of(&path).unwrap_or(0);
+            Listing {
+                id: i,
+                names: c.to_vec(),
+                ents: vec![RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime, child: i + 1 }],
+            }
+        })
+        .collect()
 }
 
 fn raise_fd_limit() {

@@ -35,7 +35,7 @@ fn skipped_folders_are_never_opened() {
     std::fs::write(root.join("ok/f"), b"x").unwrap();
     let r = root.as_os_str().as_bytes().to_vec();
     let skip = [r.as_slice(), b"/skip"].concat();
-    walk::SKIP.set(vec![skip.clone()]).unwrap();
+    assert!(walk::set_skip(vec![skip.clone()]));
 
     assert!(walk::blocked(&skip));
     assert!(walk::blocked(&[skip.as_slice(), b"/in"].concat()));

@@ -159,7 +159,7 @@ impl Engine {
             }
         };
         if !skip.is_empty() {
-            let _ = walk::SKIP.set(skip);
+            walk::set_skip(skip);
         }
         let dir = opts.dir;
         let (tx, rx) = std::sync::mpsc::channel();

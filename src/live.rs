@@ -437,6 +437,13 @@ pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
     p
 }
 
+/// A folder path without trailing slashes (`/` stays `/`): "/h/" and "/h"
+/// name the same folder.
+pub fn trim_dir(p: &[u8]) -> &[u8] {
+    let end = p.iter().rposition(|&b| b != b'/').map_or(p.len().min(1), |i| i + 1);
+    &p[..end]
+}
+
 /// `dir` is `path` or a folder above it (not just a name prefix: `/a/b`
 /// is not above `/a/bc`).
 pub fn is_ancestor(dir: &[u8], path: &[u8]) -> bool {
@@ -849,11 +856,8 @@ mod tests {
         std::fs::write(t.p("d/inner.txt"), "x").unwrap();
         // The index from while a volume was mounted on d: d flagged, no contents.
         let root = t.bytes();
-        let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-        let k = comps.len() as u32;
-        let mut ls: Vec<Listing> =
-            comps.iter().enumerate().map(|(i, c)| crate::index::tests::lst(i as u32, &[(c, KIND_DIR, 0, i as u32 + 1)])).collect();
-        ls.push(crate::index::tests::lst(k, &[(b"d", KIND_DIR | FLAG_MOUNT, 0, NONE)]));
+        let mut ls = walk::ancestors(root);
+        ls.push(crate::index::tests::lst(ls.len() as u32, &[(b"d", KIND_DIR | FLAG_MOUNT, 0, NONE)]));
         let mut live = Live::new(Index::build(ls, 0, 0, b""));
         // Its contents are scanned in fetch (under the read lock), not in
         // apply under the write lock.
