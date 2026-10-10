@@ -161,8 +161,9 @@ fn bench(qs: &str) {
         live.base.path(h.idx as usize, &mut p);
         println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
     }
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", first, times[times.len() / 2], times[0]);
 }
 
 fn plist_path() -> PathBuf {
