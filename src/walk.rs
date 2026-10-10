@@ -44,10 +44,15 @@ pub fn is_mount(path: &std::ffi::CStr) -> bool {
 pub fn prune_denied() {
     use std::os::unix::ffi::OsStrExt;
     let listed: Vec<Vec<u8>> = DENIED.lock().unwrap().iter().cloned().collect();
-    let gone = |p: &[u8]| std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(p)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-    let gone: Vec<Vec<u8>> = listed.into_iter().filter(|p| gone(p)).collect();
+    // Gone, or no longer a folder.
+    let gone_now = |p: &[u8]| {
+        std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(p)).map_or_else(|e| e.kind() == std::io::ErrorKind::NotFound, |m| !m.is_dir())
+    };
+    let gone: Vec<Vec<u8>> = listed.into_iter().filter(|p| gone_now(p)).collect();
+    // Re-check under the lock: a scan may have refused (and re-added) a
+    // recreated folder since. Only the few gone ones are looked at again.
     let mut denied = DENIED.lock().unwrap();
-    for p in &gone {
+    for p in gone.iter().filter(|p| gone_now(p)) {
         denied.remove(p);
     }
 }
