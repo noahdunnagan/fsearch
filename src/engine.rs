@@ -404,10 +404,6 @@ fn note_skipped(dir: &Path) {
     }
 }
 
-/// Full Disk Access granted since the save: the folders it lacked stay
-/// missing, since no FSEvents replay brings them back. Rescan them like a
-/// must-scan-subdirs event would; ones still refused carry over to the next
-/// save. (A save from before this was recorded rescans the gated folders.)
 /// The folders the saved index lacks, from `skipped`. A save from before
 /// that file existed falls back to the gated folders, but only when nothing
 /// is kept out (`unrestricted`): otherwise probing them is exactly what
@@ -420,6 +416,10 @@ fn lacked(dir: &Path, home: &str, unrestricted: bool) -> Vec<Vec<u8>> {
     }
 }
 
+/// Full Disk Access granted since the save: the folders it lacked stay
+/// missing, since no FSEvents replay brings them back. Rescan the ones that
+/// read now like a must-scan-subdirs event would; the rest carry over to
+/// the next save (see `lacked` and `readable_now`).
 fn rescan_unskipped(shared: &Shared) {
     let was = lacked(&shared.dir, &shared.home, walk::SKIP.get().is_none());
     let now: Vec<_> = readable_now(was).into_iter().map(|path| fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0 }).collect();
