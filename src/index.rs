@@ -413,7 +413,10 @@ impl Index {
     fn tree_is_sound(&self) -> bool {
         use rayon::prelude::*;
         let (de, dp, ds, dl, dend, par) = (self.dir_entry(), self.dir_parent(), self.dir_start(), self.dir_len(), self.dir_end(), self.parent());
-        (self.n == 0 || self.d > 0)
+        // At least the root, entry 0, which is folder 0.
+        (self.n > 0 && self.d > 0 && de[0] == 0)
+            // Ascending: dir_of and descendants binary-search them.
+            && de.par_windows(2).all(|w| w[0] < w[1])
             && (1..self.d).into_par_iter().all(|k| {
                 let p = dp[k] as usize;
                 p < k && ds[p] <= de[k] && de[k] < dend[p] && dend[k] <= dend[p]
@@ -904,6 +907,21 @@ pub(crate) mod tests {
         assert!(refused(at(idx.parent(), a), &b.to_ne_bytes()), "entry inside a folder that comes after it");
         assert!(refused(at(idx.dir_end(), 1), &0u32.to_ne_bytes()), "subtree ending before it starts");
         assert!(refused(16, &0u64.to_le_bytes()), "entries but no folders");
+        // No root: not even one entry.
+        assert!(refused(8, &[0u8; 32]), "an index with nothing in it");
+
+        // Folder entries out of order (dir_of binary-searches them): two
+        // empty sibling folders with their entry ids swapped.
+        let sib = Index::build(vec![lst(0, &[(b"a", D, 0, 1), (b"c", D, 0, 2)]), lst(1, &[]), lst(2, &[])], 0, 0, b"");
+        let sp = t.p("sib.bin");
+        sib.save(&sp).unwrap();
+        let de = sib.dir_entry();
+        let at = de.as_ptr() as usize - sib.map.as_ptr() as usize;
+        let mut b = std::fs::read(&sp).unwrap();
+        b[at + 4..at + 8].copy_from_slice(&de[2].to_ne_bytes());
+        b[at + 8..at + 12].copy_from_slice(&de[1].to_ne_bytes());
+        std::fs::write(&sp, b).unwrap();
+        assert!(Index::load(&sp).is_none(), "folder entries out of order");
     }
 
     /// A corrupt index whose parent links loop must not recurse forever: a
