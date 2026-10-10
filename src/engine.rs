@@ -321,7 +321,9 @@ impl Engine {
         let home = self.s.home.as_bytes();
         let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
         if indexed {
-            return Ok((search_pool().install(|| self.s.content.read().unwrap().search(g, q)), true));
+            // Content search brings its own reader threads; running it here
+            // skips waking a pool thread just to hand the work over.
+            return Ok((self.s.content.read().unwrap().search(g, q), true));
         }
         // Pick files under the lock, read them after releasing it: reading can
         // be slow and a waiting writer would stall every other query.
