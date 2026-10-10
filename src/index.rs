@@ -166,9 +166,8 @@ impl Index {
         let mut deep = Vec::new();
         let mut k = 0;
         let mut e = i as u32;
-        // No real chain is longer than the folder count: a corrupt index
-        // whose parents loop is cut off there, not followed forever.
-        while e != 0 && k + deep.len() < self.d {
+        // Ends: load refuses an index where a walk up could loop.
+        while e != 0 {
             if k < chain.len() {
                 chain[k] = e;
                 k += 1;
@@ -405,6 +404,22 @@ impl Index {
             && self.dir_end().par_iter().all(|&x| x <= n)
             && self.dir_start().par_iter().zip(self.dir_len()).all(|(&s, &l)| s as u64 + l as u64 <= n as u64)
             && self.name_ents().par_iter().all(|&x| x < n)
+            && self.tree_is_sound()
+    }
+
+    /// The shape every build has: parents before children (so no walk up
+    /// can loop), each folder's children after it and inside its subtree,
+    /// subtrees nested in their parent's. Run after the range checks.
+    fn tree_is_sound(&self) -> bool {
+        use rayon::prelude::*;
+        let (de, dp, ds, dl, dend, par) = (self.dir_entry(), self.dir_parent(), self.dir_start(), self.dir_len(), self.dir_end(), self.parent());
+        (self.n == 0 || self.d > 0)
+            && (1..self.d).into_par_iter().all(|k| {
+                let p = dp[k] as usize;
+                p < k && ds[p] <= de[k] && de[k] < dend[p] && dend[k] <= dend[p]
+            })
+            && (0..self.d).into_par_iter().all(|k| de[k] < ds[k].max(1) && ds[k] as u64 + dl[k] as u64 <= dend[k] as u64)
+            && (1..self.n).into_par_iter().all(|i| (de[par[i] as usize] as usize) < i)
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
@@ -846,6 +861,34 @@ pub(crate) mod tests {
         assert!(corrupt(idx.name_ents(), 0, idx.n as u32), "name's entry past the last entry");
     }
 
+    /// Trees no build makes are refused too: a folder parented by itself or
+    /// a later folder (a loop for every walk up), an entry whose folder comes
+    /// after it, a child range that runs backwards, no folders at all.
+    #[test]
+    fn load_rejects_impossible_trees() {
+        let t = Tmp::new("idx-trees");
+        let idx = Index::build(vec![lst(0, &[(b"a", D, 0, 1)]), lst(1, &[(b"b", D, 0, 2), (b"f", F, 1, NONE)]), lst(2, &[])], 0, 0, b"");
+        let path = t.p("index.bin");
+        idx.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let refused = |at: usize, v: &[u8]| {
+            let mut b = bytes.clone();
+            b[at..at + v.len()].copy_from_slice(v);
+            let bad = t.p("bad.bin");
+            std::fs::write(&bad, b).unwrap();
+            Index::load(&bad).is_none()
+        };
+        let at = |sec: &[u32], i: usize| sec.as_ptr() as usize - idx.map.as_ptr() as usize + i * 4;
+        assert_eq!(idx.d, 3);
+        assert!(refused(at(idx.dir_parent(), 1), &1u32.to_ne_bytes()), "folder parented by itself");
+        assert!(refused(at(idx.dir_parent(), 1), &2u32.to_ne_bytes()), "folder parented by a later one");
+        let a = idx.lookup(b"/a").unwrap() as usize;
+        let b = idx.dir_of(idx.lookup(b"/a/b").unwrap()).unwrap();
+        assert!(refused(at(idx.parent(), a), &b.to_ne_bytes()), "entry inside a folder that comes after it");
+        assert!(refused(at(idx.dir_end(), 1), &0u32.to_ne_bytes()), "subtree ending before it starts");
+        assert!(refused(16, &0u64.to_le_bytes()), "entries but no folders");
+    }
+
     /// A corrupt index whose parent links loop must not recurse forever: a
     /// stack overflow would crash the daemon on every start.
     #[test]
@@ -861,12 +904,8 @@ pub(crate) mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[at..at + 4].copy_from_slice(&da.to_ne_bytes());
         std::fs::write(&path, bytes).unwrap();
-        let bad = Index::load(&path).unwrap();
-        let mut p = Vec::new();
-        bad.path(a, &mut p);
-        // No ancestor chain is longer than the folder count: cut off there.
-        let parts = p.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
-        assert!(parts <= bad.d, "{parts} components for {} folders", bad.d);
+        // Refused at load, so no walk up ever meets the loop.
+        assert!(Index::load(&path).is_none());
     }
 
     #[test]
