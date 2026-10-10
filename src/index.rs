@@ -392,17 +392,19 @@ impl Index {
     /// Every id a section holds points inside the section it indexes, so a
     /// corrupt file is refused here rather than panicking at a lookup.
     fn ids_in_range(&self) -> bool {
+        use rayon::prelude::*;
         let (n, d, u) = (self.n as u32, self.d as u32, self.u as u32);
-        let monotonic = |v: &[u32], max: usize| v.windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&x| x as usize <= max);
+        let monotonic = |v: &[u32], max: usize| v.par_windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&x| x as usize <= max);
+        // In parallel: three of these are as long as the whole disk.
         monotonic(self.name_off(), self.names_len)
             && monotonic(self.name_ents_off(), self.n)
-            && self.ent_name().iter().all(|&x| x < u)
-            && self.parent().iter().all(|&x| x < d.max(1))
-            && self.dir_entry().iter().all(|&x| x < n)
-            && self.dir_parent().iter().all(|&x| x < d)
-            && self.dir_end().iter().all(|&x| x <= n)
-            && self.dir_start().iter().zip(self.dir_len()).all(|(&s, &l)| s as u64 + l as u64 <= n as u64)
-            && self.name_ents().iter().all(|&x| x < n)
+            && self.ent_name().par_iter().all(|&x| x < u)
+            && self.parent().par_iter().all(|&x| x < d.max(1))
+            && self.dir_entry().par_iter().all(|&x| x < n)
+            && self.dir_parent().par_iter().all(|&x| x < d)
+            && self.dir_end().par_iter().all(|&x| x <= n)
+            && self.dir_start().par_iter().zip(self.dir_len()).all(|(&s, &l)| s as u64 + l as u64 <= n as u64)
+            && self.name_ents().par_iter().all(|&x| x < n)
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
