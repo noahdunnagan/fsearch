@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX009";
+const MAGIC: &[u8; 8] = b"FSIDX010";
 
 #[derive(Clone, Copy)]
 enum Sec {
@@ -64,7 +64,7 @@ pub struct Index {
     pub synced_at: u32,
     off: [usize; NSEC],
     plan: std::sync::OnceLock<MemoPlan>,
-    counts: std::sync::OnceLock<[u32; CLASSES]>,
+    counts: std::sync::OnceLock<[[u32; CLASSES]; 2]>,
     top_prior: std::sync::OnceLock<i8>,
     by_key: std::sync::OnceLock<ByKey>,
 }
@@ -154,8 +154,21 @@ impl Index {
 
     /// How many names have each char class: a query checks rare ones first.
     pub fn class_counts(&self) -> &[u32; CLASSES] {
+        &self.counts()[0]
+    }
+
+    /// How many names have each char class at least twice.
+    pub fn double_counts(&self) -> &[u32; CLASSES] {
+        &self.counts()[1]
+    }
+
+    fn counts(&self) -> &[[u32; CLASSES]; 2] {
         self.counts.get_or_init(|| {
-            std::array::from_fn(|c| self.bitmap(BM_FIRST + c).iter().zip(self.bitmap(BM_SECOND + c)).map(|(a, b)| (a | b).count_ones()).sum())
+            let count = |b: &[u64]| b.iter().map(|x| x.count_ones()).sum();
+            [
+                std::array::from_fn(|c| self.bitmap(BM_FIRST + c).iter().zip(self.bitmap(BM_SECOND + c)).map(|(a, b)| (a | b).count_ones()).sum()),
+                std::array::from_fn(|c| count(self.bitmap(BM_DOUBLE + c))),
+            ]
         })
     }
 
@@ -691,7 +704,10 @@ pub const BM_START: usize = 2 * CLASSES;
 /// Names starting with a dot; names ending in ".app".
 pub const BM_DOT: usize = BM_START + 23;
 pub const BM_APP: usize = BM_DOT + 1;
-pub const NBITMAPS: usize = BM_APP + 1;
+/// Names with this char class at least twice: a token with a class twice
+/// can only match those (with a typo, it may lose one).
+pub const BM_DOUBLE: usize = BM_APP + 1;
+pub const NBITMAPS: usize = BM_DOUBLE + CLASSES;
 
 /// The bitmaps (see `BM_FIRST` and on) a name is in.
 fn name_bitmaps(s: &[u8]) -> impl Iterator<Item = usize> {
@@ -703,6 +719,17 @@ fn name_bitmaps(s: &[u8]) -> impl Iterator<Item = usize> {
         .chain((0..23).filter(move |h| starts & (1 << h) != 0).map(|h| BM_START + h))
         .chain(s.first().is_some_and(|&c| c == b'.').then_some(BM_DOT))
         .chain(s.ends_with(b".app").then_some(BM_APP))
+        .chain(class(doubled(s), BM_DOUBLE))
+}
+
+/// The char classes `s` has at least twice.
+pub fn doubled(s: &[u8]) -> u64 {
+    let (mut once, mut twice) = (0, 0);
+    for &b in s {
+        twice |= once & char_bit(b);
+        once |= char_bit(b);
+    }
+    twice
 }
 
 #[inline]

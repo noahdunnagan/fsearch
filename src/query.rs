@@ -1,6 +1,6 @@
 //! Name search: parse a query, scan the index in parallel, rank, top-k.
 
-use crate::index::{BM_FIRST, BM_SECOND, BM_START, CLASSES, Index, ZONE, Zone, char_bit, start_bit};
+use crate::index::{BM_DOUBLE, BM_FIRST, BM_SECOND, BM_START, CLASSES, Index, ZONE, Zone, char_bit, start_bit};
 use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
@@ -78,7 +78,9 @@ type Pair = Line<[(u64, u64, u64); 2]>;
 struct TokenBits<'a> {
     /// Each char's class: (first-half, second-half) bitmaps.
     seq: Vec<[&'a [u64]; 2]>,
-    /// The first char's class, then the token's other classes, rarest first.
+    /// The first char's class, then the token's other classes and the ones
+    /// it has twice (as the bitmap of names with them twice, in both
+    /// slots), rarest first.
     classes: Vec<[&'a [u64]; 2]>,
     /// Typo-taking tokens: names with a word starting with the token's
     /// first letter (or one hashing alike).
@@ -90,24 +92,30 @@ impl<'a> TokenBits<'a> {
         let class = |b: u8| char_bit(b).trailing_zeros() as usize;
         let pair = |c: usize| [idx.bitmap(BM_FIRST + c), idx.bitmap(BM_SECOND + c)];
         let first = class(t.text[0]);
-        let counts = idx.class_counts();
-        let mut rest: Vec<usize> = (0..CLASSES).filter(|&c| c != first && t.mask & (1 << c) != 0).collect();
-        rest.sort_by_key(|&c| counts[c]);
+        let (counts, doubles) = (idx.class_counts(), idx.double_counts());
+        // The other classes, and the classes the token has twice (which a
+        // name needs twice too), rarest first.
+        let twice = crate::index::doubled(&t.text);
+        let mut rest: Vec<(u32, [&[u64]; 2])> =
+            (0..CLASSES).filter(|&c| c != first && t.mask & (1 << c) != 0).map(|c| (counts[c], pair(c))).collect();
+        rest.extend((0..CLASSES).filter(|&c| twice & (1 << c) != 0).map(|c| (doubles[c], [idx.bitmap(BM_DOUBLE + c); 2])));
+        rest.sort_by_key(|x| x.0);
         TokenBits {
             seq: t.text.iter().map(|&b| pair(class(b))).collect(),
-            classes: std::iter::once(first).chain(rest).map(pair).collect(),
+            classes: std::iter::once(pair(first)).chain(rest.into_iter().map(|x| x.1)).collect(),
             start: (t.start != 0).then(|| idx.bitmap(BM_START + crate::index::start_hash(t.text[0]))),
         }
     }
 
     /// For the 64 names of word `w`: (can match: `Token::fits`, narrowed by
     /// the halves test; can match cleanly; may match with a typo). Cleanly,
-    /// the name has every class of the token, and some prefix of the token
-    /// fits the classes of its first half and the rest its second half. With
-    /// a typo, a word starts with the first letter, at most one other class
-    /// is missing, and so does the halves test with one char after the
-    /// first left out: every edit `typo_score` takes leaves the rest of the
-    /// token in order in the name.
+    /// the name has every class of the token (twice where the token has it
+    /// twice), and some prefix of the token fits the classes of its first
+    /// half and the rest its second half. With a typo, a word starts with
+    /// the first letter, at most one other of these is missing (an edit
+    /// costs the name one char of the token at most), and so does the
+    /// halves test with one char after the first left out: every edit
+    /// `typo_score` takes leaves the rest of the token in order in the name.
     #[inline]
     fn word(&self, w: usize) -> (u64, u64, u64) {
         self.words::<1>(w)[0]
