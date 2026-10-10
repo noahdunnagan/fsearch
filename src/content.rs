@@ -31,7 +31,7 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG06";
+const MAGIC: &[u8; 8] = b"FSCSEG07";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -104,12 +104,13 @@ enum S {
     Bloom,
     LongOff,
     Long,
+    ByRank,
 }
-const NS: usize = 13;
+const NS: usize = 14;
 
 #[rustfmt::skip]
 fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nlong: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, (ndocs + 1) * 4, nwords * 8, (ndocs + 1) * 4, nlong * 8]
+    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, (ndocs + 1) * 4, nwords * 8, (ndocs + 1) * 4, nlong * 8, ndocs * 4]
 }
 
 impl Segment {
@@ -127,6 +128,8 @@ impl Segment {
     sec!(bloom, S::Bloom, u64, nwords);
     sec!(long_off, S::LongOff, u32, ndocs1);
     sec!(long, S::Long, u64, nlong);
+    // Doc ids, best-ranked first.
+    sec!(by_rank, S::ByRank, u32, ndocs);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -728,6 +731,8 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
+    let mut by_rank: Vec<u32> = (0..ndocs as u32).collect();
+    by_rank.sort_by_key(|&d| (rank_key(docs[d as usize].rank, docs[d as usize].mtime), d));
     let (mut bloom_off, mut long_off) = (vec![0u32], vec![0u32]);
     let (mut blooms, mut longs) = (Vec::new(), Vec::new());
     for d in docs {
@@ -753,6 +758,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         as_bytes(&blooms),
         as_bytes(&long_off),
         as_bytes(&longs),
+        as_bytes(&by_rank),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -1000,10 +1006,9 @@ impl Content {
         }
     }
 
-    /// Candidate docs for a pattern, filtered by the name query: one list
-    /// per segment searched, with its `FIRST` best-ranked in front
-    /// (unordered).
-    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Vec<Ranked>> {
+    /// Candidate docs for a pattern, filtered by the name query, per segment
+    /// searched.
+    fn candidates(&self, plan: &TQ, filt: &Query) -> Vec<Cands> {
         // A scope narrows each segment to the doc range holding its paths.
         let prefix = filt.scope.as_ref().map(|s| [s.as_slice(), b"/"].concat());
         let only_scope = only_scope(filt);
@@ -1015,21 +1020,42 @@ impl Content {
             })
             .filter(|(_, docs, _)| !docs.is_empty())
             .collect();
-        let one = |(si, docs, check): &(usize, std::ops::Range<u32>, bool)| {
-            let (s, check) = (&self.segs[*si], *check);
-            let ids = eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect());
+        let one = |&(si, ref docs, check): &(usize, std::ops::Range<u32>, bool)| {
+            let s = &self.segs[si];
             let (rank, mtime) = (s.rank(), s.mtime());
+            let ranked = |d: u32| (rank_key(rank[d as usize], mtime[d as usize]), si as u32, d);
+            let ids = match (!check && docs.len() == s.ndocs).then(|| and_dense(s, plan)).flatten() {
+                // A common pattern (its lists all bitsets, over 1 in 8 docs
+                // holding them all): walk the docs best-ranked first through
+                // the AND's bits, to the segment's FIRST best.
+                Some((mut bits, total)) if total * 8 > s.ndocs => {
+                    let mut top = Vec::with_capacity(FIRST);
+                    for &d in s.by_rank() {
+                        if top.len() == FIRST {
+                            break;
+                        }
+                        let w = &mut bits[d as usize / 64];
+                        if *w >> (d % 64) & 1 != 0 {
+                            *w &= !(1 << (d % 64));
+                            top.push(ranked(d));
+                        }
+                    }
+                    return Cands::Walk { si, bits, top, total };
+                }
+                Some((bits, total)) => set_bits(&bits, total),
+                None => eval(s, plan, docs.clone()).unwrap_or_else(|| docs.clone().collect()),
+            };
             let mut v: Vec<Ranked> = Vec::with_capacity(ids.len());
             v.extend(
                 ids.into_iter()
                     .filter(|&d| !s.is_dead(d) && rank[d as usize] != NOT_TEXT)
                     .filter(|&d| !check || filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], mtime[d as usize]).is_some())
-                    .map(|d| ((((127 - rank[d as usize] as i32) as u64) << 32) | (u32::MAX - mtime[d as usize]) as u64, *si as u32, d)),
+                    .map(ranked),
             );
             if v.len() > FIRST {
                 v.select_nth_unstable(FIRST);
             }
-            v
+            Cands::List(v)
         };
         // About a lane per 25k docs to search, at most 8: helpers start
         // within ~10 us, but past 8 lanes they get in each other's way.
@@ -1039,7 +1065,12 @@ impl Content {
 
     pub fn search(&self, g: &Grep, filt: &Query) -> GrepResult {
         let mut per = self.candidates(&g.plan(), filt);
-        let total = per.iter().map(Vec::len).sum();
+        let total: usize = (per.iter())
+            .map(|c| match c {
+                Cands::List(v) => v.len(),
+                Cands::Walk { total, .. } => *total,
+            })
+            .sum();
         // A candidate whose bloom filter lacks one of the pattern's grams
         // can't match: skip it without opening the file.
         let probes = g.probes();
@@ -1053,7 +1084,7 @@ impl Content {
         let best = take_best(&mut per);
         let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
         if r.files.len() < filt.limit && done == best.len() && best.len() < total {
-            let mut rest: Vec<Ranked> = per.concat();
+            let mut rest: Vec<Ranked> = par_claim(&per, per.len().min(8), |c| c.rest(&self.segs)).concat();
             rest.par_sort_unstable();
             let (more, _) = verify_from(g, rest.len(), filt.limit - r.files.len(), READERS, t, |i| path(&rest[i]));
             r.files.extend(more.files);
@@ -1070,8 +1101,50 @@ impl Content {
 /// segment, then doc order. Then its segment and doc.
 type Ranked = (u64, u32, u32);
 
+/// The first part of `Ranked`.
+fn rank_key(rank: i8, mtime: u32) -> u64 {
+    (((127 - rank as i32) as u64) << 32) | (u32::MAX - mtime) as u64
+}
+
 /// Candidates ranked in the first round.
 const FIRST: usize = 512;
+
+/// One segment's candidates.
+enum Cands {
+    /// All of them, its `FIRST` best in front (unordered).
+    List(Vec<Ranked>),
+    /// `total` of them: `top`, its `FIRST` best (in order), and the rest,
+    /// set in `bits`.
+    Walk { si: usize, bits: Vec<u64>, top: Vec<Ranked>, total: usize },
+}
+
+impl Cands {
+    /// What `take_best` left, unordered.
+    fn rest(&self, segs: &[Segment]) -> Vec<Ranked> {
+        match self {
+            Cands::List(v) => v.clone(),
+            Cands::Walk { si, bits, total, .. } => {
+                let s = &segs[*si];
+                let (rank, mtime) = (s.rank(), s.mtime());
+                let docs = set_bits(bits, *total).into_iter();
+                docs.map(|d| (rank_key(rank[d as usize], mtime[d as usize]), *si as u32, d)).collect()
+            }
+        }
+    }
+}
+
+/// The docs set in `bits` (`n` of them), ascending.
+fn set_bits(bits: &[u64], n: usize) -> Vec<u32> {
+    let mut ids = Vec::with_capacity(n);
+    for (w, &x) in bits.iter().enumerate() {
+        let mut x = x;
+        while x != 0 {
+            ids.push(w as u32 * 64 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    ids
+}
 
 /// `items.iter().map(f).collect()` on `lanes` lanes (see `run_lanes`): each
 /// claims the next item.
@@ -1190,13 +1263,18 @@ fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
     assert!(!lanes.panicked.load(Relaxed), "a search lane panicked");
 }
 
-/// Take the `FIRST` best-ranked candidates out of the per-segment lists (each
-/// with its own best in front), in order.
-fn take_best(per: &mut [Vec<Ranked>]) -> Vec<Ranked> {
-    let mut top: Vec<Ranked> = per.iter_mut().flat_map(|v| v.drain(..v.len().min(FIRST))).collect();
+/// Take the `FIRST` best-ranked candidates out of the segments', in order.
+fn take_best(per: &mut Vec<Cands>) -> Vec<Ranked> {
+    let mut top = Vec::new();
+    for c in per.iter_mut() {
+        match c {
+            Cands::List(v) => top.extend(v.drain(..v.len().min(FIRST))),
+            Cands::Walk { top: t, .. } => top.append(t),
+        }
+    }
     if top.len() > FIRST {
         top.select_nth_unstable(FIRST);
-        per[0].extend(top.drain(FIRST..));
+        per.push(Cands::List(top.split_off(FIRST)));
     }
     top.sort_unstable();
     top
@@ -1699,6 +1777,28 @@ fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
         }
         i += 8;
     }
+}
+
+/// For a plan of trigrams whose lists in `s` are all bitsets: the live docs
+/// holding all of them, as bits, and how many.
+fn and_dense(s: &Segment, q: &TQ) -> Option<(Vec<u64>, usize)> {
+    let TQ::And(qs) = q else { return None };
+    let lists = qs.iter().map(|q| match q {
+        TQ::Tri(t) => s.list(*t).and_then(|l| if let List::Bits(b) = l { Some(b) } else { None }),
+        _ => None,
+    });
+    let lists: Vec<&[u8]> = lists.collect::<Option<_>>().filter(|l: &Vec<_>| !l.is_empty())?;
+    let mut bits: Vec<u64> = s.dead.iter().map(|w| !w).collect();
+    for l in lists {
+        for (w, b) in bits.iter_mut().zip(l.chunks(8)) {
+            *w &= match <[u8; 8]>::try_from(b) {
+                Ok(b) => u64::from_le_bytes(b),
+                Err(_) => b.iter().rev().fold(0, |x, &y| x << 8 | y as u64),
+            };
+        }
+    }
+    let total = bits.iter().map(|w| w.count_ones() as usize).sum();
+    Some((bits, total))
 }
 
 /// Docs within `docs` matching `q` in a segment, ascending; None means
