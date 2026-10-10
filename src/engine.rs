@@ -423,7 +423,9 @@ const GATED_IN_HOME: &[&str] = &[
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
-    GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+    // However home is written: "/Users/me/" would give "//Desktop".
+    let home = crate::live::trim_dir(home.as_bytes());
+    GATED_IN_HOME.iter().map(|d| crate::live::join(home, d.as_bytes())).chain([b"/Volumes".to_vec()]).collect()
 }
 
 /// The system TCC database is readable only with Full Disk Access, and
