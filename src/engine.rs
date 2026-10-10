@@ -599,17 +599,19 @@ fn sync(shared: &Shared, pool: &rayon::ThreadPool, home: &[u8], dirs: &[Vec<u8>]
     let n = todo.len();
     shared.content_pending.store(n, Ordering::Relaxed);
     // A first build (fresh install, format change) is a one-time wait the
-    // user is watching: every core at user-initiated QoS, and two batches in
+    // user is watching: 8 threads at user-initiated QoS, and two batches in
     // flight, so one's single-threaded parts (a run of big files, the
-    // segment write) run beside the other's reads. Each batch in flight holds
-    // ~270 MB at its peak, so a third (5% faster) would take the build to
-    // ~1 GB. Measured on HOME (730k files, 16 cores): 104-134 s on the 4
-    // utility threads; on all cores 27.7-29.5 s one at a time, 22.6-25.2 s
-    // two in flight.
+    // segment write) run beside the other's reads. Each thread keeps its
+    // next files opened ahead, and past 8 threads those opens only contend
+    // in the kernel. Measured on HOME (730k files, M4 Max, with
+    // speed-content's open-ahead build): 99-155 s on the 4 utility threads;
+    // 8 threads 17.2-17.5 s (61 s system CPU), 12 threads 22.0-24.3 s, 16
+    // threads 27.2-30.1 s (250-300 s system CPU). A third batch in flight
+    // (16.3-17.2 s) would add ~70 MB to the ~650 MB peak.
     let fast;
     let (pool, inflight) = if first {
-        let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
-        fast = content_pool(cores, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
+        fast = content_pool(threads, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
         (&fast, 2)
     } else {
         (pool, 1)
