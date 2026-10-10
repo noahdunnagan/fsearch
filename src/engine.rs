@@ -454,9 +454,18 @@ fn readable_now(was: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 /// The owner's first index, or None once this engine has become the owner
 /// and there is none to load.
 fn wait_for_index(s: &Shared) -> Option<Index> {
+    let path = s.dir.join("index.bin");
+    // A file that failed to load is checked again only once it changes, not
+    // fully re-validated every second.
+    let stamp = || std::fs::metadata(&path).ok().map(|m| (m.len(), m.modified().ok()));
+    let mut refused = None;
     loop {
-        if let Some(b) = Index::load(&s.dir.join("index.bin")) {
-            return Some(b);
+        let now = stamp();
+        if now.is_some() && now != refused {
+            match Index::load(&path) {
+                Some(b) => return Some(b),
+                None => refused = now,
+            }
         }
         if take_lock(s) {
             // The owner may have saved one just before it quit.
