@@ -1598,8 +1598,10 @@ impl Searcher<'_> {
             }
             (hits, ok)
         };
-        let mut bits = vec![0u64; idx.words];
-        let mut rank = vec![0u16; idx.words];
+        // A spare pair from the last table (its bits cleared; ranks are only
+        // read where a bit is set), or fresh ones.
+        let spare_bits = BITS_POOL.lock().unwrap().pop().filter(|(b, _)| b.len() == idx.words);
+        let (mut bits, mut rank) = spare_bits.unwrap_or_else(|| (vec![0; idx.words], vec![0; idx.words]));
         // A few thousand words to look at (a small index, a scope, a
         // narrowed table) take less time than waking threads.
         let few = from.map_or(within.map_or(idx.words, |s| s.words), |f| f.len) <= INLINE_WORDS;
@@ -1985,16 +1987,34 @@ static HIT_POOL: std::sync::Mutex<Vec<Vec<NameHit>>> = std::sync::Mutex::new(Vec
 
 /// Free the spare buffers searches keep for speed (after a quiet spell).
 pub fn trim_pools() {
+    BITS_POOL.lock().unwrap().clear();
     HIT_POOL.lock().unwrap().clear();
     DENSE_POOL.lock().unwrap().clear();
     MEMO_POOL.lock().unwrap().clear();
 }
+
+/// A spare name table bitset and rank (344 KB on this disk): allocating
+/// and freeing them each search cost page faults and madvise.
+#[allow(clippy::type_complexity)]
+static BITS_POOL: std::sync::Mutex<Vec<(Vec<u64>, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
 
 /// Spare `NameTable::dense` views (8.9 MB on this disk).
 static DENSE_POOL: std::sync::Mutex<Vec<Vec<Short>>> = std::sync::Mutex::new(Vec::new());
 
 impl Drop for NameTable {
     fn drop(&mut self) {
+        // Only the chunks holding hits have bits to clear.
+        if !self.bits.is_empty() {
+            for (chunk, hits) in self.bits.chunks_mut(CHUNK_WORDS).zip(&self.hits) {
+                if !hits.is_empty() {
+                    chunk.fill(0);
+                }
+            }
+            let mut pool = BITS_POOL.lock().unwrap();
+            if pool.is_empty() {
+                pool.push((std::mem::take(&mut self.bits), std::mem::take(&mut self.rank)));
+            }
+        }
         if let Some(d) = self.dense.take() {
             let mut pool = DENSE_POOL.lock().unwrap();
             if pool.is_empty() {
