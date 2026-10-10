@@ -78,6 +78,22 @@ fn usage() {
     }
 }
 
+/// A HOME long enough that the socket path can't fit sockaddr_un: a
+/// clear error, at once, from the client and from `serve`; no panic.
+#[test]
+fn socket_path_too_long() {
+    let h = Home::new(&"x".repeat(60));
+    assert!(h.data().join("fsearch.sock").as_os_str().len() > 103);
+    let t = Instant::now();
+    let o = h.run(&["status"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("socket path too long"), "{}", err(&o));
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let o = h.run(&["serve"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("socket path too long") && !err(&o).contains("panicked"), "{}", err(&o));
+}
+
 #[test]
 fn bench_needs_an_index() {
     let h = Home::new("bench");

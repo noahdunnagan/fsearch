@@ -13,6 +13,14 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
+/// sockaddr_un holds 104 bytes, NUL included: a longer path (a long HOME)
+/// can't be bound or connected to at all.
+pub fn check_socket(dir: &Path) -> Result<(), String> {
+    let sock = socket_path(dir);
+    let n = sock.as_os_str().len();
+    if n > 103 { Err(format!("socket path too long ({n} bytes, at most 103): {}", sock.display())) } else { Ok(()) }
+}
+
 pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
@@ -34,7 +42,13 @@ pub fn serve(dir: PathBuf, home: String) {
     };
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).expect("bind socket");
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{} bind {}: {e}", fsearch::query::now_secs(), sock.display());
+            return;
+        }
+    };
     for conn in listener.incoming().flatten() {
         let e = engine.clone();
         std::thread::spawn(move || handle(conn, &e));
@@ -226,6 +240,8 @@ fn kind_name(k: u8) -> &'static str {
 
 /// Connect to the daemon, starting it if it isn't running.
 pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
+    // Not worth starting a daemon that can never listen.
+    check_socket(dir).map_err(std::io::Error::other)?;
     let sock = socket_path(dir);
     if let Ok(s) = UnixStream::connect(&sock) {
         return Ok(s);

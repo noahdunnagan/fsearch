@@ -87,7 +87,10 @@ fn main() {
     let json = !json.is_empty();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
-        Some("serve") => server::serve(data_dir(), home()),
+        Some("serve") => {
+            server::check_socket(&data_dir()).unwrap_or_else(|e| die(&e));
+            server::serve(data_dir(), home())
+        }
         Some("stdio") => stdio(),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
