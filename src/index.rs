@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FSIDX010";
+const MAGIC: &[u8; 8] = b"FSIDX011";
 
 #[derive(Clone, Copy)]
 enum Sec {
@@ -40,9 +40,11 @@ enum Sec {
     NameEnts,
     NamePrior,
     NameInfo,
+    NameExt,
+    Exts,
     Zones,
 }
-const NSEC: usize = 19;
+const NSEC: usize = 21;
 
 pub struct Index {
     map: Mmap,
@@ -56,6 +58,7 @@ pub struct Index {
     pub words: usize,
     bits_len: usize,
     zones_len: usize,
+    ext_slots: usize,
     /// FSEvents id the index is current as of; replay starts here.
     pub event_id: u64,
     /// Wall-clock second the index is known complete as of (0: unknown).
@@ -143,6 +146,19 @@ impl Index {
     sec!(name_prior, Sec::NamePrior, i8, u);
     // Per distinct name, what bounds its score without reading it.
     sec!(name_info, Sec::NameInfo, NameInfo, u);
+    // Per distinct name, its extension as an `ext_table` slot: 0 none, 255
+    // one not in the table.
+    sec!(name_ext, Sec::NameExt, u8, u);
+    // The EXT_SLOTS most common extensions among the names, lowercased: slot
+    // i is `[len, bytes..]` (slot 0 and 255 unused).
+    sec!(ext_table, Sec::Exts, [u8; 16], ext_slots);
+
+    /// The `name_ext` slot of extension `e` (lowercase): 255 if it is not
+    /// in the table (names with such an extension have to be read).
+    pub fn ext_slot(&self, e: &[u8]) -> u8 {
+        let t = self.ext_table();
+        (1..255).find(|&i| t[i][0] as usize == e.len() && &t[i][1..1 + e.len()] == e).unwrap_or(255) as u8
+    }
     // Per ZONE entries: what a filter on size, mtime or kind can skip.
     sec!(zones, Sec::Zones, Zone, zones_len);
 
@@ -470,6 +486,9 @@ impl Index {
         let info: Vec<NameInfo> =
             (0..u).into_par_iter().map(|k| NameInfo::of(&unames[uoff[k] as usize..uoff[k + 1] as usize], name_prior[k])).collect();
         put(Sec::NameInfo, as_bytes(&info));
+        let (table, slots) = ext_slots(&unames, &uoff);
+        put(Sec::NameExt, &slots);
+        put(Sec::Exts, as_bytes(&table));
         put(Sec::Zones, as_bytes(&zones(&kind[..n], &enc, &mtime[..n])));
         m[..HDR].copy_from_slice(&header(MAGIC, &[n as u64, d as u64, u as u64, unames.len() as u64, event_id, synced_at as u64]));
         Index::from_map(m.make_read_only().unwrap()).unwrap()
@@ -491,6 +510,7 @@ impl Index {
             words,
             bits_len: words * NBITMAPS,
             zones_len: n.div_ceil(ZONE),
+            ext_slots: 256,
             event_id: event_id as u64,
             synced_at: synced_at as u32,
             off,
@@ -579,6 +599,36 @@ pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+/// A name's extension, lowercased: the bytes after its last dot.
+fn ext_of(name: &[u8]) -> Option<Vec<u8>> {
+    let dot = name.iter().rposition(|&b| b == b'.')?;
+    Some(name[dot + 1..].iter().map(|&b| crate::query::fold(b)).collect())
+}
+
+/// The table of the 254 most common extensions among `names` (each at
+/// most 15 bytes) and each name's slot in it (see `Index::name_ext`).
+pub(crate) fn ext_slots(names: &[u8], off: &[u32]) -> (Vec<[u8; 16]>, Vec<u8>) {
+    let u = off.len() - 1;
+    let name = |k: usize| &names[off[k] as usize..off[k + 1] as usize];
+    let mut count: HashMap<Vec<u8>, u32> = HashMap::new();
+    for k in 0..u {
+        if let Some(e) = ext_of(name(k)).filter(|e| e.len() < 16) {
+            *count.entry(e).or_default() += 1;
+        }
+    }
+    let mut common: Vec<(Vec<u8>, u32)> = count.into_iter().collect();
+    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut table = vec![[0u8; 16]; 256];
+    let mut slot: HashMap<Vec<u8>, u8> = HashMap::new();
+    for (i, (e, _)) in common.into_iter().take(254).enumerate() {
+        table[i + 1][0] = e.len() as u8;
+        table[i + 1][1..1 + e.len()].copy_from_slice(&e);
+        slot.insert(e, i as u8 + 1);
+    }
+    let slots = (0..u).into_par_iter().map(|k| ext_of(name(k)).map_or(0, |e| slot.get(&e).copied().unwrap_or(255))).collect();
+    (table, slots)
+}
+
 impl NameInfo {
     /// The info of a name whose folders' best location prior is `prior`.
     pub fn of(name: &[u8], prior: i8) -> NameInfo {
@@ -597,7 +647,7 @@ impl NameInfo {
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize) -> [usize; NSEC] {
     let (n4, d4, u4) = (n * 4, d * 4, (u + 1) * 4);
     let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
-    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, u * 4, z]
+    [u.div_ceil(64) * NBITMAPS * 8, u4, names_len, n4, n, n4, n4, n4, d4, d4, d4, d4, d, d4, u4, n4, u, u * 4, u, 256 * 16, z]
 }
 
 /// Entries per `Zone`.

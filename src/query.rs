@@ -1492,16 +1492,38 @@ impl Searcher<'_> {
             return NameTable::new(Vec::new(), Vec::new(), Vec::new(), idx.n, true);
         }
         let ne_off = idx.name_ents_off();
+        // One token, no negation and an `ext:`: no folder memo reads the
+        // table, so only names with an allowed extension matter.
+        let by_ext = pos.len() == 1 && neg.is_empty() && !q.exts.is_empty();
         let toks: Vec<TokenBits> = pos.iter().chain(neg).map(|t| TokenBits::new(idx, t)).collect();
         let space = char_bit(b' ').trailing_zeros() as usize;
         let space = [idx.bitmap(BM_FIRST + space), idx.bitmap(BM_SECOND + space)];
         // Name filters as bitmap prefilters: a name passing `ext:` contains
         // ".ext"; one passing `re:` contains a literal every match starts with.
         let filter = |lits: Vec<Vec<u8>>| lits.into_iter().map(Token::literal).collect::<Vec<_>>();
-        let ext_toks = (!q.exts.is_empty() && q.exts.len() <= 8).then(|| filter(q.exts.iter().map(|e| [b".", &e[..]].concat()).collect()));
         let re_toks = q.name_re.as_ref().and_then(re_literals).map(filter);
-        let bits_of = |t: &Option<Vec<Token>>| t.as_ref().map(|t| t.iter().map(|t| TokenBits::new(idx, t)).collect::<Vec<_>>());
-        let (ext_bits, re_bits) = (bits_of(&ext_toks), bits_of(&re_toks));
+        let re_bits = re_toks.as_ref().map(|t| t.iter().map(|t| TokenBits::new(idx, t)).collect::<Vec<_>>());
+        // `ext:` as the extension slots it allows (see `Index::name_ext`):
+        // only a name whose extension is not in the table needs reading.
+        let ext_slots = idx.name_ext();
+        let mut allow = [0u64; 4];
+        for e in &q.exts {
+            let s = idx.ext_slot(e) as usize;
+            allow[s / 64] |= 1 << (s % 64);
+        }
+        let ext_ok_k = |k: usize, name: &[u8]| {
+            let s = ext_slots[k] as usize;
+            allow[s / 64] >> (s % 64) & 1 != 0 && (s != 255 || ext_ok(name, &q.exts))
+        };
+        // The names of word w whose slot the filter allows.
+        let ext_word = |w: usize| -> u64 {
+            if q.exts.is_empty() {
+                return !0;
+            }
+            let slots = &ext_slots[w * 64..(w * 64 + 64).min(idx.u)];
+            slots.iter().enumerate().fold(0, |m, (i, &s)| m | (allow[s as usize / 64] >> (s % 64) & 1) << i)
+        };
+        let (dot, app) = (idx.bitmap(crate::index::BM_DOT), idx.bitmap(crate::index::BM_APP));
         // Name k is bit i of lane j of `per` (each token's
         // `TokenBits::words`). `re` is the task's own copy of `name_re`:
         // sharing one regex's cache pool across threads costs more than the
@@ -1509,8 +1531,13 @@ impl Searcher<'_> {
         let score_one =
             |k: usize, i: u32, per: &[Pair], j: usize, spaced: bool, re: Option<&regex::bytes::Regex>, ok_entries: &mut usize| -> Option<NameHit> {
                 let name = idx.uname(k as u32);
-                let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
-                let bit = |x: u64| x >> i & 1 != 0;
+                let (w, bit) = (k / 64, |x: u64| x >> i & 1 != 0);
+                // A filter alone reads no name for its flags.
+                let flags = match pos.is_empty() {
+                    true => (if bit(dot[w]) { NF_DOT } else { 0 }) | (if bit(app[w]) { NF_APP } else { 0 }),
+                    false => name_flags(name),
+                };
+                let mut h = NameHit { score: 0, bits: 0, flags, best: [0; 4] };
                 for (t, tok) in pos.iter().enumerate() {
                     let (fits, clean, typo) = per[t].0[j];
                     if bit(fits)
@@ -1531,7 +1558,7 @@ impl Searcher<'_> {
                 // as a folder on someone's path, the raw token bits matter.
                 let ok = (pos.is_empty() || h.bits != 0)
                     && h.flags & NF_NEG == 0
-                    && (q.exts.is_empty() || ext_ok(name, &q.exts))
+                    && (q.exts.is_empty() || ext_ok_k(k, name))
                     && re.is_none_or(|re| re.is_match(name));
                 if ok {
                     h.flags |= NF_OK;
@@ -1582,8 +1609,10 @@ impl Searcher<'_> {
                         // With no positive token every name is a candidate,
                         // unless a name filter says which can pass.
                         if pos.is_empty() {
-                            let some = |f: &Option<Vec<TokenBits>>| f.as_ref().map_or(!0, |f| f.iter().fold(0, |a, t| a | t.word(w).0));
-                            any |= !0 >> (64 - (idx.u - w * 64).min(64)) & some(&ext_bits) & some(&re_bits);
+                            let re = re_bits.as_ref().map_or(!0, |f| f.iter().fold(0, |a, t| a | t.word(w).0));
+                            any |= !0 >> (64 - (idx.u - w * 64).min(64)) & ext_word(w) & re;
+                        } else if by_ext && any != 0 {
+                            any &= ext_word(w);
                         }
                         let mut cand = cand_of(w) & any;
                         while cand != 0 {
