@@ -82,7 +82,9 @@ fn main() {
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
     unsafe { setiopolicy_np(3, 0, 1) };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--json` may come anywhere; the command is the first other word.
+    let (json, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a == "--json");
+    let json = !json.is_empty();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
         Some("serve") => server::serve(data_dir(), home()),
@@ -91,11 +93,7 @@ fn main() {
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
-        Some(_) => {
-            let json = args.iter().any(|a| a == "--json");
-            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-            print_one(&serde_json::json!({"q": q.join(" ")}), json);
-        }
+        Some(_) => print_one(&serde_json::json!({"q": args.join(" ")}), json),
     }
 }
 

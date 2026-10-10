@@ -71,7 +71,8 @@ fn err(o: &Output) -> String {
 #[test]
 fn usage() {
     let h = Home::new("usage");
-    for args in [&[][..], &["-h"], &["--help"]] {
+    // `--json` alone is no query either.
+    for args in [&[][..], &["-h"], &["--help"], &["--json"]] {
         let o = h.run(args);
         assert!(o.status.success() && err(&o).contains("usage:"), "{args:?}");
     }
@@ -104,6 +105,9 @@ fn searches_through_the_daemon() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(status["entries"].as_u64().unwrap() > 0);
+    // A flag before the command doesn't turn it into a search for "status".
+    let v: serde_json::Value = serde_json::from_slice(&h.run(&["--json", "status"]).stdout).unwrap();
+    assert!(v["entries"].as_u64().is_some_and(|n| n > 0), "{v}");
     let pid = std::fs::read_to_string(h.data().join("socket.lock")).unwrap();
     assert!(pid.parse::<u32>().is_ok());
 
