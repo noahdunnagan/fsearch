@@ -240,6 +240,17 @@ impl Index {
         &self.names()[o[id as usize] as usize..o[id as usize + 1] as usize]
     }
 
+    /// The 64 bytes of the map from name `id` on, if the name is no longer
+    /// and the map goes that far: SIMD reads them whole and masks off what
+    /// follows the name.
+    #[inline]
+    pub fn uname_wide(&self, id: u32) -> Option<&[u8; 64]> {
+        let o = self.name_off();
+        let (a, b) = (o[id as usize] as usize, o[id as usize + 1] as usize);
+        let at = self.off[Sec::Names as usize] + a;
+        (b - a <= 64).then(|| self.map.get(at..at + 64)?.try_into().ok()).flatten()
+    }
+
     pub fn name(&self, i: usize) -> &[u8] {
         self.uname(self.ent_name()[i])
     }

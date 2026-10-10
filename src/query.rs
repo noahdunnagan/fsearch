@@ -176,7 +176,7 @@ fn name_hit(idx: &Index, q: &Query, pos: &[&Token], neg: &[&Token], re: Option<&
     let mut h = NameHit { score: 0, bits: 0, flags: name_flags(name), best: [0; 4] };
     for (t, tok) in pos.iter().enumerate() {
         if tok.fits(m)
-            && let Some(s) = token_score(name, m, tok)
+            && let Some(s) = token_score(name, idx.uname_wide(k), m, tok)
         {
             h.bits |= 1 << t;
             let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -425,7 +425,7 @@ impl Query {
         // before the folders are looked at.
         let mut pos = self.tokens.iter().filter(|t| !t.negate).peekable();
         let m = crate::index::name_mask(name);
-        if pos.peek().is_some() && !pos.any(|t| t.fits(m) && token_score(name, m, t).is_some()) {
+        if pos.peek().is_some() && !pos.any(|t| t.fits(m) && token_score(name, None, m, t).is_some()) {
             return None;
         }
         if self.tokens.iter().any(|t| t.negate && token_matches(name, t)) {
@@ -439,7 +439,7 @@ impl Query {
         let all = (1u32 << pos.len()) - 1;
         let (mut got, mut inherited, mut score) = (0u32, 0u32, 0i32);
         for (t, tok) in pos.iter().enumerate() {
-            if let Some(s) = token_score(name, m, tok) {
+            if let Some(s) = token_score(name, None, m, tok) {
                 got |= 1 << t;
                 score += s;
             } else if let Some(s) = d.best[t] {
@@ -463,7 +463,7 @@ impl Query {
         let mut d = DirMatch { negated: false, best: [None; 8] };
         d.negated = self.tokens.iter().any(|t| t.negate && comps().any(|c| token_matches(c, t)));
         for (t, tok) in self.tokens.iter().filter(|t| !t.negate).enumerate() {
-            d.best[t] = comps().filter_map(|c| token_score(c, !0, tok)).max();
+            d.best[t] = comps().filter_map(|c| token_score(c, None, !0, tok)).max();
         }
         d
     }
@@ -613,17 +613,28 @@ fn bonus(prev: Class, cur: Class) -> i32 {
 /// fzf-v1 style: leftmost-ending match, shrunk from the right, then scored
 /// with boundary/camel/consecutive bonuses. Returns None when no match.
 pub fn fuzzy_score(name: &[u8], q: &[u8]) -> Option<i32> {
-    fuzzy_score_capped(name, q, 100)
+    fuzzy_score_capped(name, None, q, 100)
 }
 
+/// A name's 64 bytes in the index from its start, if it is no longer
+/// (`Index::uname_wide`): what follows it is masked off.
+type Wide<'a> = Option<&'a [u8; 64]>;
+
 /// `fuzzy_score` with the whole-name/stem/prefix bonus capped at `cap`.
-fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+fn fuzzy_score_capped(name: &[u8], wide: Wide, q: &[u8], cap: i32) -> Option<i32> {
     if let Some(s) = prefix_score(name, q, cap) {
         return Some(s);
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = wide;
     #[cfg(target_arch = "aarch64")]
     if name.len() <= 64 && q.len() <= 32 {
-        return fuzzy_masked(name, q, cap);
+        if let Some(w) = wide {
+            return fuzzy_masked(name, w, q, cap);
+        }
+        let mut buf = [0u8; 64];
+        buf[..name.len()].copy_from_slice(name);
+        return fuzzy_masked(name, &buf, q, cap);
     }
     // Leftmost-ending match: jump to each query byte in turn (memchr is
     // SIMD; most names fail on the first or second byte).
@@ -638,18 +649,16 @@ fn fuzzy_score_capped(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
 }
 
 /// `fuzzy_score_capped` past the prefix test, for a name of at most 64
-/// bytes: each query byte's places in the name as one 64-bit mask (NEON
-/// compares over the whole name at once) stand in for memchr's scans,
-/// which cost several times more per name tried.
+/// bytes starting `src`: each query byte's places in the name as one
+/// 64-bit mask (NEON compares over the whole name at once) stand in for
+/// memchr's scans, which cost several times more per name tried.
 #[cfg(target_arch = "aarch64")]
-fn fuzzy_masked(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
+fn fuzzy_masked(name: &[u8], src: &[u8; 64], q: &[u8], cap: i32) -> Option<i32> {
     use std::arch::aarch64::*;
-    let mut buf = [0u8; 64];
-    buf[..name.len()].copy_from_slice(name);
     let valid = u64::MAX.checked_shr(64 - name.len() as u32).unwrap_or(0);
-    // Safety (here and below): NEON is part of aarch64; loads stay in `buf`.
+    // Safety (here and below): NEON is part of aarch64; loads stay in `src`.
     let v: [uint8x16_t; 4] = std::array::from_fn(|i| unsafe {
-        let x = vld1q_u8(buf.as_ptr().add(16 * i));
+        let x = vld1q_u8(src.as_ptr().add(16 * i));
         vorrq_u8(x, vandq_u8(vcltq_u8(vsubq_u8(x, vdupq_n_u8(b'A')), vdupq_n_u8(26)), vdupq_n_u8(0x20)))
     });
     // Byte i of a compare weighed by bit i % 8: pairwise adds then pack
@@ -815,17 +824,17 @@ fn single_score(name: &[u8], i: usize, cap: i32) -> i32 {
 /// prefix: "manif" is "manifest" being typed, not a typo of "manic". `m` is
 /// as for `token_score`. Other word starts (`_`, `-`, camelCase) would cost
 /// a scan of every name per query, ~10x the price.
-fn typo_score(name: &[u8], m: u64, q: &[u8]) -> Option<i32> {
-    let mut best = typo_at(name, (name.len() > 1 && name[0] == b'.') as usize, q);
+fn typo_score(name: &[u8], wide: Wide, m: u64, q: &[u8]) -> Option<i32> {
+    let mut best = typo_at(name, wide, (name.len() > 1 && name[0] == b'.') as usize, q);
     if m & char_bit(b' ') != 0 {
         for sp in memchr::memchr_iter(b' ', name) {
-            best = best.max(typo_at(name, sp + 1, q));
+            best = best.max(typo_at(name, wide, sp + 1, q));
         }
     }
     best
 }
 
-fn typo_at(name: &[u8], s: usize, q: &[u8]) -> Option<i32> {
+fn typo_at(name: &[u8], wide: Wide, s: usize, q: &[u8]) -> Option<i32> {
     if name.get(s).is_none_or(|&b| fold(b) != q[0]) {
         return None;
     }
@@ -834,7 +843,7 @@ fn typo_at(name: &[u8], s: usize, q: &[u8]) -> Option<i32> {
     for (f, &b) in fixed.iter_mut().zip(&name[s..]) {
         *f = fold(b);
     }
-    Some(fuzzy_score_capped(name, fixed, 30)? - TYPO_COST)
+    Some(fuzzy_score_capped(name, wide, fixed, 30)? - TYPO_COST)
 }
 
 /// How long a prefix of `w` the query `q` spells with exactly one edit (a
@@ -865,13 +874,13 @@ fn one_edit_prefix(w: &[u8], q: &[u8]) -> Option<usize> {
 /// `index::name_mask`, or any superset of it (`!0` when unknown): it only
 /// skips work.
 #[inline]
-fn token_score(name: &[u8], m: u64, t: &Token) -> Option<i32> {
+fn token_score(name: &[u8], wide: Wide, m: u64, t: &Token) -> Option<i32> {
     match t.mode {
         Mode::Fuzzy if takes_typos(&t.text, t.mode) => {
-            let clean = if t.mask & !m == 0 { fuzzy_score(name, &t.text) } else { None };
-            clean.max(if m & t.start != 0 { typo_score(name, m, &t.text) } else { None })
+            let clean = if t.mask & !m == 0 { fuzzy_score_capped(name, wide, &t.text, 100) } else { None };
+            clean.max(if m & t.start != 0 { typo_score(name, wide, m, &t.text) } else { None })
         }
-        Mode::Fuzzy => fuzzy_score(name, &t.text),
+        Mode::Fuzzy => fuzzy_score_capped(name, wide, &t.text, 100),
         Mode::Exact => find_ci(name, &t.text).map(|p| 40 + if p == 0 { 30 } else { 0 } - (name.len() as i32).min(80) / 3),
         Mode::Prefix => {
             (name.len() >= t.text.len() && name.iter().zip(&t.text).all(|(&a, &b)| fold(a) == b)).then(|| 60 - (name.len() as i32).min(80) / 3)
@@ -885,7 +894,7 @@ fn token_score(name: &[u8], m: u64, t: &Token) -> Option<i32> {
 fn token_matches(name: &[u8], t: &Token) -> bool {
     match t.mode {
         Mode::Fuzzy => is_subseq(name, &t.text),
-        _ => token_score(name, !0, t).is_some(),
+        _ => token_score(name, None, !0, t).is_some(),
     }
 }
 
@@ -1181,7 +1190,7 @@ impl Searcher<'_> {
             let (w, i) = (k as usize / 64, k % 64);
             let name = idx.uname(k);
             let spaced = (space[0][w] | space[1][w]) >> i & 1 != 0;
-            let s = token_score(name, t.known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced), t)?;
+            let s = token_score(name, idx.uname_wide(k), t.known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced), t)?;
             if !(q.exts.is_empty() || ext_ok(name, &q.exts)) || re.is_some_and(|re| !re.is_match(name)) || neg.iter().any(|t| token_matches(name, t))
             {
                 return None;
@@ -1507,7 +1516,7 @@ impl Searcher<'_> {
                         m &= m - 1;
                         let k = w * 64 + i as usize;
                         let known = pos[t].known_mask(clean >> i & 1 != 0, typo >> i & 1 != 0, spaced(w, i));
-                        if token_score(idx.uname(k as u32), known, pos[t]).is_none() {
+                        if token_score(idx.uname(k as u32), idx.uname_wide(k as u32), known, pos[t]).is_none() {
                             continue;
                         }
                         let mut n = 0;
@@ -1691,7 +1700,7 @@ impl Searcher<'_> {
                 for (t, tok) in pos.iter().enumerate() {
                     let (fits, clean, typo) = per[t].0[j];
                     if bit(fits)
-                        && let Some(s) = token_score(name, tok.known_mask(bit(clean), bit(typo), spaced), tok)
+                        && let Some(s) = token_score(name, idx.uname_wide(k as u32), tok.known_mask(bit(clean), bit(typo), spaced), tok)
                     {
                         h.bits |= 1 << t;
                         let s16 = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
