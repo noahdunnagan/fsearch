@@ -536,6 +536,21 @@ pub(crate) mod tests {
         assert_eq!(flatten(&scan(t.bytes(), 2)).len(), 2002);
     }
 
+    /// A root that can't be listed still gets its (empty) listing, so the
+    /// folders above it point at something and the index builds.
+    #[test]
+    fn unreadable_root_still_builds() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tmp::new("unreadable-root");
+        std::fs::create_dir_all(t.p("r/in")).unwrap();
+        let r = t.p("r");
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ls = scan_rooted(r.as_os_str().as_bytes(), 2);
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let idx = crate::index::Index::build(ls, 0, 0, b"");
+        assert!(idx.lookup(r.as_os_str().as_bytes()).is_some());
+    }
+
     #[test]
     fn mount_points_flagged_not_crossed() {
         // /System/Volumes holds the APFS volume mounts (Data, VM, ...): one
