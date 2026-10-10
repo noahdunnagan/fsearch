@@ -410,9 +410,6 @@ impl Shared {
 
 fn start_content(s: &Arc<Shared>) {
     let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
-    // Reconcile all of home once (cheap when nothing changed), then follow
-    // along with the name index's changes.
-    let _ = s.content_tx.send((Vec::new(), vec![s.home.as_bytes().to_vec()]));
     let s = s.clone();
     spawn("fsearch-content", move || content_loop(&s, rx));
 }
@@ -504,19 +501,26 @@ pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
+fn content_pool(threads: usize, qos: libc::qos_class_t) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .start_handler(move |_| unsafe {
+            libc::pthread_set_qos_class_self_np(qos, 0);
+            no_materialize();
+        })
+        .build()
+        .unwrap()
+}
+
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
-            no_materialize();
-        })
-        .build()
-        .unwrap();
+    let pool = content_pool(4, libc::qos_class_t::QOS_CLASS_UTILITY);
     let home = shared.home.as_bytes().to_vec();
+    // Reconcile all of home once, right away (cheap when nothing changed),
+    // then follow along with the name index's changes.
+    sync(shared, &pool, &home, &[], std::slice::from_ref(&home));
     // Per-folder debounce: a folder is processed 2s after its last change,
     // or 5 min after its first pending one if it never goes quiet. A file you
     // save lands in ~2s; files apps rewrite every second (state, logs) cost
@@ -552,52 +556,100 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
             pending.remove(&k);
             if k.1 { trees.push(k.0) } else { dirs.push(k.0) }
         }
-        let t = Instant::now();
-        let wants = {
-            let g = shared.live.read().unwrap();
-            let Some(live) = g.as_ref() else { continue };
-            content::wants(live, &home, &dirs, &trees)
-        };
-        let todo = shared.content.write().unwrap().diff(wants);
-        if todo.is_empty() {
-            continue;
-        }
-        let n = todo.len();
-        shared.content_pending.store(n, Ordering::Relaxed);
-        for batch in todo.batches() {
-            let (dir, id) = {
-                let mut c = shared.content.write().unwrap();
-                (c.dir.clone(), c.alloc_id())
-            };
-            let len = batch.len();
-            if let Some(seg) = pool.install(|| content::build_segment(&dir, id, &todo, batch)) {
-                shared.content.write().unwrap().push(seg);
-            }
-            shared.content_pending.fetch_sub(len, Ordering::Relaxed);
-        }
-        drop(todo);
-        // Keep the segment count small: merge size tiers of 8.
-        loop {
-            let plan = shared.content.read().unwrap().merge_plan();
-            let Some(ids) = plan else { break };
-            let (dir, id) = {
-                let mut c = shared.content.write().unwrap();
-                (c.dir.clone(), c.alloc_id())
-            };
-            let merged = {
-                let c = shared.content.read().unwrap();
-                pool.install(|| content::merge(&dir, id, &c.segments(&ids)))
-            };
-            match merged {
-                Some(seg) => shared.content.write().unwrap().replace(&ids, seg),
-                None => break,
-            }
-        }
-        if n > 100 {
-            log(format!("content: indexed {n} files in {:.2?}", t.elapsed()));
-        }
-        release_memory();
+        sync(shared, &pool, &home, &dirs, &trees);
     }
+}
+
+/// Bring the content index in line with the name index for these folders
+/// (direct children) and trees.
+fn sync(shared: &Shared, pool: &rayon::ThreadPool, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) {
+    let t = Instant::now();
+    let wants = {
+        let g = shared.live.read().unwrap();
+        let Some(live) = g.as_ref() else { return };
+        content::wants(live, home, dirs, trees)
+    };
+    let (first, todo) = {
+        let mut c = shared.content.write().unwrap();
+        (c.segs.is_empty(), c.diff(wants))
+    };
+    if todo.is_empty() {
+        return;
+    }
+    let n = todo.len();
+    shared.content_pending.store(n, Ordering::Relaxed);
+    // A first build (fresh install, format change) is a one-time wait the
+    // user is watching: every core at user-initiated QoS, and two batches in
+    // flight, so one's single-threaded tail runs beside the other's reads.
+    // Measured on HOME (730k files, 16 cores): 119 s on the 4 utility
+    // threads, 42 s on all cores, 33 s with two in flight.
+    let fast;
+    let (pool, inflight) = if first {
+        let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+        fast = content_pool(cores, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
+        (&fast, 2)
+    } else {
+        (pool, 1)
+    };
+    build_batches(shared, pool, &todo, inflight);
+    drop(todo);
+    // Keep the segment count small: merge size tiers of 8.
+    loop {
+        let plan = shared.content.read().unwrap().merge_plan();
+        let Some(ids) = plan else { break };
+        let (dir, id) = {
+            let mut c = shared.content.write().unwrap();
+            (c.dir.clone(), c.alloc_id())
+        };
+        let merged = {
+            let c = shared.content.read().unwrap();
+            pool.install(|| content::merge(&dir, id, &c.segments(&ids)))
+        };
+        match merged {
+            Some(seg) => shared.content.write().unwrap().replace(&ids, seg),
+            None => break,
+        }
+    }
+    if n > 100 {
+        log(format!("content: indexed {n} files in {:.2?}", t.elapsed()));
+    }
+    release_memory();
+}
+
+/// Build `todo` into segments, `inflight` batches at a time. Each is pushed
+/// once it and every batch before it are done: the same segments in the
+/// same order as building them one by one.
+fn build_batches(shared: &Shared, pool: &rayon::ThreadPool, todo: &content::Docs, inflight: usize) {
+    let batches = todo.batches();
+    let (dir, ids): (PathBuf, Vec<u64>) = {
+        let mut c = shared.content.write().unwrap();
+        (c.dir.clone(), batches.iter().map(|_| c.alloc_id()).collect())
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    pool.in_place_scope(|s| {
+        let mut done: Vec<Option<Option<content::Segment>>> = (0..batches.len()).map(|_| None).collect();
+        let (mut started, mut finished, mut next) = (0, 0, 0);
+        while next < batches.len() {
+            while started < batches.len() && started - finished < inflight {
+                let (tx, dir, range, id, k) = (tx.clone(), &dir, batches[started].clone(), ids[started], started);
+                s.spawn(move |_| {
+                    let seg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| content::build_segment(dir, id, todo, range)));
+                    let _ = tx.send((k, seg));
+                });
+                started += 1;
+            }
+            let (k, seg) = rx.recv().expect("every build sends");
+            finished += 1;
+            done[k] = Some(seg.unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            while let Some(seg) = done.get_mut(next).and_then(Option::take) {
+                if let Some(seg) = seg {
+                    shared.content.write().unwrap().push(seg);
+                }
+                shared.content_pending.fetch_sub(batches[next].len(), Ordering::Relaxed);
+                next += 1;
+            }
+        }
+    });
 }
 
 fn full_build(shared: &Shared, event_id: u64) -> Index {
