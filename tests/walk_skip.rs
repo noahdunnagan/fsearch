@@ -2,7 +2,7 @@
 
 use fsearch::index::Index;
 use fsearch::live::Live;
-use fsearch::walk::{self, KIND_DIR, Listing, NONE, RawEnt};
+use fsearch::walk::{self, Listing, NONE};
 use std::os::unix::ffi::OsStrExt;
 
 fn names(l: &Listing) -> Vec<&[u8]> {
@@ -11,35 +11,23 @@ fn names(l: &Listing) -> Vec<&[u8]> {
     v
 }
 
-/// The ancestors of `root` as one-entry listings, then a scan of it.
-fn base_for(root: &[u8]) -> Index {
-    let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-    let k = comps.len() as u32;
-    let mut ls: Vec<Listing> = comps
-        .iter()
-        .enumerate()
-        .map(|(i, c)| Listing {
-            id: i as u32,
-            names: c.to_vec(),
-            ents: vec![RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: i as u32 + 1 }],
-        })
-        .collect();
-    for mut l in walk::scan(root, 2) {
-        l.id += k;
-        for e in &mut l.ents {
-            if e.child != NONE {
-                e.child += k;
-            }
-        }
-        ls.push(l);
+/// Removes the tree on drop, even after a failed assertion (and first
+/// makes a mode-000 folder deletable again).
+struct Cleanup(std::path::PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(self.0.join("locked"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&self.0);
     }
-    Index::build(ls, 0, 0, b"")
 }
 
 #[test]
 fn skipped_folders_are_never_opened() {
     let root = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-skip-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
+    let _cleanup = Cleanup(root.clone());
     for d in ["skip/in", "skipx", "ok"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
@@ -57,7 +45,8 @@ fn skipped_folders_are_never_opened() {
     // DENIED is for EPERM (privacy-refused) folders. Mode 000 is EACCES, a
     // plain permission problem: listed empty, not recorded. A real EPERM
     // needs a TCC-protected folder, which depends on this process's grants.
-    {
+    // Root reads mode 000 anyway, so the case is moot there.
+    if unsafe { libc::geteuid() } != 0 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(root.join("locked/in")).unwrap();
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -79,7 +68,7 @@ fn skipped_folders_are_never_opened() {
     assert_eq!(walk::scan(&skip, 1)[0].ents.len(), 0);
 
     // Live updates leave it alone too, even once it's gone.
-    let mut live = Live::new(base_for(&r));
+    let mut live = Live::new(Index::build(walk::scan_rooted(&r, 2), 0, 0, b""));
     std::fs::write(root.join("skip/new"), b"x").unwrap();
     live.apply_dir(&skip, false);
     live.apply_dir(&skip, true);

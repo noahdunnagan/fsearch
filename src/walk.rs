@@ -106,6 +106,32 @@ pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
 
+/// Scan `root` as part of the whole tree: the folders above it come first,
+/// as listings of one child each, so index paths stay absolute (as FSEvents
+/// reports them). For `/` it's just the scan.
+pub fn scan_rooted(root: &[u8], threads: usize) -> Vec<Listing> {
+    let mut ls = scan(root, threads);
+    let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    let k = comps.len() as u32;
+    if k == 0 {
+        return ls;
+    }
+    for l in &mut ls {
+        l.id += k;
+        for e in l.ents.iter_mut().filter(|e| e.child != NONE) {
+            e.child += k;
+        }
+    }
+    let mut path = Vec::new();
+    for (i, c) in (0..).zip(comps) {
+        path = crate::live::join(if i == 0 { b"/" } else { &path }, c);
+        let mtime = crate::live::lstat(&path).map_or(0, |o| o.mtime);
+        let ent = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime, child: i + 1 };
+        ls.push(Listing { id: i, names: c.to_vec(), ents: vec![ent] });
+    }
+    ls
+}
+
 fn raise_fd_limit() {
     let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
