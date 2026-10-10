@@ -37,6 +37,13 @@ pub fn is_mount(path: &std::ffi::CStr) -> bool {
     r == 0 && buf[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
 }
 
+/// Forget refused folders that have since become readable or are gone;
+/// keep only those still refused (EPERM).
+pub fn prune_denied() {
+    use std::os::unix::ffi::OsStrExt;
+    DENIED.lock().unwrap().retain(|p| std::fs::read_dir(std::ffi::OsStr::from_bytes(p)).is_err_and(|e| e.raw_os_error() == Some(libc::EPERM)));
+}
+
 pub fn blocked(path: &[u8]) -> bool {
     // An entry may be written with trailing slashes; it still names the
     // folder (`/` itself stays `/`). An empty one names nothing.

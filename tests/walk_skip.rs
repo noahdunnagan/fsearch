@@ -94,3 +94,18 @@ fn skipped_folders_are_never_opened() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A refused folder that has since become readable, or is gone, is
+/// forgotten: otherwise every restart rescans it again.
+#[test]
+fn denied_forgets_folders_that_read_or_are_gone() {
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-prune-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("open")).unwrap();
+    let open = root.join("open").as_os_str().as_bytes().to_vec();
+    let gone = root.join("gone").as_os_str().as_bytes().to_vec();
+    walk::DENIED.lock().unwrap().extend([open.clone(), gone.clone()]);
+    walk::prune_denied();
+    let left = walk::DENIED.lock().unwrap().clone();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!left.contains(&open) && !left.contains(&gone), "{left:?}");
+}

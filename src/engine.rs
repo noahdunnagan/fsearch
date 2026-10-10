@@ -365,6 +365,7 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
 const SKIPPED: &str = "skipped";
 
 fn note_skipped(dir: &Path) {
+    walk::prune_denied();
     let mut out = Vec::new();
     for p in walk::SKIP.get().into_iter().flatten().chain(walk::DENIED.lock().unwrap().iter()) {
         out.extend_from_slice(p);
