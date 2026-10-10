@@ -169,8 +169,13 @@ impl Query {
             "mtime" | "modified" => {
                 // mtime:<7d means "modified within the last 7 days".
                 let now = now_secs();
-                let (lo, hi) = range(v, parse_age)?;
-                self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo as u32));
+                let (lo, mut hi) = range(v, parse_age)?;
+                // A bare age is that whole unit, like `find -mtime`:
+                // mtime:3d is 3 to 4 days ago, mtime:2h 2 to 3 hours.
+                if !v.contains(['<', '>']) && !v.contains("..") {
+                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).unwrap_or(0));
+                }
+                self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo.min(now as u64) as u32));
                 if hi == u64::MAX {
                     self.mtime.0 = 0;
                 }
@@ -195,7 +200,7 @@ impl Query {
     pub fn kind_ok(&self, kind: u8) -> bool {
         match self.kind {
             None => true,
-            Some(want) => kind & 3 == want || (self.apps && kind & 3 == KIND_LINK),
+            Some(want) => kind & 3 == want || (self.apps && want == KIND_DIR && kind & 3 == KIND_LINK),
         }
     }
 
@@ -209,7 +214,7 @@ impl Query {
     /// part) supplied by the caller, who can memoize it per folder.
     pub fn match_path_with(&self, path: &[u8], kind: u8, size: u64, mtime: u32, dirs: impl FnOnce(&[u8]) -> DirMatch) -> Option<i32> {
         if let Some(s) = &self.scope
-            && !(path.starts_with(s) && path.get(s.len()) == Some(&b'/'))
+            && !(path.len() > s.len() && crate::live::is_ancestor(s, path))
         {
             return None;
         }
@@ -618,7 +623,7 @@ impl TopK {
     fn push(&mut self, key: u64) {
         if key > self.floor {
             self.buf.push(key);
-            if self.buf.len() >= (2 * self.k).max(64) {
+            if self.buf.len() >= self.k.saturating_mul(2).max(64) {
                 self.cut();
             }
         }
@@ -1261,4 +1266,865 @@ fn rank_tweaks(flags: u8, kind: u8, mtime: u32, now: u32) -> i32 {
         _ => 0,
     };
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{Index, name_mask};
+    use crate::live::OEnt;
+    use crate::walk::{KIND_OTHER, Listing, NONE, RawEnt};
+
+    const HOME: &str = "/nonexistent-fsearch-home";
+
+    fn q(s: &str) -> Query {
+        Query::parse(s, HOME).unwrap()
+    }
+
+    fn tok(s: &str) -> Token {
+        let mut q = Query::default();
+        q.push_token(s);
+        q.tokens.pop().unwrap()
+    }
+
+    /// An in-memory index of `(path, kind, size, mtime)`; every folder on a
+    /// path must be listed itself, as a KIND_DIR entry.
+    fn live(ents: &[(&str, u8, u64, u32)]) -> Live {
+        let mut ids: HashMap<&str, u32> = HashMap::from([("", 0)]);
+        for &(p, k, ..) in ents {
+            if k & 3 == KIND_DIR {
+                let n = ids.len() as u32;
+                ids.entry(p).or_insert(n);
+            }
+        }
+        let mut ls: Vec<Listing> = (0..ids.len() as u32).map(|id| Listing { id, names: Vec::new(), ents: Vec::new() }).collect();
+        for &(p, kind, size, mtime) in ents {
+            let cut = p.rfind('/').unwrap();
+            let l = &mut ls[ids[&p[..cut]] as usize];
+            let name = &p[cut + 1..];
+            let child = if kind & 3 == KIND_DIR { ids[p] } else { NONE };
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child });
+            l.names.extend_from_slice(name.as_bytes());
+        }
+        Live::new(Index::build(ls, 0, 0, b"/Users/me"))
+    }
+
+    const D: u8 = KIND_DIR;
+    const F: u8 = KIND_FILE;
+    const OLD: u32 = 1_000_000_000;
+
+    fn fixture() -> Live {
+        let now = now_secs();
+        live(&[
+            ("/Users", D, 0, OLD),
+            ("/Users/me", D, 0, OLD),
+            ("/Users/me/Developer", D, 0, OLD),
+            ("/Users/me/Developer/fsearch", D, 0, OLD),
+            ("/Users/me/Developer/fsearch/src", D, 0, OLD),
+            ("/Users/me/Developer/fsearch/src/main.rs", F, 1200, now),
+            ("/Users/me/Developer/fsearch/src/query.rs", F, 40_000, OLD),
+            ("/Users/me/Developer/fsearch/README.md", F, 3000, OLD),
+            ("/Users/me/Developer/fsearch/target", D, 0, OLD),
+            ("/Users/me/Developer/fsearch/target/main.o", F, 9000, OLD),
+            ("/Users/me/Documents", D, 0, OLD),
+            ("/Users/me/Documents/manifest.json", F, 100, OLD),
+            ("/Users/me/Documents/Tax Return 2024.pdf", F, 5_000_000, OLD),
+            ("/Users/me/Documents/photo.JPG", F, 2_000_000, OLD),
+            ("/Users/me/.zshrc", F, 10, OLD),
+            ("/Users/me/secret", D, 0, OLD),
+            ("/Users/me/secret/main.rs", F, 10, OLD),
+            ("/Applications", D, 0, OLD),
+            ("/Applications/Safari.app", D, 0, OLD),
+            ("/Applications/Notes.app", KIND_LINK, 0, OLD),
+            ("/Applications/Hidden.app", D | FLAG_HIDDEN, 0, OLD),
+        ])
+    }
+
+    fn paths(l: &Live, hits: &[Hit]) -> Vec<String> {
+        let mut buf = Vec::new();
+        hits.iter()
+            .map(|h| match &h.over {
+                Some(p) => String::from_utf8(p.clone()).unwrap(),
+                None => {
+                    l.base.path(h.idx as usize, &mut buf);
+                    String::from_utf8(buf.clone()).unwrap()
+                }
+            })
+            .collect()
+    }
+
+    fn find(l: &Live, s: &str) -> Vec<String> {
+        paths(l, &Searcher { live: l }.search(&q(s)))
+    }
+
+    /// Same answer from a fresh name table (no cache to narrow from).
+    fn fresh(s: &str) -> Vec<String> {
+        find(&fixture(), s)
+    }
+
+    // ---- parsing ----
+
+    #[test]
+    fn split_words_quotes_and_spaces() {
+        assert_eq!(split_words("  a  b "), ["a", "b"]);
+        assert_eq!(split_words(r#"in:"~/My Stuff" x"#), ["in:~/My Stuff", "x"]);
+        // An unclosed quote runs to the end.
+        assert_eq!(split_words(r#""a b"#), ["a b"]);
+        assert!(split_words("").is_empty());
+        assert!(split_words(r#""""#).is_empty());
+    }
+
+    #[test]
+    fn parse_defaults_and_empty() {
+        let e = q("");
+        assert!(e.tokens.is_empty() && e.kind.is_none() && e.scope.is_none() && e.grep.is_none());
+        assert_eq!((e.size, e.mtime, e.limit), ((0, u64::MAX), (0, u32::MAX), 50));
+        assert!(q("   ").tokens.is_empty());
+    }
+
+    #[test]
+    fn token_modes() {
+        let t = |s| {
+            let t = tok(s);
+            (String::from_utf8(t.text).unwrap(), t.mode, t.negate)
+        };
+        assert_eq!(t("Foo"), ("foo".into(), Mode::Fuzzy, false));
+        assert_eq!(t("'foo"), ("foo".into(), Mode::Exact, false));
+        assert_eq!(t("^foo"), ("foo".into(), Mode::Prefix, false));
+        assert_eq!(t("foo$"), ("foo".into(), Mode::Suffix, false));
+        assert_eq!(t("!foo"), ("foo".into(), Mode::Exact, true));
+        assert_eq!(t("!^foo"), ("foo".into(), Mode::Prefix, true));
+        assert_eq!(t("!foo$"), ("foo".into(), Mode::Suffix, true));
+        // `'` wins over a trailing `$`: it stays part of the text.
+        assert_eq!(t("'a$"), ("a$".into(), Mode::Exact, false));
+        // Bare markers are no token at all.
+        for s in ["!", "'", "^", "$", "!'"] {
+            let mut q = Query::default();
+            q.push_token(s);
+            assert!(q.tokens.is_empty(), "{s}");
+        }
+    }
+
+    #[test]
+    fn slashes_split_tokens() {
+        let p = q("src/main //x/");
+        let texts: Vec<&[u8]> = p.tokens.iter().map(|t| &t.text[..]).collect();
+        assert_eq!(texts, [&b"src"[..], b"main", b"x"]);
+        assert!(q("/").tokens.is_empty());
+    }
+
+    #[test]
+    fn at_most_eight_positive_tokens() {
+        let p = q("a b c d e f g h i j !k !l");
+        assert_eq!(p.tokens.iter().filter(|t| !t.negate).count(), 8);
+        assert_eq!(p.tokens.iter().filter(|t| t.negate).count(), 2);
+    }
+
+    #[test]
+    fn typo_fields() {
+        let short = tok("main");
+        assert_eq!((short.loose, short.start), (0, 0));
+        let long = tok("Manifest");
+        assert_eq!(long.start, start_bit(b'm'));
+        assert_eq!(long.loose, long.mask & !char_bit(b'm'));
+        // Exact tokens never take typos, whatever their length.
+        assert_eq!(tok("'manifest").loose, 0);
+    }
+
+    #[test]
+    fn filters() {
+        let p = q("ext:.RS,md type:font");
+        assert!(p.exts.starts_with(&[b"rs".to_vec(), b"md".to_vec()]) && p.exts.contains(&b"woff2".to_vec()));
+        let app = q("type:app");
+        assert_eq!((app.kind, app.exts.clone()), (Some(KIND_DIR), vec![b"app".to_vec()]));
+        assert_eq!(q("type:image,video").exts.len(), TYPES[0].1.len() + TYPES[1].1.len());
+        for (s, k) in [("f", F), ("file", F), ("d", D), ("dir", D), ("folder", D), ("l", KIND_LINK), ("link", KIND_LINK), ("symlink", KIND_LINK)] {
+            assert_eq!(q(&format!("kind:{s}")).kind, Some(k));
+        }
+        assert_eq!(q("limit:7").limit, 7);
+        assert_eq!(q("limit:0").limit, 0);
+        let g = |s: &str| {
+            let p = q(s);
+            (p.grep, p.grep_mode)
+        };
+        assert_eq!(g("grep:foo"), (Some("foo".into()), GrepMode::Literal));
+        assert_eq!(g("content:foo"), (Some("foo".into()), GrepMode::Literal));
+        assert_eq!(g("regex:a.b"), (Some("a.b".into()), GrepMode::Regex));
+        assert_eq!(g("sym:Foo"), (Some("Foo".into()), GrepMode::Symbol));
+        assert_eq!(g("symbol:Foo"), (Some("Foo".into()), GrepMode::Symbol));
+        let r = q("re:^ab path:CD");
+        assert!(r.name_re.unwrap().is_match(b"ABx") && r.path_re.unwrap().is_match(b"/x/cd"));
+        // Not a filter name: the whole word is a token.
+        let t = q("http://x foo:bar");
+        let texts: Vec<&[u8]> = t.tokens.iter().map(|t| &t.text[..]).collect();
+        assert_eq!(texts, [&b"http:"[..], b"x", b"foo:bar"]);
+        assert!(q("grep:x").clone_for_scan().grep.is_none());
+    }
+
+    #[test]
+    fn filter_errors() {
+        for s in [
+            "type:nope",
+            "type:",
+            "kind:x",
+            "kind:",
+            "limit:x",
+            "limit:-1",
+            "limit:",
+            "re:(",
+            "path:[",
+            "size:",
+            "size:abc",
+            "size:5q",
+            "size:>x",
+            "mtime:x",
+            "mtime:5..",
+            "size:1.2.3",
+        ] {
+            assert!(Query::parse(s, HOME).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn in_scope() {
+        assert_eq!(q("in:/a/b/").scope.unwrap(), b"/a/b");
+        assert_eq!(q("in:~").scope.unwrap(), HOME.as_bytes());
+        assert_eq!(q("in:~/x/").scope.unwrap(), format!("{HOME}/x").as_bytes());
+        // The root: everything is under it.
+        assert_eq!(q("in:/").scope.unwrap(), b"");
+        // Real folders resolve to their real path (/tmp is /private/tmp).
+        let dir = std::env::temp_dir().join(format!("fsearch-query-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let real = std::fs::canonicalize(&dir).unwrap();
+        let p = q(&format!("in:{}/./sub/", dir.display()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(p.scope.unwrap(), real.join("sub").as_os_str().as_encoded_bytes());
+    }
+
+    #[test]
+    fn ranges() {
+        assert_eq!(range("5", parse_size), Ok((5, 5)));
+        assert_eq!(range(">5", parse_size), Ok((5, u64::MAX)));
+        assert_eq!(range(">=5", parse_size), Ok((5, u64::MAX)));
+        assert_eq!(range("<5", parse_size), Ok((0, 5)));
+        assert_eq!(range("<=5", parse_size), Ok((0, 5)));
+        assert_eq!(range("1k..2k", parse_size), Ok((1000, 2000)));
+        assert!(range("1k..", parse_size).is_err());
+        assert!(range("..1k", parse_size).is_err());
+    }
+
+    #[test]
+    fn sizes() {
+        for (s, n) in [
+            ("0", 0),
+            ("12", 12),
+            ("12b", 12),
+            ("1k", 1000),
+            ("1.5KB", 1500),
+            ("2m", 2_000_000),
+            ("2MB", 2_000_000),
+            ("3g", 3_000_000_000),
+            ("1gb", 1_000_000_000),
+            ("1t", 1_000_000_000_000),
+            ("1tb", 1_000_000_000_000),
+            (".5k", 500),
+        ] {
+            assert_eq!(parse_size(s), Some(n), "{s}");
+        }
+        // Out of range saturates rather than wrapping.
+        assert_eq!(parse_size("99999999999999999999999t"), Some(u64::MAX));
+        for s in ["", "k", "-1", "1x", "inf", "nan", "1.2.3"] {
+            assert_eq!(parse_size(s), None, "{s}");
+        }
+        let p = q("size:>1mb");
+        assert_eq!(p.size, (1_000_000, u64::MAX));
+    }
+
+    #[test]
+    fn ages() {
+        for (s, n) in [
+            ("5s", 5),
+            ("2m", 120),
+            ("2min", 120),
+            ("1h", 3600),
+            ("1", 86400),
+            ("1d", 86400),
+            ("1w", 604800),
+            ("1mo", 2592000),
+            ("1y", 31536000),
+            ("1.5h", 5400),
+        ] {
+            assert_eq!(parse_age(s), Some(n), "{s}");
+        }
+        assert_eq!(parse_age("1x"), None);
+        assert_eq!(parse_age("d"), None);
+    }
+
+    #[test]
+    fn mtime_bounds() {
+        let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
+        let now = now_secs();
+        let p = q("mtime:<7d");
+        assert!(near(p.mtime.0, now - 7 * 86400) && near(p.mtime.1, now));
+        let p = q("modified:>7d");
+        assert!(p.mtime.0 == 0 && near(p.mtime.1, now - 7 * 86400));
+        let p = q("mtime:1d..2d");
+        assert!(near(p.mtime.0, now - 2 * 86400) && near(p.mtime.1, now - 86400));
+        // Older than the epoch: lower bound clamps to 0.
+        assert_eq!(q("mtime:<200y").mtime.0, 0);
+        assert_eq!(q("mtime:99999999999999999999999y").mtime, (0, 0));
+    }
+
+    /// `type:app` lets symlinks stand in for folders (system apps link into
+    /// the cryptex), not for files: a later `kind:file` means files.
+    #[test]
+    fn apps_admit_links_only_as_folders() {
+        assert!(q("type:app").kind_ok(KIND_LINK));
+        assert!(q("type:app").kind_ok(KIND_DIR));
+        let f = q("type:app kind:file");
+        assert!(f.kind_ok(KIND_FILE));
+        assert!(!f.kind_ok(KIND_LINK));
+    }
+
+    /// No `<`/`>`: that whole unit, like `find -mtime 3` (3 to 4 days ago).
+    #[test]
+    fn bare_mtime_is_that_whole_unit() {
+        let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
+        let now = now_secs();
+        let p = q("mtime:3d");
+        assert!(near(p.mtime.0, now - 4 * 86400) && near(p.mtime.1, now - 3 * 86400), "{:?}", p.mtime);
+        let p = q("mtime:2h");
+        assert!(near(p.mtime.0, now - 3 * 3600) && near(p.mtime.1, now - 2 * 3600), "{:?}", p.mtime);
+        assert_eq!(q("mtime:3").mtime, q("mtime:3d").mtime);
+    }
+
+    #[test]
+    fn mtime_older_than_u32_seconds_matches_nothing_recent() {
+        // 140y is more seconds than a u32 holds; truncating it left a bound
+        // of ~4 years ago instead of "before 1970 minus 84 years".
+        let q = Query::parse("mtime:>140y", "/h").unwrap();
+        assert_eq!(q.mtime, (0, 0));
+    }
+
+    #[test]
+    fn huge_limit_does_not_overflow() {
+        let mut t = TopK::new(usize::MAX);
+        t.push(key(1, 1));
+        assert_eq!(t.buf.len(), 1);
+    }
+
+    // ---- matching primitives ----
+
+    #[test]
+    fn folding_and_finding() {
+        assert_eq!(fold(b'A'), b'a');
+        assert_eq!(fold(b'z'), b'z');
+        assert_eq!(fold(b'@'), b'@');
+        assert_eq!(fold(b'['), b'[');
+        assert_eq!(fold(0xC3), 0xC3);
+        assert!(is_subseq(b"MyMainFile", b"mmf"));
+        assert!(!is_subseq(b"abc", b"abcd"));
+        assert!(!is_subseq(b"", b"a"));
+        assert_eq!(find_ci(b"FooBar", b"bar"), Some(3));
+        assert_eq!(find_ci(b"ab", b"abc"), None);
+        assert_eq!(find_ci(b"abc", b"abc"), Some(0));
+        assert_eq!(find_folded(b"xYz", b'y'), Some(1));
+        assert_eq!(find_folded(b"a1b1", b'1'), Some(1));
+        assert_eq!(rfind_folded(b"YxY", b'y'), Some(2));
+        assert_eq!(rfind_folded(b"a1b1", b'1'), Some(3));
+    }
+
+    #[test]
+    fn classes_and_bonuses() {
+        assert!(class(b'a') == Class::Lower && class(b'Q') == Class::Upper && class(b'7') == Class::Digit);
+        assert!(class(b'_') == Class::Delim && class(b'@') == Class::Delim && class(b'~') == Class::Other && class(0xE2) == Class::Other);
+        assert_eq!(bonus(Class::Delim, Class::Lower), BONUS_BOUNDARY);
+        assert_eq!(bonus(Class::Delim, Class::Delim), 0);
+        assert_eq!(bonus(Class::Lower, Class::Upper), BONUS_CAMEL);
+        assert_eq!(bonus(Class::Upper, Class::Digit), BONUS_CAMEL);
+        assert_eq!(bonus(Class::Lower, Class::Lower), 0);
+    }
+
+    #[test]
+    fn fuzzy_ranking() {
+        let s = |n: &[u8], q: &[u8]| fuzzy_score(n, q);
+        assert_eq!(s(b"abc", b"x"), None);
+        assert_eq!(s(b"abc", b"abcd"), None);
+        assert_eq!(s(b"", b"ab"), None);
+        assert_eq!(s(b"acb", b"abc"), None);
+        // Whole name > stem > prefix > inside > scattered.
+        let whole = s(b"main", b"main").unwrap();
+        let stem = s(b"main.rs", b"main").unwrap();
+        let prefix = s(b"mainframe.rs", b"main").unwrap();
+        let inside = s(b"domain.rs", b"main").unwrap();
+        let scattered = s(b"mxaxixn.rs", b"main").unwrap();
+        assert!(whole > stem && stem > prefix && prefix > inside && inside > scattered, "{whole} {stem} {prefix} {inside} {scattered}");
+        // A leading dot doesn't count against a whole-name match.
+        assert_eq!(s(b".zshrc", b"zshrc"), s(b"zshrc", b"zshrc").map(|x| x - 1));
+        // A word boundary beats a mid-word hit; camelCase counts too.
+        assert!(s(b"x_bar", b"bar") > s(b"xbar", b"bar"));
+        assert!(s(b"fooBar", b"bar") > s(b"foobar", b"bar"));
+        // A run carries the strongest boundary bonus met inside it.
+        assert!(s(b"x-ab", b"-ab") > s(b"xyab", b"yab"));
+        // Shrunk from the right: the tight match at the end is scored.
+        assert!(s(b"a____ab", b"ab").unwrap() > s(b"a_____b", b"ab").unwrap());
+        // Long names pay a capped length penalty.
+        assert_eq!(s(&[b'x'; 300], b"xx"), s(&[b'x'; 240], b"xx"));
+    }
+
+    #[test]
+    fn single_byte_query() {
+        assert_eq!(fuzzy_score(b"a", b"a"), Some(SCORE_MATCH + BONUS_BOUNDARY * 2 + 100));
+        assert_eq!(fuzzy_score(b"a.rs", b"a"), Some(SCORE_MATCH + BONUS_BOUNDARY * 2 + 80 - 1));
+        assert_eq!(fuzzy_score(b"ab", b"a"), Some(SCORE_MATCH + BONUS_BOUNDARY * 2 + 30));
+        assert_eq!(fuzzy_score(b"ba", b"a"), Some(SCORE_MATCH));
+        assert_eq!(fuzzy_score(b".a", b"a"), Some(SCORE_MATCH + BONUS_BOUNDARY * 2 + 100));
+        assert_eq!(fuzzy_score_capped(b"a", b"a", 30), Some(SCORE_MATCH + BONUS_BOUNDARY * 2 + 30));
+    }
+
+    #[test]
+    fn one_edit() {
+        let e = |w: &[u8], q: &[u8]| one_edit_prefix(w, q);
+        assert_eq!(e(b"manifest", b"manfiest"), Some(8), "swapped");
+        assert_eq!(e(b"manifest", b"manixest"), Some(8), "wrong");
+        assert_eq!(e(b"manifest", b"manifst"), Some(8), "missing");
+        assert_eq!(e(b"manifest", b"manifeest"), Some(8), "extra");
+        assert_eq!(e(b"Manifest.json", b"manfiest"), Some(8), "folds case");
+        assert_eq!(e(b"abc", b"abcd"), Some(3), "extra at the end");
+        assert_eq!(e(b"manifest", b"manif"), None, "a clean prefix is no typo");
+        assert_eq!(e(b"manifest", b"mxnixest"), None, "two edits");
+        assert_eq!(e(b"hat_18", b"hat_19"), None, "digits are never edited");
+        assert_eq!(e(b"hat_x8", b"hat_18"), None);
+    }
+
+    #[test]
+    fn typos() {
+        let ts = |n: &[u8], q: &[u8]| typo_score(n, name_mask(n), q);
+        assert!(ts(b"manifest.json", b"manfiest").is_some());
+        assert!(ts(b".manifest", b"manfiest").is_some());
+        // At the start of a space-separated word, not elsewhere.
+        assert!(ts(b"Tax Return 2024.pdf", b"retrun").is_some());
+        assert!(ts(b"tax_return", b"retrun").is_none());
+        assert!(ts(b"other", b"retrun").is_none());
+        // Below the clean spelling, placed no higher than a prefix.
+        let typo = ts(b"manifest", b"manifset").unwrap();
+        assert!(typo < fuzzy_score(b"manifest", b"manifest").unwrap());
+        assert_eq!(typo, fuzzy_score_capped(b"manifest", b"manifest", 30).unwrap() - TYPO_COST);
+        // Words past the fixed buffer are skipped, not a panic.
+        let long = [b'a'; 200];
+        let mut q = vec![b'a'; 150];
+        q[100] = b'b';
+        assert!(typo_at(&long, 0, &q).is_none());
+        q.truncate(127);
+        assert!(typo_at(&long, 0, &q).is_some());
+        assert!(typo_at(b"abc", 3, b"abcde").is_none());
+    }
+
+    #[test]
+    fn token_scores_by_mode() {
+        let s = |n: &[u8], t: &str| token_score(n, name_mask(n), &tok(t));
+        assert!(s(b"main.rs", "main").is_some());
+        assert!(s(b"manifest.json", "manfiest").is_some());
+        assert!(s(b"manifest.json", "manifest").unwrap() > s(b"manifest.json", "manfiest").unwrap());
+        // A typo token whose mask fits but whose start doesn't: no typo path.
+        assert!(s(b"xmanifest", "manfiest").is_none());
+        assert_eq!(s(b"main.rs", "'ain"), Some(40 - 7 / 3));
+        assert_eq!(s(b"main.rs", "'MAIN"), Some(70 - 7 / 3));
+        assert_eq!(s(b"main.rs", "'mian"), None);
+        assert_eq!(s(b"main.rs", "^ma"), Some(60 - 7 / 3));
+        assert_eq!(s(b"main.rs", "^ai"), None);
+        assert_eq!(s(b"m", "^ma"), None);
+        assert_eq!(s(b"main.RS", ".rs$"), Some(50 - 7 / 3));
+        assert_eq!(s(b"main.rs", "main$"), None);
+        assert_eq!(s(b"s", ".rs$"), None);
+        // Negated tokens match by the same rules, fuzzy ones as subsequences.
+        assert!(token_matches(b"secret", &tok("!secret")));
+        assert!(!token_matches(b"secret", &tok("!sct")));
+        assert!(token_matches(b"secret", &tok("sct")));
+        let mut fz = tok("sct");
+        fz.negate = true;
+        assert!(token_matches(b"secret", &fz));
+    }
+
+    #[test]
+    fn fits_prefilter() {
+        let m = |n: &[u8]| name_mask(n);
+        assert!(tok("main").fits(m(b"main.rs")));
+        assert!(!tok("main").fits(m(b"mai.rs")));
+        // One missing class is forgiven only when a word starts right.
+        let t = tok("manixest");
+        assert!(t.fits(m(b"manifest")));
+        assert!(!t.fits(m(b"amanifest")));
+        assert!(!tok("manizqst").fits(m(b"manifest")));
+        // Never the first letter's class.
+        assert!(!tok("xanifest").fits(m(b"manifest")));
+    }
+
+    #[test]
+    fn extensions_and_flags() {
+        let ex = |n: &[u8], e: &[&[u8]]| ext_ok(n, &e.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
+        assert!(ex(b"a.RS", &[b"rs"]));
+        assert!(ex(b"a.tar.gz", &[b"md", b"gz"]));
+        assert!(!ex(b"a.rsx", &[b"rs"]));
+        assert!(!ex(b"Makefile", &[b"rs"]));
+        assert!(ex(b".zshrc", &[b"zshrc"]));
+        assert_eq!(name_flags(b".x.app"), NF_DOT | NF_APP);
+        assert_eq!(name_flags(b"x"), 0);
+        assert_eq!(name_flags(b""), 0);
+    }
+
+    #[test]
+    fn tweaks() {
+        let now = 100_000_000;
+        assert_eq!(rank_tweaks(0, F, now, now), 10);
+        assert_eq!(rank_tweaks(0, F, now + 50, now), 10);
+        assert_eq!(rank_tweaks(0, F, now - 86_401, now), 7);
+        assert_eq!(rank_tweaks(0, F, now - 604_801, now), 4);
+        assert_eq!(rank_tweaks(0, F, now - 2_592_001, now), 1);
+        assert_eq!(rank_tweaks(0, F, 0, now), 0);
+        assert_eq!(rank_tweaks(NF_DOT, F | FLAG_HIDDEN, 0, now), -16);
+        assert_eq!(rank_tweaks(NF_APP, D, 0, now), 25);
+        assert_eq!(rank_tweaks(NF_APP, KIND_LINK, 0, now), 25);
+        assert_eq!(rank_tweaks(NF_APP, F, 0, now), 0);
+    }
+
+    #[test]
+    fn top_k_order_and_ties() {
+        assert!(key(5, 0) > key(4, 0) && key(-1, 0) > key(i32::MIN, 0));
+        // Equal scores: the lower index ranks first.
+        assert!(key(5, 1) > key(5, 2));
+        let scores: Vec<i32> = (0..1000).map(|i| i * 7919 % 1000 - 500).collect();
+        let hits = top_k(scores.len(), 10, |r, top| {
+            for i in r {
+                top.push(key(scores[i], i as u32));
+            }
+        });
+        let mut got: Vec<(i32, u32)> = hits.iter().map(|h| (h.score, h.idx)).collect();
+        got.sort_by(|a, b| b.cmp(a));
+        let mut want: Vec<(i32, u32)> = scores.iter().enumerate().map(|(i, &s)| (s, i as u32)).collect();
+        want.sort_by(|a, b| b.cmp(a));
+        assert_eq!(got, want[..10]);
+        assert!(top_k(0, 10, |_, _| {}).is_empty());
+        assert!(top_k(100, 0, |r, top| r.for_each(|i| top.push(key(1, i as u32)))).is_empty());
+        // Many pushes into one TopK: cut back as it goes, floor rising.
+        let mut t = TopK::new(3);
+        for i in 0..200 {
+            t.push(key(i, i as u32));
+        }
+        t.cut();
+        t.buf.sort();
+        assert_eq!(t.buf, [key(197, 197), key(198, 198), key(199, 199)]);
+        assert_eq!(t.floor, key(197, 197));
+        // Ties everywhere: still exactly k, lowest indices.
+        let hits = top_k(500, 3, |r, top| r.for_each(|i| top.push(key(0, i as u32))));
+        let mut idx: Vec<u32> = hits.iter().map(|h| h.idx).collect();
+        idx.sort();
+        assert_eq!(idx, [0, 1, 2]);
+    }
+
+    #[test]
+    fn dir_memo_folding() {
+        let a = DirMemo { bits: 0b01, best: [5, 0, 0, 0] };
+        let b = DirMemo { bits: 0b10, best: [1, 9, 0, 0] };
+        let m = a.under(b);
+        assert_eq!((m.bits, m.best), (0b11, [5, 9, 0, 0]));
+        let neg = DirMemo { bits: u32::MAX, best: [0; 4] };
+        assert_eq!(a.under(neg).bits, u32::MAX);
+        assert_eq!(neg.under(a).bits, u32::MAX);
+    }
+
+    #[test]
+    fn name_key_narrowing() {
+        let k = |s: &str| NameKey::of(&q(s));
+        assert!(k("mai").narrows(&k("ma")));
+        assert!(k("^mai").narrows(&k("^ma")));
+        assert!(k("'mai").narrows(&k("'ma")));
+        assert!(k("xrs$").narrows(&k("rs$")));
+        assert!(!k("rsx$").narrows(&k("rs$")));
+        assert!(k("manife").narrows(&k("manif")));
+        assert!(k("main !foo").narrows(&k("mai !foo")));
+        assert!(!k("ma").narrows(&k("mai")), "shorter widens");
+        assert!(!k("manif").narrows(&k("mani")), "gaining typos widens");
+        assert!(!k("main !foox").narrows(&k("main !foo")), "a longer negation widens");
+        assert!(!k("main x").narrows(&k("main")), "token count");
+        assert!(!k("^main").narrows(&k("main")), "mode");
+        assert!(!k("main ext:rs").narrows(&k("mai")), "exts");
+        assert!(!k("main re:x").narrows(&k("mai")), "name regex");
+        assert!(!k("!main").narrows(&k("!main")), "negations only: every name is a candidate");
+        assert!(k("main") == k("main kind:file size:>1 in:/x path:y"), "non-name filters are not in the key");
+    }
+
+    // ---- whole-path matching (overlay, content docs) ----
+
+    #[test]
+    fn match_path_filters() {
+        let mp = |s: &str, p: &str, kind: u8, size: u64, mtime: u32| q(s).match_path(p.as_bytes(), kind, size, mtime);
+        let now = now_secs();
+        assert!(mp("main", "/a/main.rs", F, 1, now).is_some());
+        assert!(mp("", "/a/main.rs", F, 1, now).is_some());
+        assert!(mp("main", "/", D, 0, now).is_none());
+        assert!(mp("main", "/a/", D, 0, now).is_none());
+        assert!(mp("kind:dir", "/a/main", F, 1, now).is_none());
+        assert!(mp("ext:md", "/a/main.rs", F, 1, now).is_none());
+        assert!(mp("size:>5", "/a/main.rs", F, 1, now).is_none());
+        assert!(mp("size:<5", "/a/main.rs", F, 9, now).is_none());
+        assert!(mp("mtime:<1d", "/a/main.rs", F, 1, OLD).is_none());
+        assert!(mp("mtime:>1d", "/a/main.rs", F, 1, now).is_none());
+        assert!(mp("re:^x", "/a/main.rs", F, 1, now).is_none());
+        assert!(mp("path:^/b", "/a/main.rs", F, 1, now).is_none());
+        assert!(mp("re:^m path:^/a", "/a/main.rs", F, 1, now).is_some());
+        // Scope: strictly below, on a component boundary.
+        assert!(mp("in:/a", "/a/main.rs", F, 1, now).is_some());
+        assert!(mp("in:/a", "/ab/main.rs", F, 1, now).is_none());
+        assert!(mp("in:/a", "/a", D, 1, now).is_none());
+        assert!(mp("in:/", "/a", D, 1, now).is_some());
+    }
+
+    #[test]
+    fn match_path_tokens_and_folders() {
+        let mp = |s: &str, p: &str| q(s).match_path(p.as_bytes(), F, 1, OLD);
+        assert!(mp("zzz", "/a/main.rs").is_none());
+        // Every token must match: the name some, its folders the rest.
+        let src = fuzzy_score(b"src", b"src").unwrap();
+        let main = fuzzy_score(b"main.rs", b"main").unwrap();
+        assert_eq!(mp("src main", "/a/src/b/main.rs"), Some(main + src * 3 / 4), "folders count 3/4");
+        assert!(mp("src main", "/x/main.rs").is_none());
+        assert!(mp("src main", "/src/x.rs").is_none(), "folders alone are not a hit");
+        // Negations hit the name or any folder.
+        assert!(mp("main !secret", "/secret/main.rs").is_none());
+        assert!(mp("main !secret", "/a/main_secret.rs").is_none());
+        assert!(mp("main !secret", "/a/main.rs").is_some());
+        assert!(mp("!secret", "/a/main.rs").is_some());
+        let d = q("src !tmp main").dir_match(b"/a/src//b");
+        assert!(!d.negated && d.best[0].is_some() && d.best[1].is_none());
+        assert!(q("!tmp").dir_match(b"/tmp/x").negated);
+    }
+
+    // ---- the searcher over an in-memory index ----
+
+    #[test]
+    fn search_basics() {
+        let l = fixture();
+        let main = find(&l, "main");
+        assert_eq!(main.len(), 4);
+        assert!(main.contains(&"/Users/me/Developer/fsearch/target/main.o".into()));
+        assert!(main.contains(&"/Users/me/Documents/manifest.json".into()), "m-a-i-n in order");
+        assert_eq!(find(&l, "'main").len(), 3);
+        assert_eq!(find(&l, "'main !secret").len(), 2);
+        assert_eq!(find(&l, "'main !target !secret"), ["/Users/me/Developer/fsearch/src/main.rs"]);
+        // "fsearch" holds s-r-c too.
+        assert_eq!(find(&l, "src main"), ["/Users/me/Developer/fsearch/src/main.rs", "/Users/me/Developer/fsearch/target/main.o"]);
+        assert_eq!(find(&l, "'src main"), ["/Users/me/Developer/fsearch/src/main.rs"]);
+        assert_eq!(find(&l, "fsearch/'src/main"), ["/Users/me/Developer/fsearch/src/main.rs"]);
+        assert_eq!(find(&l, "manfiest"), ["/Users/me/Documents/manifest.json"]);
+        assert_eq!(find(&l, "retrun"), ["/Users/me/Documents/Tax Return 2024.pdf"]);
+        assert_eq!(find(&l, "zshrc"), ["/Users/me/.zshrc"]);
+        assert_eq!(find(&l, "PHOTO ext:jpg"), ["/Users/me/Documents/photo.JPG"]);
+        assert_eq!(find(&l, "^read"), ["/Users/me/Developer/fsearch/README.md"]);
+        assert_eq!(find(&l, ".rs$").len(), 3);
+        assert!(find(&l, "nothing-like-this").is_empty());
+        // A folder is a hit too.
+        assert_eq!(find(&l, "'documents"), ["/Users/me/Documents"]);
+        // Fresh-from-the-root results do not depend on the cache.
+        assert_eq!(find(&l, "main"), fresh("main"));
+    }
+
+    #[test]
+    fn search_filters() {
+        let l = fixture();
+        assert_eq!(find(&l, "ext:rs").len(), 3);
+        assert_eq!(find(&l, "ext:rs kind:dir").len(), 0);
+        assert_eq!(find(&l, "kind:dir in:/Applications"), ["/Applications/Safari.app", "/Applications/Hidden.app"]);
+        assert_eq!(find(&l, "kind:link"), ["/Applications/Notes.app"]);
+        assert_eq!(find(&l, "size:>1mb"), ["/Users/me/Documents/Tax Return 2024.pdf", "/Users/me/Documents/photo.JPG"]);
+        assert_eq!(find(&l, "main mtime:<1d"), ["/Users/me/Developer/fsearch/src/main.rs"]);
+        assert_eq!(find(&l, "main path:target"), ["/Users/me/Developer/fsearch/target/main.o"]);
+        assert_eq!(find(&l, "re:^query"), ["/Users/me/Developer/fsearch/src/query.rs"]);
+        assert_eq!(find(&l, "main limit:1").len(), 1);
+        assert!(find(&l, "main limit:0").is_empty());
+        assert_eq!(find(&l, "'main limit:18446744073709551615").len(), 3);
+        // Symlinked apps count too (system apps link into the cryptex).
+        assert_eq!(find(&l, "type:app").len(), 3);
+        assert!(find(&l, "type:app").contains(&"/Applications/Notes.app".to_string()));
+    }
+
+    #[test]
+    fn search_ranking() {
+        let l = fixture();
+        // A recent, exact stem match outranks an old one; hidden apps sink.
+        assert_eq!(find(&l, "main.rs")[0], "/Users/me/Developer/fsearch/src/main.rs");
+        let apps = find(&l, ".app$");
+        assert_eq!(apps.last().unwrap(), "/Applications/Hidden.app");
+        let hits = Searcher { live: &l }.search(&q("main"));
+        assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
+    }
+
+    #[test]
+    fn search_scope() {
+        let l = fixture();
+        let s = Searcher { live: &l };
+        assert_eq!(s.scope_range(&q("x")), Some((1, l.base.n)));
+        assert_eq!(s.scope_range(&q("in:/")), Some((1, l.base.n)));
+        assert_eq!(find(&l, "'main in:/Users/me/Developer"), find(&l, "'main !secret"));
+        assert_eq!(find(&l, "'main in:/users/ME/developer/"), find(&l, "'main !secret"), "lookup forgives case");
+        assert!(find(&l, "main in:/Users/me/Developer/fsearch/src/main.rs").is_empty(), "a file is no scope");
+        assert!(find(&l, "main in:/nowhere").is_empty());
+        assert!(find(&l, "in:/Users/me/Documents/manifest.json").is_empty());
+        assert_eq!(find(&l, "in:/Users/me/secret"), ["/Users/me/secret/main.rs"]);
+    }
+
+    #[test]
+    fn negation_only_and_empty_queries() {
+        let l = fixture();
+        let all = find(&l, "limit:1000");
+        assert_eq!(all.len(), l.base.n - 1);
+        let some = find(&l, "!secret limit:1000");
+        assert_eq!(some.len(), all.len() - 2);
+        assert!(!some.iter().any(|p| p.contains("secret")));
+    }
+
+    /// FULL_PASS is process-wide; tests that flip it take turns.
+    static PASS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn full_pass_agrees_with_selective() {
+        let _g = PASS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let queries = [
+            "main",
+            "main !secret",
+            "src main",
+            "fsearch src main",
+            "me fsearch src main README",
+            "!secret limit:1000",
+            "manfiest",
+            "kind:dir",
+            "size:>1mb",
+            "main path:target",
+            "a b c d e f",
+            "in:/Users/me main",
+            "rs$ !target",
+        ];
+        for s in queries {
+            FULL_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+            let sel = fresh(s);
+            FULL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
+            let full = fresh(s);
+            FULL_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(sel, full, "{s}");
+        }
+    }
+
+    #[test]
+    fn name_cache_reuse_and_narrowing() {
+        let l = fixture();
+        let s = Searcher { live: &l };
+        // Typing: each query narrows the last one's table.
+        for typed in ["m", "ma", "mai", "main", "main.", "main.r", "main.rs"] {
+            assert_eq!(find(&l, typed), fresh(typed), "{typed}");
+        }
+        for typed in ["manif", "manife", "manifes", "manifest"] {
+            assert_eq!(find(&l, typed), fresh(typed), "{typed}");
+        }
+        // The same name key again (a filter that isn't in the key changed).
+        let a = s.search(&q("main"));
+        let b = s.search(&q("main limit:2"));
+        assert_eq!(paths(&l, &a)[..2], paths(&l, &b)[..]);
+        // Backspacing does not narrow.
+        assert_eq!(find(&l, "mai"), fresh("mai"));
+        l.names_cache.trim_if_idle(std::time::Duration::from_secs(3600));
+        assert!(l.names_cache.0.lock().unwrap().is_some());
+        l.names_cache.trim_if_idle(std::time::Duration::ZERO);
+        assert!(l.names_cache.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn overlay_entries() {
+        let mut l = fixture();
+        let now = now_secs();
+        for (p, kind) in [
+            ("/Users/me/Documents/mainframe.txt", F),
+            ("/Users/me/Documents/new/main.c", F),
+            ("/Users/me/secret/main.go", F),
+            ("/Users/me/Documents/new", D),
+            ("/Applications/New.app", D),
+        ] {
+            l.over.insert(p.as_bytes().to_vec(), OEnt::new(p.as_bytes(), kind, 5, now));
+        }
+        let main = find(&l, "main !secret limit:100");
+        assert!(main.contains(&"/Users/me/Documents/mainframe.txt".into()));
+        assert!(main.contains(&"/Users/me/Documents/new/main.c".into()));
+        assert!(!main.iter().any(|p| p.contains("secret")));
+        assert_eq!(find(&l, "new main"), ["/Users/me/Documents/new/main.c"]);
+        // Apps rank up.
+        assert_eq!(find(&l, "kind:dir new"), ["/Applications/New.app", "/Users/me/Documents/new"]);
+        assert_eq!(find(&l, "in:/Users/me/Documents/new"), ["/Users/me/Documents/new/main.c"]);
+        // More overlay hits than the limit: its own top-k is cut first.
+        assert_eq!(find(&l, "main limit:2").len(), 2);
+        assert_eq!(find(&l, "zzz").len(), 0);
+    }
+
+    /// Big enough for the dense name table (> 64k matched names), the full
+    /// pass (> SELECTIVE entries) and a memo plan with an oversized folder.
+    fn big() -> Live {
+        let mut paths: Vec<(String, u8)> = vec![("/big".into(), D)];
+        let mut f = 0;
+        for d in 0..4200 {
+            paths.push((format!("/big/d{d}"), D));
+            for _ in 0..17 {
+                paths.push((format!("/big/d{d}/f{f}.txt"), F));
+                f += 1;
+            }
+            if d < 10 {
+                paths.push((format!("/big/d{d}/n"), D));
+                paths.push((format!("/big/d{d}/n/m"), D));
+                paths.push((format!("/big/d{d}/n/m/deep{d}.txt"), F));
+            }
+        }
+        let ents: Vec<(&str, u8, u64, u32)> = paths.iter().map(|(p, k)| (p.as_str(), *k, 1, OLD)).collect();
+        live(&ents)
+    }
+
+    #[test]
+    fn big_index_strategies() {
+        let l = big();
+        let files = 4200 * 17 + 10;
+        let s = Searcher { live: &l };
+        // Every name passes: dense table, full pass, dir memo for the negation.
+        let lim = "limit:1000000";
+        assert_eq!(s.search(&q(&format!("kind:file !zzz {lim}"))).len(), files);
+        assert_eq!(s.search(&q(&format!("kind:file !d4199 {lim}"))).len(), files - 17);
+        assert_eq!(s.search(&q(&format!("kind:file !m {lim}"))).len(), files - 10);
+        assert_eq!(s.search(&q(&format!("!d4199 {lim}"))).len(), l.base.n - 1 - 18);
+        assert_eq!(s.search(&q(&format!("kind:file txt n {lim}"))).len(), 10);
+        // Every name scored but none passes: dense table, selective pass.
+        assert!(s.search(&q("f ext:zzz")).is_empty());
+        assert_eq!(paths(&l, &s.search(&q("deep3 d3 n m"))), ["/big/d3/n/m/deep3.txt"]);
+        assert_eq!(s.search(&q("'f123.")).len(), 1);
+    }
+
+    #[test]
+    fn dead_entries_are_skipped() {
+        // A folder that isn't on disk: relisting it finds it gone.
+        let root = format!("/fsearch-test-missing-{}", std::process::id());
+        let gone = format!("{root}/gone.txt");
+        let mut l = live(&[(&root, D, 0, OLD), (&gone, F, 1, OLD), ("/kept-gone.txt", F, 1, OLD)]);
+        assert_eq!(find(&l, "gone").len(), 2);
+        l.apply_dir(root.as_bytes(), false);
+        assert_eq!(find(&l, "gone"), ["/kept-gone.txt"]);
+    }
+
+    #[test]
+    fn odd_names() {
+        let l = live(&[("/é", D, 0, OLD), ("/é/café.txt", F, 1, OLD), ("/é/CAFÉ.TXT", F, 1, OLD), ("/x", F, 1, OLD), ("/other", KIND_OTHER, 1, OLD)]);
+        // Non-ASCII matches byte for byte (no Unicode case folding), though
+        // as 5 bytes "café" forgives the one byte É differs by.
+        assert_eq!(find(&l, "'café"), ["/é/café.txt"]);
+        assert_eq!(find(&l, "café"), ["/é/café.txt", "/é/CAFÉ.TXT"]);
+        assert_eq!(find(&l, "é caf").len(), 2);
+        assert_eq!(find(&l, "x")[0], "/x");
+        assert_eq!(find(&l, "other"), ["/other"]);
+        let long = "y".repeat(10_000);
+        assert!(find(&l, &long).is_empty());
+        assert!(find(&l, &format!("'{long}")).is_empty());
+    }
 }
