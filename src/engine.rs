@@ -542,7 +542,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     release_memory();
     // Re-map from the file so the index is clean, evictable page cache
     // rather than anonymous memory.
-    Index::load(&path).unwrap_or(idx)
+    Index::load_own(&path).unwrap_or(idx)
 }
 
 unsafe extern "C" {
@@ -568,7 +568,7 @@ fn compact(shared: &Shared) {
         log(format!("save failed: {e}"));
     }
     note_skipped(&shared.dir);
-    let idx = Index::load(&path).unwrap_or(idx);
+    let idx = Index::load_own(&path).unwrap_or(idx);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
     release_memory();

@@ -440,6 +440,13 @@ impl Index {
         fields::<6>(&h, MAGIC).map(|f| f[4])
     }
 
+    /// Reload a file this process just built and saved: its ids are known
+    /// good, so the load-time check is skipped.
+    pub(crate) fn load_own(path: &Path) -> Option<Index> {
+        let f = std::fs::File::open(path).ok()?;
+        Index::from_map(unsafe { Mmap::map(&f) }.ok()?, false)
+    }
+
     pub fn load(path: &Path) -> Option<Index> {
         let f = std::fs::File::open(path).ok()?;
         Index::from_map(unsafe { Mmap::map(&f) }.ok()?, true)
