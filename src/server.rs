@@ -74,10 +74,10 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
         }
         // Read every time: a new holder writes its pid only after taking the
         // lock, so until then the file may name a crashed daemon's pid, now
-        // ours or a stranger's. Only an fsearch process gets the signal.
+        // ours or a stranger's. Only a daemon (`fsearch serve`) is signalled.
         let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
         named = pid.or(named);
-        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_fsearch(p)) {
+        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_fsearch(p) && is_daemon(p)) {
             unsafe { libc::kill(p, libc::SIGTERM) };
             killed = Some(p);
         }
@@ -100,7 +100,7 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
             format!("socket.lock holds a stale pid ({me}, this process); the daemon holding the lock never recorded its own: stop it by hand")
         }
         (None, Some(p)) => {
-            format!("socket.lock holds a stale pid ({p}, not fsearch); the daemon holding the lock never recorded its own: stop it by hand")
+            format!("socket.lock holds a stale pid ({p}, not an fsearch daemon); the daemon holding the lock never recorded its own: stop it by hand")
         }
         (None, None) => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
@@ -722,6 +722,32 @@ mod tests {
         assert_eq!(r, Ok(()));
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// A recorded pid reused by another fsearch process that isn't a daemon
+    /// (an `fsearch stdio` client) is never signalled.
+    #[test]
+    fn stop_never_signals_a_non_daemon_fsearch() {
+        let dir = root().join("stop9");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket.lock");
+        std::fs::write(&path, "").unwrap();
+        let mut client = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::tests::file_opener", "--ignored"])
+            .env("FSEARCH_TEST_OPEN", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, client.id().to_string()).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(try_lock(&held));
+        let r = stop_within(&dir, Duration::from_millis(300));
+        let alive = client.try_wait().unwrap().is_none();
+        let _ = client.kill();
+        let _ = client.wait();
+        drop(held);
+        assert!(r.is_err());
+        assert!(alive, "signalled a non-daemon fsearch process");
     }
 
     /// The lock's holder hasn't written its pid yet, and the file still
