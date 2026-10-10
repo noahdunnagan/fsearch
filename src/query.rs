@@ -353,9 +353,7 @@ impl Query {
             }
             "in" => {
                 let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
-                // The index holds real paths: /etc is /private/etc.
-                let p = std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
-                self.scope = Some(p.trim_end_matches('/').as_bytes().to_vec());
+                self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
             }
             "size" => self.size = range(v, parse_size)?,
             "mtime" | "modified" => {
@@ -477,6 +475,25 @@ pub struct DirMatch {
 }
 
 /// Split on spaces, keeping "double quoted" runs together.
+/// The real path of `p` (the index holds real paths: /etc is
+/// /private/etc), or `p` if it has none. Resolving costs a few syscalls
+/// (~4 us), as much as a whole search in a small folder, and searches in
+/// one folder come in a row (typing): the last answer holds for a second,
+/// less than the index takes to see most changes anyway.
+fn real_path(p: String) -> String {
+    static LAST: std::sync::Mutex<Option<(String, String, std::time::Instant)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some((from, to, at)) = &*last
+        && *from == p
+        && at.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return to.clone();
+    }
+    let to = std::fs::canonicalize(&p).map_or_else(|_| p.clone(), |c| c.to_string_lossy().into_owned());
+    *last = Some((p, to.clone(), std::time::Instant::now()));
+    to
+}
+
 fn split_words(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     for c in s.chars() {
