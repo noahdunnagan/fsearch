@@ -2,3 +2,6 @@ target/
 .probe/
 .livetest/
 .replaytest/
+.build/
+.swiftpm/
+

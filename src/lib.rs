@@ -5,6 +5,7 @@
 
 pub mod content;
 mod engine;
+pub mod ffi;
 mod fsevents;
 pub mod index;
 pub mod live;

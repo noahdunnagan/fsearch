@@ -3,6 +3,8 @@ name = "fsearch"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+[lib]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 libc = "0.2"

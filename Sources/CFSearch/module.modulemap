@@ -1,0 +1,4 @@
+module CFSearch [system] {
+    header "include/fsearch.h"
+    export *
+}
