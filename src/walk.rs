@@ -78,7 +78,12 @@ thread_local! {
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
+    scan_on(root, &pool)
+}
+
+/// Scan `root` on `pool`, so the caller can keep the threads across calls.
+pub(crate) fn scan_on(root: &[u8], pool: &rayon::ThreadPool) -> Vec<Listing> {
+    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..pool.current_num_threads() + 1).map(|_| Mutex::new(Vec::new())).collect() };
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.

@@ -10,6 +10,14 @@ use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
 use std::collections::{BTreeMap, HashMap};
 
+/// Keep the live-update workers between scans: folder churn otherwise
+/// builds and drops four of them for every scan.
+fn live_scan(path: &[u8]) -> Vec<Listing> {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).start_handler(|_| crate::no_materialize()).build().unwrap());
+    walk::scan_on(path, pool)
+}
+
 #[derive(Clone, Copy)]
 pub struct OEnt {
     pub kind: u8,
@@ -218,7 +226,7 @@ impl Live {
             if f.path != b"/" {
                 f.attrs = lstat(&f.path);
                 if f.attrs.is_some_and(|a| a.kind & 3 == KIND_DIR && a.kind & FLAG_MOUNT == 0) {
-                    f.scans.insert(f.path.clone(), walk::scan(&f.path, 4));
+                    f.scans.insert(f.path.clone(), live_scan(&f.path));
                 }
             }
             return f;
@@ -241,7 +249,7 @@ impl Live {
             };
             if !was_dir {
                 let child = join(&f.path, name);
-                let ls = walk::scan(&child, 4);
+                let ls = live_scan(&child);
                 f.scans.insert(child, ls);
             }
         }
@@ -356,7 +364,7 @@ impl Live {
             return;
         }
         self.trees.push(path.clone());
-        let ls = scan.unwrap_or_else(|| walk::scan(&path, 4));
+        let ls = scan.unwrap_or_else(|| live_scan(&path));
         for_each_path(&ls, &path, |p, r| {
             let e = OEnt::new(&p, r.kind, r.size, r.mtime);
             self.put(p, e);
