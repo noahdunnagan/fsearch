@@ -1848,7 +1848,24 @@ impl Content {
         // rank those first, and the rest only if reading gets that far.
         let t = std::time::Instant::now();
         let best = take_best(&mut per);
-        let (mut r, done) = verify_from(g, best.len(), filt.limit, READERS, t, |i| path(&best[i]));
+        // Lanes by the bytes the batch is expected to read (each file at
+        // most the 4 MB a match looks at): megabytes pay for another four
+        // threads, a few hundred small files do not.
+        let lanes = |c: &[Ranked]| {
+            // Only a grep with gram probes skips candidates without reading
+            // them; without probes the batch's bytes are read, and megabytes
+            // of that pay for more lanes. Small files choke on threads.
+            if !probes.short.is_empty() || !probes.long.is_empty() {
+                return READERS;
+            }
+            let bytes: u64 = c.iter().map(|&(_, si, d)| self.segs[si as usize].size()[d as usize].min(MAX_FILE * 4)).sum();
+            match (bytes, bytes / c.len().max(1) as u64) {
+                (b, avg) if b >= 16 * 1024 * 1024 && avg >= 64 * 1024 => 3 * READERS,
+                (b, _) if b >= 16 * 1024 * 1024 => 2 * READERS,
+                _ => READERS,
+            }
+        };
+        let (mut r, done) = verify_from(g, best.len(), filt.limit, lanes(&best), t, |i| path(&best[i]));
         if r.files.len() < filt.limit && done == best.len() && best.len() < total {
             // Then the next best few thousand, and the others only if
             // reading gets past those too.
@@ -1866,7 +1883,8 @@ impl Content {
                 if at > 0 {
                     rest[at..].par_sort_unstable();
                 }
-                let (more, done) = verify_from(g, end - at, filt.limit - r.files.len(), READERS, t, |i| path(&rest[at + i]));
+                let part = &rest[at..end];
+                let (more, done) = verify_from(g, end - at, filt.limit - r.files.len(), lanes(part), t, |i| path(&rest[at + i]));
                 r.files.extend(more.files);
                 r.read += more.read;
                 r.complete = more.complete;
@@ -2455,9 +2473,40 @@ thread_local! {
 fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
         use std::io::Read;
+        let (mut f, size) = open_sized(path)?;
+        // One read for a file the size metadata reported (or the 4 MB cap):
+        // asking for one byte past it reports EOF with the same syscall.
+        // A file grown since is caught up with in doublings, and a short
+        // read is EOF: regular files never return less than asked for.
+        let cap = (MAX_FILE * 4) as usize;
+        let mut room = ((size as usize).min(cap) + 1).min(cap);
+        let mut at = 0usize;
         buf.clear();
-        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
-        if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
+        if room > MAX_FILE as usize {
+            // A binary's megabytes are not worth reading: the leading bytes
+            // carry the same NUL check as below, before pulling in the rest.
+            buf.resize(8193, 0);
+            let n = f.read(&mut buf[..]).ok()?;
+            if memchr::memchr(0, &buf[..n]).is_some() {
+                return None;
+            }
+            at = n;
+            room = (((size as usize).min(cap)) - at).saturating_add(1).min(cap - at);
+        }
+        while at < cap {
+            if buf.len() < at + room {
+                buf.resize(at + room, 0);
+            }
+            let n = f.read(&mut buf[at..at + room]).ok()?;
+            if n < room {
+                at += n;
+                break;
+            }
+            at += n;
+            room = (room * 2).min(cap - at).max(1);
+        }
+        buf.truncate(at);
+        if memchr::memchr(0, &buf[..at.min(8192)]).is_some() {
             return None;
         }
         let lines = match g.literal.as_ref().filter(|l| !l.needs_regex(buf)) {
@@ -3130,7 +3179,7 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
             }
         })
         .collect();
-    files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+    files.sort_by_key(|(p, m)| rank_key(doc_rank(p), *m));
     files.into_iter().map(|(p, _)| p).collect()
 }
 
