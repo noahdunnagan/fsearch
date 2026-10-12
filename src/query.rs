@@ -298,7 +298,7 @@ impl Query {
             {
                 continue;
             }
-            for piece in word.split('/').filter(|p| !p.is_empty()) {
+            for piece in word.split(|c| c == '/' || (cfg!(windows) && c == '\\')).filter(|p| !p.is_empty()) {
                 q.push_token(piece);
             }
         }
@@ -353,7 +353,7 @@ impl Query {
             }
             "in" => {
                 let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
-                self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
+                self.scope = Some(real_path(p));
             }
             "size" => self.size = range(v, parse_size)?,
             "mtime" | "modified" => {
@@ -479,8 +479,8 @@ pub struct DirMatch {
 /// (~4 us), as much as a whole search in a small folder, and searches in
 /// one folder come in a row (typing): the last answer holds for a second,
 /// less than the index takes to see most changes anyway.
-fn real_path(p: String) -> String {
-    static LAST: std::sync::Mutex<Option<(String, String, std::time::Instant)>> = std::sync::Mutex::new(None);
+fn real_path(p: String) -> Vec<u8> {
+    static LAST: std::sync::Mutex<Option<(String, Vec<u8>, std::time::Instant)>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap();
     if let Some((from, to, at)) = &*last
         && *from == p
@@ -488,7 +488,11 @@ fn real_path(p: String) -> String {
     {
         return to.clone();
     }
-    let to = std::fs::canonicalize(&p).map_or_else(|_| p.clone(), |c| c.to_string_lossy().into_owned());
+    let path = std::fs::canonicalize(&p).unwrap_or_else(|_| std::path::PathBuf::from(&p));
+    let mut to = crate::paths::encode(&path);
+    while to.last() == Some(&b'/') {
+        to.pop();
+    }
     *last = Some((p, to.clone(), std::time::Instant::now()));
     to
 }

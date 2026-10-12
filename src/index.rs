@@ -573,6 +573,7 @@ impl Index {
         f.write_all(&header(MAGIC, &[self.n as u64, self.d as u64, self.u as u64, self.names_len as u64, self.event_id, self.synced_at as u64]))?;
         f.write_all(&self.map[HDR..])?;
         f.sync_data()?;
+        drop(f);
         std::fs::rename(tmp, path)
     }
 

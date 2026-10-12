@@ -30,7 +30,7 @@ fn main() {
 }
 
 fn home() -> String {
-    std::env::var("HOME").unwrap()
+    std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap()
 }
 
 /// Deterministic xorshift, so every build samples the same corpus.
@@ -183,7 +183,7 @@ fn grep_search(live: &Live, content: &Content, pool: &rayon::ThreadPool, q: &str
     let mode = q.grep_mode;
     let mut g = Grep::new(&q.grep.take().unwrap(), mode).unwrap();
     g.budget = budget;
-    let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home.as_bytes()));
+    let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, &fsearch::paths::encode(Path::new(home))));
     let r = if indexed {
         pool.install(|| content.search(&g, &q))
     } else {
@@ -210,8 +210,8 @@ fn run(snap: &Path, corpus: &str, out: &str, kinds: &str) {
     let content = Content::open_shared(snap.join("content"));
     let load = ms(t.elapsed());
     let pool = rayon::ThreadPoolBuilder::new()
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        .start_handler(|_| {
+            fsearch::platform::set_priority(fsearch::platform::Priority::Interactive);
         })
         .build()
         .unwrap();

@@ -2,10 +2,10 @@
 name = "fsearch"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 
 [dependencies]
-libc = "0.2"
 rayon = "1.12"
 memchr = "2.8"
 memmap2 = "0.9"
@@ -13,6 +13,12 @@ regex = "1.12"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3

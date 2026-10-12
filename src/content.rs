@@ -1079,6 +1079,10 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
         return false;
     }
     let rel = rest.strip_prefix(b"/").unwrap_or(rest);
+    #[cfg(windows)]
+    if rel.split(|&b| b == b'/').next().is_some_and(|c| c.eq_ignore_ascii_case(b"AppData")) {
+        return false;
+    }
     if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
         return false;
     }
@@ -1207,6 +1211,31 @@ impl Content {
         let manifest: Vec<u64> =
             std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
         let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
+        Self::from_segments(dir, segs)
+    }
+
+    /// Open a complete published snapshot; missing or invalid content must
+    /// never be mistaken for an empty index.
+    pub fn open_snapshot(dir: PathBuf) -> Result<Content, String> {
+        let manifest = dir.join("manifest");
+        let text = std::fs::read_to_string(&manifest).map_err(|e| format!("read {}: {e}", manifest.display()))?;
+        let mut ids = std::collections::HashSet::new();
+        let mut segs = Vec::new();
+        for token in text.split_whitespace() {
+            let id = token.parse::<u64>().map_err(|_| format!("invalid segment ID in {}: {token}", manifest.display()))?;
+            if id == u64::MAX {
+                return Err(format!("invalid segment ID in {}: {token}", manifest.display()));
+            }
+            if !ids.insert(id) {
+                return Err(format!("duplicate segment ID in {}: {id}", manifest.display()));
+            }
+            let segment = Segment::load(&dir, id).ok_or_else(|| format!("missing or invalid content segment: {}", seg_path(&dir, id).display()))?;
+            segs.push(segment);
+        }
+        Ok(Self::from_segments(dir, segs))
+    }
+
+    fn from_segments(dir: PathBuf, segs: Vec<Segment>) -> Content {
         let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         #[rustfmt::skip]
         let mut c = Content { dir, segs, next_id, gids: Vec::new(), base: Vec::new(), blocks: Vec::new(), copies: Vec::new(), users: Vec::new(), sources: Vec::new() };
@@ -2132,7 +2161,7 @@ fn helpers() -> &'static Helpers {
             let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
                 // Someone is waiting: keep off the slow cores and out of the
                 // throttled IO tiers, and never download iCloud placeholders.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                crate::platform::set_priority(crate::platform::Priority::Initiated);
                 crate::no_materialize();
                 let mut seen = 0;
                 loop {
@@ -2373,6 +2402,7 @@ const SCAN_READERS: usize = 8;
 
 /// Run `f` with this thread never downloading iCloud placeholders (as the
 /// helper threads), then restore its policy.
+#[cfg(target_os = "macos")]
 fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
     unsafe extern "C" {
         fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
@@ -2386,6 +2416,11 @@ fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
         unsafe { setiopolicy_np(3, 1, prior) };
     }
     r
+}
+
+#[cfg(windows)]
+fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 pub struct FileMatches {
@@ -2577,6 +2612,9 @@ fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> 
     let k = needle.len();
     let last = hay.len().checked_sub(k)?;
     let at = |c: usize| hay[c..c + k].iter().zip(needle).all(|(&x, &y)| fold(x) == y);
+    #[cfg(not(target_arch = "aarch64"))]
+    let (i, _) = (from, pair);
+    #[cfg(target_arch = "aarch64")]
     let mut i = from;
     #[cfg(target_arch = "aarch64")]
     // Safety: every load reads 16 bytes at i + pair.1 at most, and the loop
@@ -3143,6 +3181,7 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
 }
 
 /// `open_regular`, and the file's size.
+#[cfg(target_os = "macos")]
 fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -3153,10 +3192,31 @@ fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
 
 /// `open_regular` for a file about to be indexed, telling the kernel to
 /// start reading it now (as much as indexing reads).
+#[cfg(target_os = "macos")]
 fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let (f, len) = open_sized(path)?;
     let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
     unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
     Some(f)
+}
+
+#[cfg(windows)]
+fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let p = crate::paths::decode(path);
+    let skip = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    let m = std::fs::symlink_metadata(&p).ok()?;
+    if !m.is_file() || m.file_attributes() & skip != 0 {
+        return None;
+    }
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(p).ok()?;
+    let m = f.metadata().ok()?;
+    (m.is_file() && m.file_attributes() & skip == 0).then_some((f, m.len()))
+}
+
+#[cfg(windows)]
+fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
+    open_regular(path)
 }

@@ -23,12 +23,21 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 enum Conn {
-    Stdio { child: std::process::Child, w: std::process::ChildStdin, r: BufReader<std::process::ChildStdout> },
-    Sock { w: UnixStream, r: BufReader<UnixStream> },
+    Stdio {
+        child: std::process::Child,
+        w: std::process::ChildStdin,
+        r: BufReader<std::process::ChildStdout>,
+    },
+    #[cfg(unix)]
+    Sock {
+        w: UnixStream,
+        r: BufReader<UnixStream>,
+    },
 }
 
 impl Conn {
@@ -40,7 +49,9 @@ impl Conn {
             let (bin, home) = bin.split_once('@').map_or((bin, None), |(b, h)| (b, Some(h)));
             let mut cmd = std::process::Command::new(bin);
             if let Some(h) = home {
-                cmd.env("HOME", h);
+                cmd.env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, h);
+                #[cfg(windows)]
+                cmd.env("FSEARCH_DATA_DIR", std::path::Path::new(h).join("AppData/Local/FSearch"));
             }
             let mut child =
                 cmd.arg("stdio").args(parts).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("spawn stdio");
@@ -48,8 +59,13 @@ impl Conn {
             let r = BufReader::new(child.stdout.take().unwrap());
             Conn::Stdio { child, w, r }
         } else if let Some(p) = t.strip_prefix("sock:") {
-            let s = UnixStream::connect(p).expect("connect");
-            Conn::Sock { w: s.try_clone().unwrap(), r: BufReader::new(s) }
+            #[cfg(unix)]
+            {
+                let s = UnixStream::connect(p).expect("connect");
+                Conn::Sock { w: s.try_clone().unwrap(), r: BufReader::new(s) }
+            }
+            #[cfg(windows)]
+            panic!("Unix socket transport is unavailable on Windows: {p}; use stdio:")
         } else {
             panic!("transport must be stdio:<bin> or sock:<path>")
         }
@@ -65,6 +81,7 @@ impl Conn {
                 w.flush().unwrap();
                 r.read_line(line).unwrap();
             }
+            #[cfg(unix)]
             Conn::Sock { w, r } => {
                 w.write_all(req.as_bytes()).unwrap();
                 r.read_line(line).unwrap();
@@ -76,9 +93,13 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Conn::Stdio { child, .. } = self {
-            let _ = child.kill();
-            let _ = child.wait();
+        match self {
+            Conn::Stdio { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(unix)]
+            Conn::Sock { .. } => {}
         }
     }
 }
@@ -230,9 +251,12 @@ fn cli(a: &[String]) {
     let mut recs = [Rec::default(), Rec::default()];
     let run = |k: usize, q: &str| -> (Duration, String) {
         let t = Instant::now();
-        let out = std::process::Command::new(bins[k])
+        let mut cmd = std::process::Command::new(bins[k]);
+        #[cfg(windows)]
+        cmd.env("FSEARCH_DATA_DIR", std::path::Path::new(homes[k]).join("AppData/Local/FSearch"));
+        let out = cmd
             .arg(q)
-            .env("HOME", homes[k])
+            .env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, homes[k])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
@@ -409,6 +433,7 @@ fn main() {
                     rec.add("ping", "ping", "ping", w, &line);
                 }
             }
+            #[cfg(unix)]
             "connping" => {
                 let p = transport.strip_prefix("sock:").expect("connping needs sock:");
                 for _ in 0..num(1, 200) {

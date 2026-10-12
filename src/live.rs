@@ -103,6 +103,10 @@ pub enum Applied {
 impl Live {
     pub fn new(base: Index) -> Live {
         base.prefault();
+        Self::new_unwarmed(base)
+    }
+
+    pub(crate) fn new_unwarmed(base: Index) -> Live {
         let words = base.n.div_ceil(64);
         let event_id = base.event_id;
         let synced_at = base.synced_at;
@@ -495,6 +499,7 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (lo, hi)
 }
 
+#[cfg(target_os = "macos")]
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -508,4 +513,46 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
         _ => walk::KIND_OTHER,
     };
     Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
+}
+
+#[cfg(windows)]
+pub fn lstat(path: &[u8]) -> Option<OEnt> {
+    if path == b"/" {
+        return Some(OEnt::new(path, KIND_DIR, 0, 0));
+    }
+    let m = std::fs::symlink_metadata(crate::paths::decode(path)).ok()?;
+    Some(OEnt::new(path, crate::walk::metadata_kind(&m), m.len(), crate::walk::metadata_mtime(&m)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::{Query, Searcher};
+    use crate::walk::{KIND_FILE, NONE, RawEnt};
+
+    #[test]
+    fn unwarmed_search_matches_prefaulted_search() {
+        let build = || {
+            let mut listing = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+            for name in [b"readme.md".as_slice(), b"README.txt", b"other.rs"] {
+                listing.ents.push(RawEnt {
+                    name_off: listing.names.len() as u32,
+                    name_len: name.len() as u16,
+                    kind: KIND_FILE,
+                    size: 100,
+                    mtime: 1,
+                    child: NONE,
+                });
+                listing.names.extend_from_slice(name);
+            }
+            Index::build(vec![listing], 0, 0, b"/")
+        };
+        let cold = Live::new_unwarmed(build());
+        let warm = Live::new(build());
+        for raw in ["readme", "rdme", "ext:txt", "'other.rs", "re:^read", "!other", "kind:file size:>50"] {
+            let query = Query::parse(raw, "").unwrap();
+            let search = |live| Searcher { live }.search(&query).into_iter().map(|h| (h.idx, h.score)).collect::<Vec<_>>();
+            assert_eq!(search(&cold), search(&warm), "{raw}");
+        }
+    }
 }
