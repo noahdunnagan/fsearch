@@ -9,7 +9,7 @@ use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
 use crate::walk::{self, KIND_DIR, Listing, NONE, RawEnt};
 use std::collections::HashMap;
-use std::os::unix::ffi::OsStrExt;
+use crate::ospath::{bytes_from_path, path_from_bytes};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -130,22 +130,51 @@ struct Shared {
 }
 
 fn try_lock(f: &std::fs::File) -> bool {
-    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    #[cfg(unix)]
+    {
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(f), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        crate::winpriv::try_lock_file(f)
+    }
 }
 
 fn log(msg: impl AsRef<str>) {
     eprintln!("{} {}", crate::query::now_secs(), msg.as_ref());
 }
 
-/// Never let indexing download iCloud placeholders: on the calling thread,
-/// opening or listing a dataless file fails fast instead of materializing it.
 pub fn no_materialize() {
-    unsafe extern "C" {
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        unsafe { setiopolicy_np(3, 1, 1) };
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
-    unsafe { setiopolicy_np(3, 1, 1) };
 }
+
+fn set_qos_interactive() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+fn set_qos_utility() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
+fn set_qos_initiated() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
 
 /// Searches run here, at user-interactive QoS: an app's background executor
 /// (or any low-QoS caller) would otherwise put the scan on efficiency cores.
@@ -165,7 +194,7 @@ fn pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("fsearch-search-{i}"))
             .start_handler(|_| {
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+                set_qos_interactive();
                 crate::alloc::keep_on_this_thread();
             })
             .build()
@@ -188,7 +217,7 @@ fn warmer() -> &'static std::thread::Thread {
     static T: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let t = std::thread::Builder::new().name("fsearch-warm".into()).spawn(|| {
-            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+            set_qos_interactive();
             loop {
                 let (from, until, now) = (WARM_FROM.load(Ordering::SeqCst), WARM_UNTIL.load(Ordering::SeqCst), now_ns());
                 if now >= until {
@@ -234,7 +263,7 @@ impl Engine {
         let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
         let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
-            Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
+            Some(v) => v.into_iter().map(|p| bytes_from_path(&p)).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
             None => {
                 log("no Full Disk Access: skipping consent-gated folders (grant it to fsearch to index everything)");
@@ -364,7 +393,7 @@ impl Engine {
                             (live.base.kind(i), live.base.size_of(i), live.base.mtime(i))
                         }
                     };
-                    Found { path: PathBuf::from(std::ffi::OsStr::from_bytes(&p)), kind, size, mtime, score: h.score }
+                    Found { path: path_from_bytes(&p), kind, size, mtime, score: h.score }
                 })
                 .collect()
         })?;
@@ -621,7 +650,7 @@ fn rescan_unskipped(shared: &Shared) {
         if walk::blocked(&path) {
             continue;
         }
-        let readable = std::fs::read_dir(std::ffi::OsStr::from_bytes(&path)).map_or_else(|e| e.raw_os_error() != Some(libc::EPERM), |_| true);
+        let readable = std::fs::read_dir(path_from_bytes(&path)).is_ok();
         if readable {
             now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0, stream: 0 });
         } else {
@@ -694,20 +723,38 @@ const GATED_IN_HOME: &[&str] = &[
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
-    GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+    #[cfg(target_os = "macos")]
+    {
+        GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        Vec::new()
+    }
 }
 
-/// The system TCC database is readable only with Full Disk Access, and
-/// trying without it fails immediately (no prompt).
 pub fn has_full_disk_access() -> bool {
-    std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+    #[cfg(target_os = "macos")]
+    {
+        std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+    }
+    #[cfg(windows)]
+    {
+        crate::winpriv::is_elevated()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        true
+    }
 }
 
-fn content_pool(threads: usize, qos: libc::qos_class_t) -> rayon::ThreadPool {
+
+fn content_pool(threads: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .start_handler(move |_| unsafe {
-            libc::pthread_set_qos_class_self_np(qos, 0);
+        .start_handler(|_| {
+            set_qos_initiated();
             no_materialize();
         })
         .build()
@@ -715,10 +762,9 @@ fn content_pool(threads: usize, qos: libc::qos_class_t) -> rayon::ThreadPool {
 }
 
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
-    // Indexing file contents is background work: utility QoS keeps it off
-    // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
-    let pool = content_pool(4, libc::qos_class_t::QOS_CLASS_UTILITY);
+    set_qos_utility();
+    let pool = content_pool(4);
+
     let home = shared.home.as_bytes().to_vec();
     // First run, while the whole disk is listed: index the folders searches
     // ask about from their early indexes. (A request that comes as the
@@ -821,7 +867,7 @@ fn sync_wants(shared: &Shared, pool: &rayon::ThreadPool, wants: Vec<(Vec<u8>, bo
     let fast;
     let pool = if first {
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
-        fast = content_pool(threads, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
+        fast = content_pool(threads);
         &fast
     } else {
         pool
@@ -1021,7 +1067,7 @@ impl Pace {
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
-    let ours = shared.dir.as_os_str().as_bytes();
+    let ours = bytes_from_path(&shared.dir);
     // Events fseventsd dropped before we read them: (replay from, last drop).
     let mut gap: Option<(u64, Instant)> = None;
     // Replays in a row that dropped again; the third falls back to a relist.
@@ -1038,7 +1084,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         events.extend(rx.try_iter().flatten());
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
-        let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
+        let owner_wrote = events.iter().any(|e| e.path.starts_with(&ours));
         let (mut rebuild, mut root_flags, had_events) = (false, 0, !events.is_empty());
         let (mut dirs, mut max_id): (HashMap<Vec<u8>, (bool, u64)>, u64) = (HashMap::new(), 0);
         if had_events {
@@ -1167,7 +1213,16 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     }
 }
 
-/// Default data dir: `~/Library/Application Support/FSearch`.
 pub fn default_dir(home: &str) -> PathBuf {
-    Path::new(home).join("Library/Application Support/FSearch")
+    #[cfg(windows)]
+    {
+        let _ = home;
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| r"C:\ProgramData".into());
+        PathBuf::from(base).join("FSearch")
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(home).join("Library/Application Support/FSearch")
+    }
 }
+

@@ -27,9 +27,8 @@ use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Class, Hir, HirKind};
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use crate::ospath::path_from_bytes;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -1535,7 +1534,7 @@ impl<'a> Scope<'a> {
         {
             return g.clone();
         }
-        let g = std::fs::read(OsStr::from_bytes(path)).ok().and_then(|t| Globs::parse(&t)).map(Arc::new);
+        let g = std::fs::read(path_from_bytes(path)).ok().and_then(|t| Globs::parse(&t)).map(Arc::new);
         parsed.insert(path.to_vec(), (size, mtime, g.clone()));
         g
     }
@@ -1566,7 +1565,7 @@ impl<'a> Scope<'a> {
         if (self.look)(&dot).is_none_or(|(kind, ..)| kind & 3 != KIND_FILE) {
             return false;
         }
-        let text = std::fs::read(OsStr::from_bytes(&dot)).unwrap_or_default();
+        let text = std::fs::read(path_from_bytes(&dot)).unwrap_or_default();
         let to = text.strip_prefix(b"gitdir:").map_or(&b""[..], <[u8]>::trim_ascii);
         to.strip_suffix(b"/").unwrap_or(to).rsplit(|&b| b == b'/').nth(1) == Some(&b"worktrees"[..])
     }
@@ -1673,7 +1672,7 @@ impl<'a> Scope<'a> {
 /// user's git config, else ~/.config/git/ignore.
 fn excludes_file(home: &[u8]) -> Vec<u8> {
     for config in [&b"/.gitconfig"[..], b"/.config/git/config"] {
-        let Ok(text) = std::fs::read(OsStr::from_bytes(&[home, config].concat())) else { continue };
+        let Ok(text) = std::fs::read(path_from_bytes(&[home, config].concat())) else { continue };
         let (mut core, mut found) = (false, None);
         for l in text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii) {
             if l.starts_with(b"[") {
@@ -1701,10 +1700,10 @@ fn git_dir(dir: &[u8], kind: u8) -> Option<Vec<u8>> {
     if kind & 3 == KIND_DIR {
         return Some(dot);
     }
-    let text = std::fs::read(OsStr::from_bytes(&dot)).ok()?;
+    let text = std::fs::read(path_from_bytes(&dot)).ok()?;
     let to = text.strip_prefix(b"gitdir:")?.trim_ascii();
     let git = if to.starts_with(b"/") { to.to_vec() } else { join(dir, to) };
-    Some(match std::fs::read(OsStr::from_bytes(&join(&git, b"commondir"))) {
+    Some(match std::fs::read(path_from_bytes(&join(&git, b"commondir"))) {
         Ok(c) if c.trim_ascii().starts_with(b"/") => c.trim_ascii().to_vec(),
         Ok(c) => join(&git, c.trim_ascii()),
         Err(_) => git,
@@ -3125,6 +3124,7 @@ fn helpers() -> &'static Helpers {
             let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
                 // Someone is waiting: keep off the slow cores and out of the
                 // throttled IO tiers, and never download iCloud placeholders.
+                #[cfg(target_os = "macos")]
                 unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
                 crate::no_materialize();
                 let mut seen = 0;
@@ -3481,18 +3481,24 @@ const OPENING: usize = 4;
 fn readers_more() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        let get = |name: &str| {
-            let name = std::ffi::CString::new(name).ok()?;
-            let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
-            let ok = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
-            (ok && v > 0).then_some(v as usize)
-        };
-        // The levels run fastest first; the last one is the efficiency cores.
-        let fast = match get("hw.nperflevels") {
-            Some(n) if n > 1 => (0..n - 1).filter_map(|i| get(&format!("hw.perflevel{i}.physicalcpu"))).sum(),
-            _ => get("hw.physicalcpu").unwrap_or(READERS),
-        };
-        fast.clamp(READERS, READERS_MORE)
+        #[cfg(target_os = "macos")]
+        {
+            let get = |name: &str| {
+                let name = std::ffi::CString::new(name).ok()?;
+                let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
+                let ok = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+                (ok && v > 0).then_some(v as usize)
+            };
+            let fast = match get("hw.nperflevels") {
+                Some(n) if n > 1 => (0..n - 1).filter_map(|i| get(&format!("hw.perflevel{i}.physicalcpu"))).sum(),
+                _ => get("hw.physicalcpu").unwrap_or(READERS),
+            };
+            fast.clamp(READERS, READERS_MORE)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            READERS
+        }
     })
 }
 /// Index searches reading candidates now (see READERS).
@@ -4686,24 +4692,27 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
 
 /// `open_regular`, and the file's size.
 fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    let f = std::fs::File::open(path_from_bytes(path)).ok()?;
     let m = f.metadata().ok()?;
     m.is_file().then_some((f, m.len()))
 }
 
-/// `open_regular` for a file about to be indexed, telling the kernel to
-/// start reading it now (as much as indexing reads).
 fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
     open_ahead_sized(path).map(|(f, _)| f)
 }
 
-/// `open_ahead`, and the file's size.
 fn open_ahead_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
-    use std::os::unix::io::AsRawFd;
-    let (f, len) = open_sized(path)?;
-    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_REPO_FILE + 1) as libc::c_int };
-    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
-    Some((f, len))
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let (f, len) = open_sized(path)?;
+        let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_REPO_FILE + 1) as libc::c_int };
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+        Some((f, len))
+    }
+    #[cfg(not(unix))]
+    {
+        open_sized(path)
+    }
 }
+

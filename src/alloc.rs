@@ -152,15 +152,29 @@ fn take(l: Layout) -> Option<*mut u8> {
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if l.size() >= BIG && l.align() <= 16384 {
-            let p =
-                unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-            return if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 };
+            #[cfg(unix)]
+            {
+                let p = unsafe {
+                    libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+                };
+                return if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 };
+            }
+            #[cfg(windows)]
+            {
+                const MEM_COMMIT: u32 = 0x1000;
+                const MEM_RESERVE: u32 = 0x2000;
+                const PAGE_READWRITE: u32 = 0x04;
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn VirtualAlloc(addr: *mut u8, size: usize, ty: u32, prot: u32) -> *mut u8;
+                }
+                return unsafe { VirtualAlloc(std::ptr::null_mut(), l.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+            }
         }
         take(l).unwrap_or_else(|| unsafe { System.alloc(small(l)) })
     }
 
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        // Fresh anonymous pages are already zero.
         if l.size() >= BIG && l.align() <= 16384 {
             return unsafe { self.alloc(l) };
         }
@@ -175,7 +189,19 @@ unsafe impl GlobalAlloc for Alloc {
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         if l.size() >= BIG && l.align() <= 16384 {
-            unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
+            #[cfg(unix)]
+            unsafe {
+                libc::munmap(p as *mut libc::c_void, l.size());
+            }
+            #[cfg(windows)]
+            {
+                const MEM_RELEASE: u32 = 0x8000;
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn VirtualFree(addr: *mut u8, size: usize, ty: u32) -> i32;
+                }
+                unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+            }
             return;
         }
         let kept = l.align() <= 16 && FREE.with(|f| unsafe { (*f.get()).keep(list(l.size()), p) });
@@ -183,6 +209,7 @@ unsafe impl GlobalAlloc for Alloc {
             unsafe { System.dealloc(p, small(l)) }
         }
     }
+
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
         // A thread that keeps blocks moves one to grow it: malloc's realloc

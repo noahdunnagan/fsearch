@@ -1,14 +1,20 @@
 # FSearch
 
-Whole-disk file search for macOS: names in about 0.1 ms, typo-tolerant,
-plus indexed search inside files. A CLI with a small daemon, a Rust crate,
-or an MCP server for coding agents.
+Whole-disk file search: names in about 0.1 ms, typo-tolerant, plus indexed
+search inside files. A CLI with a small daemon, a Rust crate, or an MCP
+server for coding agents.
+
+macOS crawls with `getattrlistbulk` and stays current from FSEvents.
+Windows reads NTFS `$MFT` (sequential I/O; needs Administrator once) and
+the USN journal, and talks over `\\.\pipe\fsearch-ipc`.
 
 ```
-cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
+cargo build --release && ./target/release/fsearch install   # macOS -> ~/.local/bin/fsearch
+# Windows: cargo build --release && fsearch install
 fsearch fsearch main              # find files by name
 fsearch 'ext:rs grep:apply_dir'   # search inside files
 ```
+
 
 ## Speed
 

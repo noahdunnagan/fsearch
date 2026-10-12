@@ -1,15 +1,28 @@
-//! Whole-disk file search for macOS: a fuzzy name index over every entry on
-//! disk, kept live from FSEvents, plus a trigram content index for text
-//! files. `Engine` runs it all in-process; the `fsearch` binary wraps one in
-//! a daemon with a JSON-lines socket.
+//! Whole-disk file search: fuzzy names, typo tolerance, indexed content grep.
+//! macOS uses getattrlistbulk + FSEvents; Windows uses `$MFT` + the USN journal.
 
 pub mod alloc;
 pub mod content;
 mod engine;
+#[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(windows)]
+#[path = "usn.rs"]
+mod fsevents;
+#[cfg(windows)]
+pub mod nt;
+pub mod ospath;
+#[cfg(windows)]
+pub mod pathwin;
+#[cfg(windows)]
+mod winpriv;
 pub mod index;
 pub mod live;
 pub mod query;
+#[cfg(not(windows))]
+pub mod walk;
+#[cfg(windows)]
+#[path = "walk_win.rs"]
 pub mod walk;
 
 pub use content::{Case, FileMatches, Grep, GrepResult, Hit};

@@ -992,46 +992,53 @@ fn other_form(s: &str) -> Option<String> {
 /// loaded on first use as in fsevents.rs (linking it costs every process
 /// ~1 ms at launch).
 fn normalized(s: &str, form: isize) -> Option<String> {
-    use std::ffi::{CStr, c_char, c_void};
-    type Fns = (
-        unsafe extern "C" fn(*const c_void, isize) -> *mut c_void,
-        unsafe extern "C" fn(*mut c_void, *const c_char, u32),
-        unsafe extern "C" fn(*mut c_void, isize),
-        unsafe extern "C" fn(*const c_void, *mut c_char, isize, u32) -> u8,
-        unsafe extern "C" fn(*const c_void),
-    );
-    static CF: std::sync::OnceLock<Option<Fns>> = std::sync::OnceLock::new();
-    unsafe fn sym<T>(h: *mut c_void, name: &CStr) -> Option<T> {
-        let p = unsafe { libc::dlsym(h, name.as_ptr()) };
-        (!h.is_null() && !p.is_null()).then(|| unsafe { std::mem::transmute_copy(&p) })
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (s, form);
+        return None;
     }
-    let f = CF
-        .get_or_init(|| unsafe {
-            let h = libc::dlopen(c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation".as_ptr(), libc::RTLD_LAZY);
-            Some((
-                sym(h, c"CFStringCreateMutable")?,
-                sym(h, c"CFStringAppendCString")?,
-                sym(h, c"CFStringNormalize")?,
-                sym(h, c"CFStringGetCString")?,
-                sym(h, c"CFRelease")?,
-            ))
-        })
-        .as_ref()?;
-    const UTF8: u32 = 0x0800_0100;
-    let c = std::ffi::CString::new(s).ok()?;
-    // Decomposed, a char takes at most three times its bytes.
-    let mut out = vec![0u8; 4 * s.len() + 16];
-    unsafe {
-        let m = (f.0)(std::ptr::null(), 0);
-        if m.is_null() {
-            return None;
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, c_char, c_void};
+        type Fns = (
+            unsafe extern "C" fn(*const c_void, isize) -> *mut c_void,
+            unsafe extern "C" fn(*mut c_void, *const c_char, u32),
+            unsafe extern "C" fn(*mut c_void, isize),
+            unsafe extern "C" fn(*const c_void, *mut c_char, isize, u32) -> u8,
+            unsafe extern "C" fn(*const c_void),
+        );
+        static CF: std::sync::OnceLock<Option<Fns>> = std::sync::OnceLock::new();
+        unsafe fn sym<T>(h: *mut c_void, name: &CStr) -> Option<T> {
+            let p = unsafe { libc::dlsym(h, name.as_ptr()) };
+            (!h.is_null() && !p.is_null()).then(|| unsafe { std::mem::transmute_copy(&p) })
         }
-        (f.1)(m, c.as_ptr(), UTF8);
-        (f.2)(m, form);
-        let ok = (f.3)(m, out.as_mut_ptr() as *mut c_char, out.len() as isize, UTF8) != 0;
-        (f.4)(m);
-        let n = out.iter().position(|&b| b == 0)?;
-        ok.then(|| String::from_utf8(out[..n].to_vec()).ok()).flatten()
+        let f = CF
+            .get_or_init(|| unsafe {
+                let h = libc::dlopen(c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation".as_ptr(), libc::RTLD_LAZY);
+                Some((
+                    sym(h, c"CFStringCreateMutable")?,
+                    sym(h, c"CFStringAppendCString")?,
+                    sym(h, c"CFStringNormalize")?,
+                    sym(h, c"CFStringGetCString")?,
+                    sym(h, c"CFRelease")?,
+                ))
+            })
+            .as_ref()?;
+        const UTF8: u32 = 0x0800_0100;
+        let c = std::ffi::CString::new(s).ok()?;
+        let mut out = vec![0u8; 4 * s.len() + 16];
+        unsafe {
+            let m = (f.0)(std::ptr::null(), 0);
+            if m.is_null() {
+                return None;
+            }
+            (f.1)(m, c.as_ptr(), UTF8);
+            (f.2)(m, form);
+            let ok = (f.3)(m, out.as_mut_ptr() as *mut c_char, out.len() as isize, UTF8) != 0;
+            (f.4)(m);
+            let n = out.iter().position(|&b| b == 0)?;
+            ok.then(|| String::from_utf8(out[..n].to_vec()).ok()).flatten()
+        }
     }
 }
 
@@ -3904,6 +3911,7 @@ impl NameTable {
             });
             d
         })
+        .as_slice()
     }
 
     #[inline(always)]

@@ -484,34 +484,61 @@ pub(crate) fn normalize(path: &[u8]) -> Vec<u8> {
 }
 
 pub fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(dir.len() + 1 + name.len());
-    p.extend_from_slice(dir);
-    if dir != b"/" {
-        p.push(b'/');
+    #[cfg(windows)]
+    {
+        crate::pathwin::join(dir, name)
     }
-    p.extend_from_slice(name);
-    p
+    #[cfg(not(windows))]
+    {
+        let mut p = Vec::with_capacity(dir.len() + 1 + name.len());
+        p.extend_from_slice(dir);
+        if dir != b"/" {
+            p.push(b'/');
+        }
+        p.extend_from_slice(name);
+        p
+    }
 }
 
-/// Key range holding everything strictly under `path`.
 fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let lo = join(path, b"");
     let mut hi = lo.clone();
-    *hi.last_mut().unwrap() += 1; // '/' + 1 == '0'
+    if let Some(l) = hi.last_mut() {
+        *l += 1;
+    }
     (lo, hi)
 }
 
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
-    let c = std::ffi::CString::new(path).ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
-        return None;
+    #[cfg(windows)]
+    {
+        let p = crate::ospath::path_from_bytes(path);
+        let m = std::fs::symlink_metadata(&p).ok()?;
+        let kind = if m.file_type().is_symlink() {
+            walk::KIND_LINK
+        } else if m.is_dir() {
+            KIND_DIR
+        } else if m.is_file() {
+            walk::KIND_FILE
+        } else {
+            walk::KIND_OTHER
+        };
+        let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as u32).unwrap_or(0);
+        Some(OEnt::new(path, kind, m.len(), mtime))
     }
-    let kind = match st.st_mode & libc::S_IFMT {
-        libc::S_IFREG => walk::KIND_FILE,
-        libc::S_IFDIR => KIND_DIR,
-        libc::S_IFLNK => walk::KIND_LINK,
-        _ => walk::KIND_OTHER,
-    };
-    Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
+    #[cfg(not(windows))]
+    {
+        let c = std::ffi::CString::new(path).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => walk::KIND_FILE,
+            libc::S_IFDIR => KIND_DIR,
+            libc::S_IFLNK => walk::KIND_LINK,
+            _ => walk::KIND_OTHER,
+        };
+        Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
+    }
 }

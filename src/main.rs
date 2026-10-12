@@ -1,6 +1,13 @@
+#[cfg(not(windows))]
 mod frecency;
+#[cfg(not(windows))]
 mod git;
+#[cfg(not(windows))]
 mod mcp;
+#[cfg(not(windows))]
+mod server;
+#[cfg(windows)]
+#[path = "win_server.rs"]
 mod server;
 
 use fsearch::{index, live, query};
@@ -9,7 +16,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// See `fsearch::alloc`.
 #[global_allocator]
 static GLOBAL: fsearch::alloc::Alloc = fsearch::alloc::Alloc;
 
@@ -19,32 +25,38 @@ const USAGE: &str = "usage:
   fsearch mcp                   MCP server on stdin/stdout, for coding agents
   fsearch serve                 run the daemon in the foreground
   fsearch status
-  fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
-                                (needs Full Disk Access granted to ~/.local/bin/fsearch)
-  fsearch uninstall             remove the login agent (keeps the index)
+  fsearch install [--login]     install the binary and optional login/startup entry
+  fsearch uninstall             remove the login/startup entry (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
+#[cfg(not(windows))]
 const LABEL: &str = "mt.nd.fsearch";
 
 fn home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    }
 }
 
 fn data_dir() -> PathBuf {
-    let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
+    let d = fsearch::default_dir(&home());
     std::fs::create_dir_all(&d).ok();
     d
 }
 
-unsafe extern "C" {
-    fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
-}
-
 fn main() {
-    // Never let a search download iCloud placeholders: opening or listing a
-    // dataless file/dir fails fast instead of materializing it.
-    // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
-    unsafe { setiopolicy_np(3, 0, 1) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        setiopolicy_np(3, 0, 1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
@@ -53,7 +65,12 @@ fn main() {
             server::serve(data_dir(), home())
         }
         Some("stdio") => stdio(),
-        Some("mcp") => mcp::run(data_dir()),
+        Some("mcp") => {
+            #[cfg(not(windows))]
+            mcp::run(data_dir());
+            #[cfg(windows)]
+            die("mcp is not yet wired on Windows; use fsearch stdio");
+        }
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
@@ -61,20 +78,14 @@ fn main() {
         Some(_) => {
             let json = args.iter().any(|a| a == "--json");
             let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-            // The folder `git:` filters and globs are about, unless `in:` says.
             let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
             print_one(&serde_json::json!({"q": q.join(" "), "cwd": cwd}), json);
         }
     }
 }
 
-/// macOS's malloc (27, xzone) keeps freed small blocks dirty and its
-/// pressure relief does nothing, so after the first run or a compaction the
-/// daemon held 150-290 MB it no longer used, until restarted. In
-/// space-efficient mode, read only at launch, it hands them back: the daemon
-/// idles at 5-15 MB on the M6, for searches ~8% slower. So `serve` restarts
-/// itself in it.
 fn space_efficient() {
+    #[cfg(target_os = "macos")]
     if std::env::var_os("MallocSpaceEfficient").is_none()
         && let Ok(exe) = std::env::current_exe()
     {
@@ -84,10 +95,11 @@ fn space_efficient() {
     }
 }
 
+
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     s.write_all(format!("{req}\n").as_bytes()).unwrap();
-    // One request only: the daemon needn't keep the cores warm for a next one.
+    #[cfg(unix)]
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).unwrap();
@@ -121,6 +133,7 @@ fn stdio() {
                 break;
             }
         }
+        #[cfg(unix)]
         let _ = up.shutdown(std::net::Shutdown::Write);
     });
     let mut out = std::io::stdout().lock();
@@ -144,7 +157,6 @@ fn bench(qs: &str) {
     let content = grep.as_ref().map(|_| fsearch::content::Content::open_shared(dir.join("content")));
     let pool = rayon::ThreadPoolBuilder::new()
         .start_handler(|_| {
-            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
             fsearch::alloc::keep_on_this_thread();
         })
         .build()
@@ -189,31 +201,46 @@ fn bench(qs: &str) {
     eprintln!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0]);
 }
 
+#[cfg(not(windows))]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(not(windows))]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(not(windows))]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(windows)]
 fn install(login: bool) {
-    // A plain reinstall keeps an existing login agent.
+    let dest = data_dir().join("fsearch.exe");
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(std::env::current_exe().unwrap(), &dest).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    if login {
+        println!("installed {}; add a startup entry with: fsearch serve", dest.display());
+    } else {
+        println!("installed {}; daemon starts on first search", dest.display());
+    }
+}
+
+#[cfg(windows)]
+fn uninstall() {
+    println!("index kept in {}", data_dir().display());
+}
+
+#[cfg(not(windows))]
+fn install(login: bool) {
     let login = login || plist_path().exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
-    // Stop the old daemon so the next one runs the new binary. Unload the
-    // login agent first, or KeepAlive would restart it straight away.
     let target = format!("{}/{LABEL}", domain());
     launchctl(&["bootout", &target]);
     server::stop(&data_dir()).unwrap_or_else(|e| die(&e));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-    // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache. Copy then rename, so
-    // reinstalling from the installed copy works too.
     let tmp = bin.with_extension("new");
     std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
     let agents =
@@ -242,8 +269,6 @@ fn install(login: bool) {
         log.display()
     );
     std::fs::write(plist_path(), plist).unwrap();
-    // bootout returns before the old job is fully gone; bootstrap fails
-    // until it is.
     let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
     let retry = || {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -255,11 +280,13 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})\n{agents}", bin.display());
 }
 
+#[cfg(not(windows))]
 fn uninstall() {
     launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     let _ = std::fs::remove_file(plist_path());
     println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
 }
+
 
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
