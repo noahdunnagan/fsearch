@@ -322,7 +322,21 @@ impl Engine {
             s.loading.1.notify_all();
             if let Some(from) = replay {
                 // (A save from before event ids were stamped: from now.)
-                s.watch(if owner && from == 0 { fsevents::current_id() } else { from });
+                let from = if owner && from == 0 { fsevents::current_id() } else { from };
+                let head = fsevents::current_id();
+                if from > head {
+                    // fseventsd re-based its journal below the saved id (the
+                    // saved id then sits in the future): replaying from it
+                    // delivers nothing. Treat it as lost history: relist the
+                    // folders that changed since the save, and re-stamp the
+                    // id so the next save is replayable again.
+                    log(format!("saved event id {from} is ahead of the journal head {head}: relisting folders changed since the save"));
+                    s.watch(head);
+                    s.live.write().unwrap().as_mut().unwrap().event_id = head;
+                    relist_changed(&s, "event ids re-based below our save", 0);
+                } else {
+                    s.watch(from);
+                }
             }
             if let Some(l) = s.live.read().unwrap().as_ref() {
                 l.base.prefault();
