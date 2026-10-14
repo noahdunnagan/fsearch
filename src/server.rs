@@ -368,6 +368,9 @@ impl Extras {
         for g in globs {
             let (neg, g) = g.strip_prefix('!').map_or((false, g), |g| (true, g));
             let re = glob_regex(g, &base)?;
+            if !neg {
+                q.named.extend(fsearch::query::glob_name(g).map(<[u8]>::to_vec));
+            }
             if neg || q.path_re.is_some() {
                 x.globs.push((re, neg));
                 continue;

@@ -391,6 +391,9 @@ pub struct Query {
     pub mtime: (u32, u32),
     pub name_re: Option<regex::bytes::Regex>,
     pub path_re: Option<regex::bytes::Regex>,
+    /// File names a request's globs spell out (see `glob_name`), set by the
+    /// server: a grep reads such files even without indexed text (`names`).
+    pub named: Vec<Vec<u8>>,
     pub limit: usize,
     /// Content search: handled by the content layer, carried here so one
     /// query string can say everything.
@@ -632,6 +635,19 @@ impl Query {
         }
     }
 
+    /// The file names the query spells out: its words, its globs' and `named`.
+    pub fn names(&self) -> impl Iterator<Item = &[u8]> {
+        let words = self.tokens.iter().filter(|t| !t.negate).map(|t| &t.text[..]);
+        let globs = self.globs.iter().filter(|g| !g.negate).filter_map(|g| glob_name(&g.text));
+        words.chain(globs).chain(self.named.iter().map(Vec::as_slice))
+    }
+
+    /// Does the query name the file at `path` (see `names`), ASCII case aside?
+    pub fn names_file(&self, path: &[u8]) -> bool {
+        let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |c| c + 1)..];
+        self.names().any(|n| n.eq_ignore_ascii_case(name))
+    }
+
     /// Does a full path pass every filter and token? Returns the match score.
     /// Used where there is no dir memo: the overlay and content-search docs.
     pub fn match_path(&self, path: &[u8], kind: u8, size: u64, mtime: u32) -> Option<i32> {
@@ -734,6 +750,13 @@ impl Query {
 pub struct DirMatch {
     negated: bool,
     best: [Option<i32>; 8],
+}
+
+/// The file name a glob spells out: its last part, if free of glob syntax
+/// (`**/big.json` and `data/big.json` name `big.json`; `{a/x,b/y}.json` none).
+pub fn glob_name(g: &str) -> Option<&[u8]> {
+    let name = g.rsplit('/').next().unwrap_or(g);
+    (!name.is_empty() && !name.contains(['*', '?', '[', '{', '}', '\\'])).then_some(name.as_bytes())
 }
 
 /// A glob or folder word: `src/**/*.rs`, `*test*`, `test/`, `a/b/`.
@@ -4064,6 +4087,14 @@ mod tests {
     fn live() -> Live {
         let ent = |off| RawEnt { name_off: off, name_len: 3, kind: KIND_FILE, size: 1, mtime: 1, child: NONE };
         Live::new(Index::build(vec![Listing { id: 0, names: b"abcabd".to_vec(), ents: vec![ent(0), ent(3)] }], 0, 0, b"/h"))
+    }
+
+    /// A word (each part of a path) or a glob's last part names a file; not
+    /// a negated one, a wildcard, a brace group or a folder word.
+    #[test]
+    fn names_files() {
+        let names = |s: &str| Query::parse(s, "/h").unwrap().names().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>();
+        assert_eq!(names("data/big.json !x.json **/one.json !**/two.json *.rs src/ b*g.json {x/d.json,y/e.json}"), ["data", "big.json", "one.json"]);
     }
 
     /// limit: takes any number; the largest overflowed `TopK`.

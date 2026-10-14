@@ -146,6 +146,9 @@ pub struct Segment {
     /// The first and last path in path order, decoded once: every scoped
     /// search checks them (see `prefix_run`).
     ends: [Vec<u8>; 2],
+    /// Its docs with no text as (`name_key` of the name, doc), sorted: built
+    /// the first time a grep names a file (see `no_text`).
+    no_text: std::sync::OnceLock<Vec<(u64, u32)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +225,18 @@ impl Segment {
         let mut r = PathReader { b: &self.paths()[self.path_off()[g] as usize..], ..Default::default() };
         r.skip(k + 1);
         r.path
+    }
+
+    /// Its docs with no text whose name hashes as `name` (see `name_key`).
+    fn no_text(&self, name: &[u8]) -> impl Iterator<Item = u32> + '_ {
+        let by_name = self.no_text.get_or_init(|| {
+            let mut v: Vec<_> =
+                (0..self.ndocs as u32).filter(|&d| self.doc_gid()[d as usize] == NONE).map(|d| (name_key(&self.path(d)), d)).collect();
+            v.sort_unstable();
+            v
+        });
+        let h = name_key(name);
+        by_name[by_name.partition_point(|e| e.0 < h)..].iter().take_while(move |e| e.0 == h).map(|e| e.1)
     }
 
     /// Every doc's path in doc order, in one pass.
@@ -428,6 +443,7 @@ impl Segment {
         let mut s = Segment {
             map, id, ndocs, ngroups: ndocs.div_ceil(PATHS), ntri, nblk: ntri.div_ceil(DICT), dict_len, plen, paths_len, nwords, nown, nown1: nown + 1,
             off, dead, live_docs, refs: Counts::new(nown), runs: Vec::new(), ends: Default::default(),
+            no_text: Default::default(),
         };
         let mut runs: Vec<(u32, u32, u32)> = Vec::new();
         for (c, &g) in s.own_gid().iter().enumerate() {
@@ -700,6 +716,12 @@ fn bloom(hashes: &[u32], bits: usize, out: &mut Vec<u64>) {
 /// Keywords a definition starts with (`sym:` search).
 const DEFINES: &str = "fn|func|function|def|class|struct|enum|trait|interface|type|typealias|impl|let|const|var|val|static|module|mod|protocol|extension|macro_rules!|define|typedef|union|object|record|namespace|actor";
 
+/// FNV-1a of the file name ending `path`, ASCII case aside.
+fn name_key(path: &[u8]) -> u64 {
+    let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |c| c + 1)..];
+    name.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b.to_ascii_lowercase() as u64).wrapping_mul(0x100_0000_01b3))
+}
+
 /// The posting key for "this doc defines `name`": a hash above the 24-bit
 /// trigram space, so definitions live in the same key table as trigrams.
 fn symbol_key(name: &[u8]) -> u32 {
@@ -737,12 +759,13 @@ fn symbols(buf: &[u8], out: &mut Vec<u32>) {
     out.extend(keys);
 }
 
-/// Paths with size and mtime, all in one buffer: a full sync holds ~500k
-/// of them, and one allocation beats 500k (see `Paths` for big ones).
+/// Paths with size, mtime and whether the build reads each, all in one
+/// buffer: a full sync holds ~500k of them, and one allocation beats 500k
+/// (see `Paths` for big ones).
 #[derive(Default)]
 pub struct Docs {
     buf: Paths,
-    items: Vec<(u32, u32, u64, u32)>,
+    items: Vec<(u32, u32, u64, u32, bool)>,
     /// What builds of these docs share: the contents already indexed (set
     /// by `diff`; docs from elsewhere are for a new, empty index).
     dedup: std::sync::OnceLock<Dedup>,
@@ -858,12 +881,12 @@ impl std::ops::Deref for Paths {
 }
 
 impl Docs {
-    fn push(&mut self, path: &[u8], size: u64, mtime: u32) {
-        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime));
+    fn push(&mut self, path: &[u8], size: u64, mtime: u32, read: bool) {
+        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime, read));
         self.buf.push(path);
     }
     pub fn path(&self, i: usize) -> &[u8] {
-        let (o, l, _, _) = self.items[i];
+        let (o, l, ..) = self.items[i];
         &self.buf[o as usize..(o + l) as usize]
     }
     pub fn len(&self) -> usize {
@@ -872,17 +895,20 @@ impl Docs {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+    pub fn reads_any(&self) -> bool {
+        self.items.iter().any(|it| it.4)
+    }
     fn sort(&mut self) {
         let buf = &self.buf;
         self.items.sort_by(|a, b| buf[a.0 as usize..(a.0 + a.1) as usize].cmp(&buf[b.0 as usize..(b.0 + b.1) as usize]));
         self.items.dedup_by(|a, b| buf[a.0 as usize..(a.0 + a.1) as usize] == buf[b.0 as usize..(b.0 + b.1) as usize]);
     }
     fn find(&self, path: &[u8]) -> Option<usize> {
-        let i = self.items.partition_point(|&(o, l, _, _)| &self.buf[o as usize..(o + l) as usize] < path);
+        let i = self.items.partition_point(|&(o, l, ..)| &self.buf[o as usize..(o + l) as usize] < path);
         (i < self.items.len() && self.path(i) == path).then_some(i)
     }
 
-    /// Index ranges of about SEG_BYTES of file data each.
+    /// Index ranges of about SEG_BYTES of file data to read each.
     pub fn batches(&self) -> Vec<std::ops::Range<usize>> {
         let (mut out, mut start, mut bytes) = (Vec::new(), 0, 0u64);
         for (i, it) in self.items.iter().enumerate() {
@@ -890,7 +916,7 @@ impl Docs {
                 out.push(start..i);
                 (start, bytes) = (i, 0);
             }
-            bytes += it.2;
+            bytes += if it.4 { it.2 } else { 0 };
         }
         if start < self.items.len() {
             out.push(start..self.items.len());
@@ -904,8 +930,12 @@ impl Docs {
 const SMALL: usize = 256;
 
 /// Rank of a doc that turned out not to be text: kept so diffs know we
-/// looked at it, never a candidate.
+/// looked at it, a candidate only where the query names it (`NAMED`).
 const NOT_TEXT: i8 = i8::MIN;
+
+/// Rank of a doc the build keeps unread (see `Scope::file`): never opened,
+/// a candidate as a `NOT_TEXT` one. Both rank below every doc with text.
+const SKIPPED: i8 = i8::MIN + 1;
 
 struct DocMeta<'a> {
     path: std::borrow::Cow<'a, [u8]>,
@@ -957,8 +987,9 @@ struct SplitContent {
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
-/// to be text are recorded with no content; a file whose bytes are already
-/// indexed (this sync, or before it: see `diff`) just names that content.
+/// to be text, or kept unread, are recorded with no content; a file whose
+/// bytes are already indexed (this sync, or before it: see `diff`) just
+/// names that content.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
     use std::io::Read;
     // Docs in runs of 256, a run on one thread with its next 8 files open
@@ -982,7 +1013,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             runs.push(start..i);
             (start, bytes) = (i, 0);
         }
-        bytes += docs.items[i].2;
+        bytes += if docs.items[i].4 { docs.items[i].2 } else { 0 };
     }
     if start < range.end {
         runs.push(start..range.end);
@@ -995,7 +1026,8 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             let mut ahead = std::collections::VecDeque::new();
             for i in run.clone() {
                 while ahead.len() <= AHEAD && i + ahead.len() < run.end {
-                    ahead.push_back(open_ahead(docs.path(i + ahead.len())));
+                    let k = i + ahead.len();
+                    ahead.push_back(if docs.items[k].4 { open_ahead(docs.path(k)) } else { None });
                 }
                 buf.clear();
                 let text = (ahead.pop_front().flatten())
@@ -1057,13 +1089,20 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let gids = dedup.free.lock().unwrap().take(nnew);
     let meta: Vec<DocMeta> = (splits.iter().flat_map(|sp| &sp.docs))
         .map(|&(i, holds)| {
-            let (_, _, size, mtime) = docs.items[i];
+            let (_, _, size, mtime, read) = docs.items[i];
             let gid = match holds {
                 Holds::Nothing => NONE,
                 Holds::Gid(g) => g,
                 Holds::New(k) => gids[local[k as usize] as usize],
             };
-            DocMeta { path: docs.path(i).into(), size, mtime, rank: if gid == NONE { NOT_TEXT } else { doc_rank(docs.path(i)) }, gid }
+            let rank = if !read {
+                SKIPPED
+            } else if gid == NONE {
+                NOT_TEXT
+            } else {
+                doc_rank(docs.path(i))
+            };
+            DocMeta { path: docs.path(i).into(), size, mtime, rank, gid }
         })
         .collect();
     let mut own: Vec<Option<ContentMeta>> = (0..nnew).map(|_| None).collect();
@@ -1329,10 +1368,10 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
     Segment::load(dir, id)
 }
 
-/// Should this file be in the content index? (Resolves its folders from the
-/// disk; a sync resolves each folder once, see `Scope`.)
+/// Should this file's text be in the content index? (Resolves its folders
+/// from the disk; a sync resolves each folder once, see `Scope`.)
 pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
-    Scope::new(home, &on_disk).file(path, size)
+    Scope::new(home, &on_disk).file(path, size) == Some(true)
 }
 
 /// Outside git repos, the text files are known by name and size.
@@ -1610,8 +1649,10 @@ impl<'a> Scope<'a> {
         Place { repo: up.repo || rules.root.is_some(), rules: Some(Arc::new(rules)) }
     }
 
-    /// Should the file at `path` be indexed?
-    fn file(&mut self, path: &[u8], size: u64) -> bool {
+    /// Should the file at `path` be indexed: Some(true) for its text, and
+    /// Some(false) unread for one skipped as generated, or for its size with
+    /// a text extension, so a grep that names it still reads it.
+    fn file(&mut self, path: &[u8], size: u64) -> Option<bool> {
         let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
         let (dir, name) = (&path[..cut], &path[cut + 1..]);
         let place = match &self.last {
@@ -1622,10 +1663,14 @@ impl<'a> Scope<'a> {
                 p
             }
         };
-        let Some(place) = place else { return false };
+        let place = place?;
         let cap = if json_ext(name) { MAX_FILE } else { MAX_REPO_FILE };
         let ok = if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
-        ok && !generated(name, size) && !ignored(&place.rules, self.global.as_deref(), path, false)
+        let made = generated(name, size);
+        let read = ok && !made;
+        let text_name = || TEXT_EXTS.iter().any(|x| x.eq_ignore_ascii_case(ext(name)));
+        let keep = read || size <= MAX_REPO_FILE && (made || size > MAX_FILE && text_name());
+        (keep && !ignored(&place.rules, self.global.as_deref(), path, false)).then_some(read)
     }
 
     /// What should be indexed under `dir` (direct children only unless
@@ -1650,24 +1695,26 @@ impl<'a> Scope<'a> {
                     continue;
                 }
                 path(i, &mut p);
-                if self.file(&p, size) {
-                    picked.push(i);
+                if let Some(read) = self.file(&p, size) {
+                    picked.push((i as u32, read));
                     bytes += p.len();
                 }
             }
         }
         let lo = join(dir, b"");
         let over: Vec<_> = (live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)))
-            .filter(|(k, o)| o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && self.file(k, o.size))
+            .filter(|(k, o)| o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')))
+            .filter_map(|(k, o)| Some((k, o, self.file(k, o.size)?)))
             .collect();
         want.items.reserve_exact(picked.len() + over.len());
-        want.buf = Paths::exactly(bytes + over.iter().map(|(k, _)| k.len()).sum::<usize>());
-        for i in picked {
+        want.buf = Paths::exactly(bytes + over.iter().map(|(k, ..)| k.len()).sum::<usize>());
+        for (i, read) in picked {
+            let i = i as usize;
             path(i, &mut p);
-            want.push(&p, idx.size_of(i), idx.mtime(i));
+            want.push(&p, idx.size_of(i), idx.mtime(i), read);
         }
-        for (k, o) in over {
-            want.push(k, o.size, o.mtime);
+        for (k, o, read) in over {
+            want.push(k, o.size, o.mtime, read);
         }
         want
     }
@@ -2276,6 +2323,7 @@ impl Content {
                         Some(k)
                             if want.items[k].2 == s.size()[i] as u64
                                 && want.items[k].3 == s.mtime()[i]
+                                && want.items[k].4 == (s.rank()[i] != SKIPPED)
                                 && (g == NONE || content_of(gids, g).is_some()) =>
                         {
                             held[k] = true
@@ -2291,8 +2339,8 @@ impl Content {
             }
             for (i, h) in held.iter().enumerate() {
                 if !h {
-                    let (_, _, size, mtime) = want.items[i];
-                    todo.push(want.path(i), size, mtime);
+                    let (_, _, size, mtime, read) = want.items[i];
+                    todo.push(want.path(i), size, mtime, read);
                 }
             }
         }
@@ -2478,7 +2526,7 @@ impl Content {
                 let (mut v, mut paths) = (Vec::with_capacity(ids.len()), PathCursor::default());
                 v.extend(
                     ids.into_iter()
-                        .filter(|&d| !s.is_dead(d) && s.rank()[d as usize] != NOT_TEXT)
+                        .filter(|&d| !s.is_dead(d) && s.rank()[d as usize] > SKIPPED)
                         .filter(|&d| !check || path_ok(filt, ext_only, &mut paths, s, d))
                         .map(|d| ranked(s, si, d)),
                 );
@@ -2729,15 +2777,25 @@ impl Content {
     }
 
     /// `search`, reading `fresh` first: files the index may not hold as
-    /// they are now (see `Dirty`), newest first.
+    /// they are now (see `Dirty`), newest first. The files the query names
+    /// whose text it holds none of (see `no_text`) are candidates too,
+    /// ranked as if it held them.
     pub fn search_with(&self, g: &Grep, filt: &Query, fresh: &[Vec<u8>]) -> GrepResult {
-        let Found { mut per, total, dense } = self.candidates(&g.plan(), filt);
+        let Found { mut per, mut total, dense } = self.candidates(&g.plan(), filt);
+        let mut left: Vec<_> = self.no_text(filt).into_iter().filter(|f| !fresh.contains(&f.0)).collect();
+        left.sort_unstable();
+        left.dedup_by(|a, b| a.0 == b.0);
+        total += left.len();
+        per.push(Cands::list(left.iter().enumerate().map(|(k, (p, _, mtime))| (rank_key(doc_rank(p), *mtime), NAMED, k as u32)).collect()));
         // A candidate whose content's bloom filter lacks one of the pattern's
         // grams can't match: skip it without opening the file. (A fresh one
         // was read already.)
         let probes = g.probes();
-        let read: std::collections::HashSet<&[u8]> = fresh.iter().map(Vec::as_slice).collect();
+        let read: std::collections::HashSet<&[u8]> = fresh.iter().chain(left.iter().map(|f| &f.0)).map(Vec::as_slice).collect();
         let path = |&(_, si, d): &Ranked| {
+            if si == NAMED {
+                return Some(left[d as usize].0.as_slice().into());
+            }
             let s = &self.segs[si as usize];
             let (a, c) = self.content_of(s.doc_gid()[d as usize])?;
             self.segs[a].may_contain(c, &probes).then(|| s.path(d)).filter(|p| read.is_empty() || !read.contains(p.as_slice())).map(Into::into)
@@ -2753,7 +2811,7 @@ impl Content {
         };
         let (mut r, done) = match fresh.len() {
             0 => (GrepResult { complete: true, ..Default::default() }, 0),
-            n => verify_from(g, from(n), n, limit, Reading::Fresh, t, |i| Some(fresh[i].as_slice().into())),
+            n => verify_from(g, from(n), n, limit, Reading::Fresh, Some(filt), t, |i| Some(fresh[i].as_slice().into())),
         };
         // Then most searches are done within the best few hundred
         // candidates: rank those first, and the rest only if reading gets
@@ -2766,7 +2824,7 @@ impl Content {
         };
         if r.files.len() < limit && done == fresh.len() {
             let best = take_best(&mut per);
-            let (more, done) = verify_from(g, from(best.len()), best.len(), limit - r.files.len(), Reading::Index, t, |i| path(&best[i]));
+            let (more, done) = verify_from(g, from(best.len()), best.len(), limit - r.files.len(), Reading::Index, None, t, |i| path(&best[i]));
             add(&mut r, more, fresh.len());
             if r.files.len() < limit && done == best.len() && best.len() < total {
                 // Then the next best few thousand, and the others only if
@@ -2786,7 +2844,7 @@ impl Content {
                         rest[at..].par_sort_unstable();
                     }
                     let f = at + from(end - at);
-                    let (more, done) = verify_from(g, f, end, limit - r.files.len(), Reading::Index, t, |i| path(&rest[i]));
+                    let (more, done) = verify_from(g, f, end, limit - r.files.len(), Reading::Index, None, t, |i| path(&rest[i]));
                     add(&mut r, more, fresh.len() + best.len());
                     if r.files.len() >= limit || done < end {
                         break;
@@ -2800,10 +2858,25 @@ impl Content {
         r
     }
 
-    /// Does a live doc lie under this folder?
+    /// Does a live doc the build read lie under this folder?
     pub fn holds(&self, dir: &[u8]) -> bool {
         let lo = join(dir, b"");
-        self.segs.iter().any(|s| s.with_prefix(&lo).next().is_some())
+        self.segs.iter().any(|s| s.with_prefix(&lo).any(|d| s.rank()[d as usize] != SKIPPED))
+    }
+
+    /// The files the query names (`Query::names`) whose live doc holds no
+    /// text and that pass its filters, with their size and mtime.
+    fn no_text(&self, filt: &Query) -> Vec<(Vec<u8>, u64, u32)> {
+        let mut out = Vec::new();
+        for s in &self.segs {
+            for d in filt.names().flat_map(|n| s.no_text(n)).filter(|&d| !s.is_dead(d)) {
+                let (p, size, mtime) = (s.path(d), s.size()[d as usize] as u64, s.mtime()[d as usize]);
+                if filt.names_file(&p) && filt.match_path(&p, KIND_FILE, size, mtime).is_some() {
+                    out.push((p, size, mtime));
+                }
+            }
+        }
+        out
     }
 
     /// Which of `want` (what should be indexed under `dir`) no live doc
@@ -2815,7 +2888,8 @@ impl Content {
             let ids = if recursive { s.with_prefix(&lo).collect::<Vec<_>>() } else { s.direct_children(&lo) };
             for d in ids {
                 if let Some(k) = want.find(&s.path(d))
-                    && (want.items[k].2, want.items[k].3) == (s.size()[d as usize] as u64, s.mtime()[d as usize])
+                    && (want.items[k].2, want.items[k].3, want.items[k].4)
+                        == (s.size()[d as usize] as u64, s.mtime()[d as usize], s.rank()[d as usize] != SKIPPED)
                 {
                     held[k] = true;
                 }
@@ -2831,8 +2905,9 @@ impl Content {
 #[derive(Default)]
 pub struct Dirty(Mutex<Changed>);
 
-/// Per folder (and whether its subtree), its changed files: path, size, mtime.
-type Changed = HashMap<(Vec<u8>, bool), Vec<(Vec<u8>, u64, u32)>>;
+/// Per folder (and whether its subtree), its changed files: path, size,
+/// mtime, and whether the build reads it.
+type Changed = HashMap<(Vec<u8>, bool), Vec<(Vec<u8>, u64, u32, bool)>>;
 
 /// Past this many changed files in one folder, the rest wait for the sync.
 const DIRTY_MAX: usize = 4096;
@@ -2847,7 +2922,7 @@ impl Dirty {
                 .unheld(&dir, recursive, &want)
                 .into_iter()
                 .take(DIRTY_MAX)
-                .map(|k| (want.path(k).to_vec(), want.items[k].2, want.items[k].3))
+                .map(|k| (want.path(k).to_vec(), want.items[k].2, want.items[k].3, want.items[k].4))
                 .collect();
             if files.is_empty() {
                 m.remove(&(dir, recursive));
@@ -2865,12 +2940,13 @@ impl Dirty {
         }
     }
 
-    /// The changed files the query's name filters let through, newest first.
+    /// The changed files the query's name filters let through, newest first:
+    /// of those the build keeps unread, the ones it names.
     pub fn files(&self, q: &Query) -> Vec<Vec<u8>> {
         let m = self.0.lock().unwrap();
         let mut out: Vec<(u32, &Vec<u8>)> = (m.values().flatten())
-            .filter(|(p, size, mtime)| q.match_path(p, KIND_FILE, *size, *mtime).is_some())
-            .map(|(p, _, mtime)| (*mtime, p))
+            .filter(|(p, size, mtime, read)| (*read || q.names_file(p)) && q.match_path(p, KIND_FILE, *size, *mtime).is_some())
+            .map(|(p, _, mtime, _)| (*mtime, p))
             .collect();
         out.sort_unstable_by(|a, b| b.cmp(a));
         out.dedup_by(|a, b| a.1 == b.1);
@@ -2970,6 +3046,10 @@ type Ranked = (u64, u32, u32);
 fn rank_key(rank: i8, mtime: u32) -> u64 {
     (((127 - rank as i32) as u64) << 32) | (u32::MAX - mtime) as u64
 }
+
+/// The segment of a `Ranked` for a named file no segment holds text of:
+/// its doc is the file's place in `Content::search_with`'s list of them.
+const NAMED: u32 = u32::MAX;
 
 /// Candidates ranked in the first round.
 const FIRST: usize = 512;
@@ -3258,20 +3338,23 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
 /// Grep the docs `wanted` lists by reading them all: the content index's
 /// first build is still running, and its partial answer would be missing
 /// files. Reads them in the order the built index will rank them (it
-/// numbers a first build's docs in path order), so the answer is the same.
+/// numbers a first build's docs in path order), so the answer is the same:
+/// one kept unread is read only where the query names it.
 pub fn grep_unindexed(g: &Grep, mut docs: Docs, filt: &Query) -> GrepResult {
     docs.sort();
     let mut order: Vec<(u64, u32)> = (0..docs.len())
         .filter_map(|i| {
-            let (p, (_, _, size, mtime)) = (docs.path(i), docs.items[i]);
-            filt.match_path(p, KIND_FILE, size, mtime)?;
+            let (p, (_, _, size, mtime, read)) = (docs.path(i), docs.items[i]);
+            filt.match_path(p, KIND_FILE, size, mtime).filter(|_| read || filt.names_file(p))?;
             Some((rank_key(doc_rank(p), mtime), i as u32))
         })
         .collect();
     order.sort_unstable();
     let n = order.len();
-    let mut r =
-        verify_from(g, g.skip.min(n), n, filt.limit, Reading::Scan, std::time::Instant::now(), |k| Some(docs.path(order[k].1 as usize).into())).0;
+    let mut r = verify_from(g, g.skip.min(n), n, filt.limit, Reading::Scan, Some(filt), std::time::Instant::now(), |k| {
+        Some(docs.path(order[k].1 as usize).into())
+    })
+    .0;
     r.next = r.next.filter(|&x| x < n);
     r
 }
@@ -3589,7 +3672,8 @@ pub fn grep_file(g: &Grep, path: &[u8]) -> GrepResult {
 }
 
 fn verify_as(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize, how: Reading) -> GrepResult {
-    let mut r = verify_from(g, g.skip.min(paths.len()), paths.len(), limit, how, std::time::Instant::now(), |i| Some(paths[i].as_ref().into())).0;
+    let mut r =
+        verify_from(g, g.skip.min(paths.len()), paths.len(), limit, how, None, std::time::Instant::now(), |i| Some(paths[i].as_ref().into())).0;
     r.next = r.next.filter(|&x| x < paths.len());
     r
 }
@@ -3599,7 +3683,8 @@ fn verify_as(g: &Grep, paths: &[impl AsRef<[u8]> + Sync], limit: usize, how: Rea
 /// read directly answers as the index will once it holds the file.
 #[derive(Clone, Copy)]
 enum Reading {
-    /// The content index's candidates (the build took them for text).
+    /// The content index's candidates (the build took them for text, or
+    /// the query names them: `NAMED`).
     Index,
     /// Files changed since their folder's last sync, read as candidates.
     Fresh,
@@ -3622,13 +3707,16 @@ impl Reading {
 
 /// `verify` over candidates `from..n`, `path(i)` giving the i-th, or None
 /// if the index already rules it out; the budget counts from `t`. Also
-/// returns how far it got through them.
+/// returns how far it got through them. A file the query `names` names
+/// is ruled out as not text only for a NUL, as in the index.
+#[allow(clippy::too_many_arguments)]
 fn verify_from<'a>(
     g: &Grep,
     from: usize,
     n: usize,
     limit: usize,
     how: Reading,
+    names: Option<&Query>,
     t: std::time::Instant,
     path: impl Fn(usize) -> Option<std::borrow::Cow<'a, [u8]>> + Sync,
 ) -> (GrepResult, usize) {
@@ -3663,6 +3751,7 @@ fn verify_from<'a>(
             let Some((i, p, f)) = taken.pop_front() else { break };
             read.fetch_add(1, Relaxed);
             mine += 1;
+            let text = text && !names.is_some_and(|q| q.names_file(&p));
             let m = match f {
                 Some(f) => f.and_then(|(file, size)| match_open(g, &p, file, size, text)),
                 None => match_file(g, &p, (!scan).then_some(&opening), text),
@@ -3729,6 +3818,12 @@ fn match_open(g: &Grep, path: &[u8], mut file: std::fs::File, size: u64, text: b
     // keeps a freed big buffer in the process's footprint, a new one for
     // each such file read. (One that grew since is read whole, below.)
     if size > READ_BUF_MAX {
+        // A NUL in its first 8 KB rules it out (see `matches_in`): look first.
+        let mut head = [0; 8192];
+        let k = std::os::unix::fs::FileExt::read_at(&file, &mut head, 0).ok()?;
+        if memchr::memchr(0, &head[..k]).is_some() {
+            return None;
+        }
         let mut map = memmap2::MmapMut::map_anon(size as usize + 1).ok()?;
         let mut n = 0;
         while n < map.len() {
@@ -4355,7 +4450,7 @@ fn and_bits(lists: &[&[u8]], docs: std::ops::Range<u32>, out: &mut Vec<u32>) {
 /// The live text docs of a segment, as bits, and how many.
 fn live_text(s: &Segment) -> (Vec<u64>, usize) {
     let mut bits: Vec<u64> = s.dead.iter().map(|w| !w).collect();
-    for (d, _) in s.rank().iter().enumerate().filter(|&(_, &r)| r == NOT_TEXT) {
+    for (d, _) in s.rank().iter().enumerate().filter(|&(_, &r)| r <= SKIPPED) {
         bits[d / 64] &= !(1 << (d % 64));
     }
     if let Some(w) = bits.last_mut().filter(|_| !s.ndocs.is_multiple_of(64)) {
@@ -4769,7 +4864,7 @@ mod tests {
         for (name, text) in [("b.txt", "dear ÉMILE\n"), ("c.txt", "a key for émile\n"), ("d.txt", "none\n")] {
             let p = d.join(name);
             std::fs::write(&p, text).unwrap();
-            docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+            docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1, true);
         }
         docs.sort();
         let mut c = Content::open(d.join("idx"));
@@ -4820,12 +4915,121 @@ mod tests {
         let p = d.join("a.txt");
         std::fs::write(&p, "text\n").unwrap();
         let mut docs = Docs::default();
-        docs.push(p.as_os_str().as_bytes(), 5, 1);
+        docs.push(p.as_os_str().as_bytes(), 5, 1, true);
         let seg = build_segment(&d, 1, &docs, 0..1).unwrap();
         assert_eq!(seg.live_docs, 1);
         std::fs::write(dead_path(&d, 1), u64::MAX.to_le_bytes()).unwrap();
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// A named file the index holds no text of (not text, or kept unread)
+    /// is read only where named; one kept unread doesn't make its folder held,
+    /// and is built again once its text is wanted.
+    #[test]
+    fn reads_named_files_without_text() {
+        let d = std::env::temp_dir().join(format!("fsearch-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("only")).unwrap();
+        let d = d.canonicalize().unwrap();
+        let line = format!("[{}\"key\"]\n", "1,".repeat(2500));
+        let want = |files: &[(&str, &str, bool)]| {
+            let mut docs = Docs::default();
+            for &(name, text, read) in files {
+                let p = d.join(name);
+                std::fs::write(&p, text).unwrap();
+                docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1, read);
+            }
+            docs.sort();
+            docs
+        };
+        let files = [("one.json", line.as_str(), true), ("a.txt", "key\n", true), ("Big.json", "key\n", false), ("only/x.lock", "key\n", false)];
+        let docs = want(&files);
+        let mut c = Content::open(d.join("idx"));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        let mut g = Grep::new("key", GrepMode::Literal).unwrap();
+        g.budget = None;
+        let found = |q: &str| {
+            let r = c.search(&g, &Query::parse(q, "/h").unwrap());
+            let mut f: Vec<String> = r.files.iter().map(|f| String::from_utf8_lossy(&f.path[d.as_os_str().len() + 1..]).into_owned()).collect();
+            f.sort();
+            f
+        };
+        let r = [found(""), found("one.json"), found("big.json"), found("BIG.JSON")];
+        let held = [c.holds(d.as_os_str().as_bytes()), c.holds(d.join("only").as_os_str().as_bytes())];
+        let todo = c.diff(vec![(d.as_os_str().as_bytes().to_vec(), true, want(&[files[0], files[1], ("Big.json", "key\n", true), files[3]]))]);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(r, [vec!["a.txt"], vec!["one.json"], vec!["Big.json"], vec!["Big.json"]]);
+        assert_eq!(held, [true, false]);
+        assert_eq!((todo.len(), todo.path(0).ends_with(b"/Big.json"), todo.items[0].4), (1, true, true));
+    }
+
+    /// Kept unread: a file skipped as generated, or for its size with a text
+    /// extension; not a binary or unknown one outside a repo, nor one in a
+    /// skipped folder; files added since the name index was built, the same.
+    #[test]
+    fn keeps_skipped_files_unread() {
+        let ent = |off, len, kind, size, child| RawEnt { name_off: off, name_len: len, kind, size, mtime: 0, child };
+        let ls = vec![
+            Listing { id: 0, names: b"Users".to_vec(), ents: vec![ent(0, 5, KIND_DIR, 0, 1)] },
+            Listing { id: 1, names: b"me".to_vec(), ents: vec![ent(0, 2, KIND_DIR, 0, 2)] },
+            Listing {
+                id: 2,
+                names: b"big.jsonsmall.jsonicon.pngnode_moduleshuge.log".to_vec(),
+                ents: vec![
+                    ent(0, 8, KIND_FILE, 200_000, crate::walk::NONE),
+                    ent(8, 10, KIND_FILE, 1_000, crate::walk::NONE),
+                    ent(18, 8, KIND_FILE, 1_000, crate::walk::NONE),
+                    ent(26, 12, KIND_DIR, 0, 3),
+                    ent(38, 8, KIND_FILE, 2_000_000, crate::walk::NONE),
+                ],
+            },
+            Listing { id: 3, names: b"big.json".to_vec(), ents: vec![ent(0, 8, KIND_FILE, 200_000, crate::walk::NONE)] },
+        ];
+        let mut live = Live::new(crate::index::Index::build(ls, 0, 0, b"/Users/me"));
+        for p in [&b"/Users/me/new.min.js"[..], b"/Users/me/new.png", b"/Users/me/new.meta"] {
+            live.over.insert(p.to_vec(), crate::live::OEnt::new(p, KIND_FILE, 1_000, 0));
+        }
+        let w = wanted(&live, b"/Users/me", b"/Users/me", true);
+        let mut got: Vec<_> = (0..w.len()).map(|i| (String::from_utf8_lossy(w.path(i)).into_owned(), w.items[i].4)).collect();
+        got.sort();
+        let me = |name: &str, read| (format!("/Users/me/{name}"), read);
+        assert_eq!(got, [me("big.json", false), me("huge.log", false), me("new.min.js", false), me("small.json", true)]);
+    }
+
+    /// Changed files kept unread are read first only where the query names
+    /// them; the first build's scan reads them the same way.
+    #[test]
+    fn reads_unread_files_where_named() {
+        let d = std::env::temp_dir().join(format!("fsearch-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let files: Vec<(Vec<u8>, u64, u32, bool)> = [("a.txt", true), ("big.json", false)]
+            .iter()
+            .map(|&(name, read)| {
+                let p = d.join(name);
+                std::fs::write(&p, "key\n").unwrap();
+                (p.as_os_str().as_bytes().to_vec(), 4, 1, read)
+            })
+            .collect();
+        let dirty = Dirty(Mutex::new(HashMap::from([((d.as_os_str().as_bytes().to_vec(), true), files.clone())])));
+        let mut g = Grep::new("key", GrepMode::Literal).unwrap();
+        g.budget = None;
+        let name = |p: &[u8]| String::from_utf8_lossy(&p[d.as_os_str().len() + 1..]).into_owned();
+        let read = |q: &str| {
+            let q = Query::parse(q, "/h").unwrap();
+            let mut docs = Docs::default();
+            for (p, size, mtime, read) in &files {
+                docs.push(p, *size, *mtime, *read);
+            }
+            let first: Vec<String> = grep_unindexed(&g, docs, &q).files.iter().map(|f| name(&f.path)).collect();
+            (dirty.files(&q).iter().map(|p| name(p)).collect::<Vec<_>>(), first)
+        };
+        let r = [read(""), read("big.json")];
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(r, [(vec!["a.txt".to_string()], vec!["a.txt".to_string()]), (vec!["big.json".into()], vec!["big.json".into()])]);
     }
 }

@@ -409,9 +409,10 @@ impl Engine {
         if indexed && !built {
             // The content index's first build is running: read the files it
             // will hold instead, so the answer is complete (and the same).
-            // None there: read the folder directly, below, as once built.
+            // If it reads none there: read the folder directly, below, as
+            // once built (see `Content::holds`).
             let (docs, early) = self.s.with_names(scope, |live| content::wanted(live, home, scope.unwrap_or(home), true))?;
-            if !docs.is_empty() {
+            if docs.reads_any() {
                 let hold = walk::Hold::new();
                 let r = content::grep_unindexed(g, docs, q);
                 drop(hold);

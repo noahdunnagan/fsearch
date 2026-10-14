@@ -89,7 +89,7 @@ fn build(home: &str, dir: &Path) {
         let Some(seg) = pool.install(|| content::merge(&cdir, id, &c.segments(&ids))) else { break };
         c.replace(&ids, seg);
     }
-    let text: usize = c.segs.iter().map(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && s.rank()[d as usize] != i8::MIN).count()).sum();
+    let text: usize = c.segs.iter().map(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && s.rank()[d as usize] > i8::MIN + 1).count()).sum();
     #[rustfmt::skip]
     println!(
         "{}",
@@ -135,7 +135,7 @@ fn measure(home: &str, dir: &Path) {
         if let Some(seg) = pool.install(|| content::build_segment(dir, id, &todo, range)) {
             bytes += std::fs::metadata(dir.join(format!("seg-{id:06}.fsc"))).unwrap().len();
             docs += seg.ndocs;
-            text += (0..seg.ndocs).filter(|&d| seg.rank()[d] != i8::MIN).count();
+            text += (0..seg.ndocs).filter(|&d| seg.rank()[d] > i8::MIN + 1).count();
             segs += 1;
             drop(seg);
             std::fs::remove_file(dir.join(format!("seg-{id:06}.fsc"))).unwrap();
@@ -194,7 +194,7 @@ fn docs(dir: &Path) {
     let c = Content::open_shared(dir.join("content"));
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for s in &c.segs {
-        for d in (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && s.rank()[d as usize] != i8::MIN) {
+        for d in (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && s.rank()[d as usize] > i8::MIN + 1) {
             use std::io::Write;
             out.write_all(&s.path(d)).unwrap();
             out.write_all(b"\n").unwrap();
