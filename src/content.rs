@@ -18,6 +18,7 @@
 //! knows about with the docs we hold, reindex what changed, tombstone what
 //! went away. The first build is just a sync of $HOME.
 
+use crate::document;
 use crate::index::{HDR, as_bytes, fields, header, layout, sec};
 use crate::live::{Live, join};
 use crate::query::{GrepMode, Query, fold};
@@ -998,9 +999,17 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                     ahead.push_back(open_ahead(docs.path(i + ahead.len())));
                 }
                 buf.clear();
-                let text = (ahead.pop_front().flatten())
-                    .and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_REPO_FILE && is_text(&buf));
+                let opened = ahead.pop_front().flatten();
+                let text = if document::kind(docs.path(i)).is_some() {
+                    opened.and_then(|f| document::read(docs.path(i), f)).is_some_and(|b| {
+                        buf = b;
+                        !buf.is_empty() && memchr::memchr(0, &buf).is_none()
+                    })
+                } else {
+                    opened
+                        .and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok())
+                        .is_some_and(|n| n as u64 <= MAX_REPO_FILE && is_text(&buf))
+                };
                 let holds = if !text {
                     Holds::Nothing
                 } else {
@@ -1337,6 +1346,9 @@ pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
 
 /// Outside git repos, the text files are known by name and size.
 fn name_ok(name: &[u8], size: u64) -> bool {
+    if document::kind(name).is_some() {
+        return document::enabled() && size <= document::MAX_SOURCE;
+    }
     if size > MAX_FILE || SKIP_DIRS.contains(&name) {
         return false;
     }
@@ -1351,6 +1363,9 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 
 /// A name fff takes for binary without reading it.
 fn binary_ext(name: &[u8]) -> bool {
+    if document::enabled() && document::kind(name).is_some() {
+        return false;
+    }
     name.iter().rposition(|&b| b == b'.').filter(|&p| p > 0).is_some_and(|p| BINARY_EXTS.iter().any(|x| x.eq_ignore_ascii_case(&name[p + 1..])))
 }
 
@@ -1623,7 +1638,7 @@ impl<'a> Scope<'a> {
             }
         };
         let Some(place) = place else { return false };
-        let cap = if json_ext(name) { MAX_FILE } else { MAX_REPO_FILE };
+        let cap = if document::kind(name).is_some() { document::MAX_SOURCE } else if json_ext(name) { MAX_FILE } else { MAX_REPO_FILE };
         let ok = if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
         ok && !generated(name, size) && !ignored(&place.rules, self.global.as_deref(), path, false)
     }
@@ -1646,7 +1661,7 @@ impl<'a> Scope<'a> {
             picked.reserve_exact(range.len());
             for i in range {
                 let (name, size) = (idx.name(i), idx.size_of(i));
-                if idx.kind(i) & 3 != KIND_FILE || live.is_dead(i as u32) || size > MAX_REPO_FILE || binary_ext(&name) {
+                if idx.kind(i) & 3 != KIND_FILE || live.is_dead(i as u32) || size > document::MAX_SOURCE || binary_ext(&name) {
                     continue;
                 }
                 path(i, &mut p);
@@ -2274,7 +2289,11 @@ impl Content {
                     match want.find(&s.path(d)) {
                         // (A doc whose content is gone is indexed again.)
                         Some(k)
-                            if want.items[k].2 == s.size()[i] as u64
+                            // Documents can change text while preserving size and
+                            // second-resolution mtime. Recheck them on folder events;
+                            // extraction's metadata cache avoids reparsing unchanged files.
+                            if document::kind(want.path(k)).is_none()
+                                && want.items[k].2 == s.size()[i] as u64
                                 && want.items[k].3 == s.mtime()[i]
                                 && (g == NONE || content_of(gids, g).is_some()) =>
                         {
@@ -2815,6 +2834,7 @@ impl Content {
             let ids = if recursive { s.with_prefix(&lo).collect::<Vec<_>>() } else { s.direct_children(&lo) };
             for d in ids {
                 if let Some(k) = want.find(&s.path(d))
+                    && document::kind(want.path(k)).is_none()
                     && (want.items[k].2, want.items[k].3) == (s.size()[d as usize] as u64, s.mtime()[d as usize])
                 {
                     held[k] = true;
@@ -3722,6 +3742,10 @@ fn match_file(g: &Grep, path: &[u8], opening: Option<&std::sync::atomic::AtomicU
 /// `match_file` on a file opened at `size` bytes.
 fn match_open(g: &Grep, path: &[u8], mut file: std::fs::File, size: u64, text: bool) -> Option<FileMatches> {
     use std::io::{Read, Seek};
+    if document::kind(path).is_some() {
+        let buf = document::read(path, file)?;
+        return matches_in(g, path, &buf, false);
+    }
     if size > MAX_REPO_FILE {
         return None;
     }
@@ -4670,18 +4694,21 @@ fn regex_plan(h: &Hir) -> TQ {
 pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     q.kind = Some(KIND_FILE);
     q.limit = 200_000;
-    q.size = (q.size.0, q.size.1.min(MAX_FILE));
+    q.size = (q.size.0, q.size.1.min(if document::enabled() { document::MAX_SOURCE } else { MAX_FILE }));
     let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
-        .map(|h| match h.over {
-            Some(path) => {
-                let m = live.over[&path].mtime;
-                (path, m)
-            }
-            None => {
-                let mut p = Vec::new();
-                live.base.path(h.idx as usize, &mut p);
-                (p, live.base.mtime(h.idx as usize))
-            }
+        .filter_map(|h| {
+            let (path, size, mtime) = match h.over {
+                Some(path) => {
+                    let o = live.over[&path];
+                    (path, o.size, o.mtime)
+                }
+                None => {
+                    let mut path = Vec::new();
+                    live.base.path(h.idx as usize, &mut path);
+                    (path, live.base.size_of(h.idx as usize), live.base.mtime(h.idx as usize))
+                }
+            };
+            (if document::kind(&path).is_some() { document::enabled() } else { size <= MAX_FILE }).then_some((path, mtime))
         })
         .collect();
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));

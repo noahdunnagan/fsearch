@@ -5,6 +5,7 @@
 
 pub mod alloc;
 pub mod content;
+pub mod document;
 mod engine;
 mod fsevents;
 pub mod index;

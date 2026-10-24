@@ -202,6 +202,12 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
             && v.get("q").and_then(Value::as_str).is_some_and(|q| ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| q.contains(k))));
     match op {
         "ping" => Ok(Reply::Value(json!({"ok": true}))),
+        "settings" => {
+            if let Some(value) = v.get("document_indexing") {
+                engine.set_document_indexing(value.as_bool().ok_or("document_indexing must be a boolean")?)?;
+            }
+            Ok(Reply::Value(json!({"ok": true, "document_indexing": fsearch::document::enabled()})))
+        }
         "save" => {
             engine.save();
             Ok(Reply::Value(json!({"ok": true, "scheduled": true})))
@@ -798,7 +804,15 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         // Only the files git lists (modified...), newest first: read them.
         x.ready(cx, &q)?;
         let mut paths = from_git(cx, &q.clone_for_scan(), &x, MAX_GREP);
-        paths.retain(|f| f.kind & 3 == KIND_FILE && f.size <= fsearch::content::MAX_FILE && x.keep(&cx.git, f.path.as_os_str().as_bytes()));
+        paths.retain(|f| {
+            let path = f.path.as_os_str().as_bytes();
+            let cap = if fsearch::document::enabled() && fsearch::document::kind(path).is_some() {
+                fsearch::document::MAX_SOURCE
+            } else {
+                fsearch::content::MAX_FILE
+            };
+            f.kind & 3 == KIND_FILE && f.size <= cap && x.keep(&cx.git, path)
+        });
         paths.sort_by_key(|f| std::cmp::Reverse(f.mtime));
         let paths: Vec<Vec<u8>> = paths.into_iter().map(|f| f.path.as_os_str().as_bytes().to_vec()).collect();
         let mut r = fsearch::content::verify(&g, &paths, x.offset.saturating_add(q.limit).saturating_add(1));
@@ -844,6 +858,11 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
                 m
             });
             let mut j = json!({"path": String::from_utf8_lossy(&f.path), "matches": matches.collect::<Vec<_>>()});
+            if let Some(meta) = fsearch::content::open_regular(&f.path).and_then(|f| f.metadata().ok()) {
+                use std::os::unix::fs::MetadataExt;
+                j["size"] = meta.len().into();
+                j["mtime"] = (meta.mtime().max(0) as u64).into();
+            }
             if let Some(w) = x.annotate.then(|| cx.git.status(&f.path).and_then(git::word)).flatten() {
                 j["git"] = w.into();
             }

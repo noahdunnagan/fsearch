@@ -70,6 +70,41 @@ build-output folders outside repos. To leave out more, list folders in
 (`~` and `#` comments work). Names are always indexed, and a grep inside
 a file you name still reads it.
 
+## Optional document contents
+
+`fsearch documents on` enables DOC, DOCX, PDF, XLS and XLSX content indexing;
+`fsearch documents off` disables it. The default is off. Existing grep, regex
+and MCP searches then use extracted text, respecting the same home scope and
+ignore rules. Enabling queues a content resync; the first build takes time.
+
+DOC/DOCX use macOS `textutil`, PDF uses PDFKit, and Excel uses Calamine across
+all worksheets. Search reads stored cell values, not recalculated formulas.
+No OCR, password unlocking, or exact page/cell navigation is provided. Reported
+line numbers refer to extracted text. Unsupported or unreadable files are skipped.
+
+Keep `fsearch-extract` beside `fsearch` (or the binary embedding the crate).
+`cargo build --release` builds both; `fsearch install` copies both. Parsing uses
+already-open local regular files without materializing iCloud placeholders.
+Inputs are capped at 64 MiB and extracted text at 8 MiB. Each parser has a 10 s
+wall timeout; the PDF/Excel helper also has an 8 s CPU limit and a 256 MiB Rust
+heap budget (native PDFKit allocations are outside that budget).
+
+Extracted text is cached privately under the index data directory's
+`document-text-v1/`, with periodic pruning to 256 MiB / 4096 entries. File identity
+and nanosecond modification/change times invalidate the cache. Disabling stops
+reading documents and removes them on the next content sync; cached text remains
+until pruning or manual removal of that directory.
+
+JSON clients can read `{"op":"settings"}` or set
+`{"op":"settings","document_indexing":true}`. Status includes `document_indexing`.
+Crate users change settings through the owning engine's `set_document_indexing`.
+
+The integration reuses the PDF index/read-path design from
+[ATS-aerothermal-solutions/fsearch's 6bcfdba](https://github.com/ATS-aerothermal-solutions/fsearch/commit/6bcfdba7a72c61f2a083631a0e288dc93dd3555f)
+and adapts the isolated parser allocator, collector and cache approach from
+[joshwhiteley/fsearch](https://github.com/joshwhiteley/fsearch), MIT, Copyright
+2026 Josh Whiteley. See [DOCUMENT-LICENSE](DOCUMENT-LICENSE).
+
 ## Full Disk Access
 
 From a terminal with Full Disk Access it indexes everything. As a login

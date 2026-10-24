@@ -19,6 +19,7 @@ const USAGE: &str = "usage:
   fsearch mcp                   MCP server on stdin/stdout, for coding agents
   fsearch serve                 run the daemon in the foreground
   fsearch status
+  fsearch documents on|off      enable/disable common document content indexing
   fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
                                 (needs Full Disk Access granted to ~/.local/bin/fsearch)
   fsearch uninstall             remove the login agent (keeps the index)
@@ -55,6 +56,14 @@ fn main() {
         Some("stdio") => stdio(),
         Some("mcp") => mcp::run(data_dir()),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
+        Some("documents") => {
+            let enabled = match args.get(1).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => die("usage: fsearch documents on|off"),
+            };
+            print_one(&serde_json::json!({"op": "settings", "document_indexing": enabled}), true);
+        }
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
@@ -202,6 +211,10 @@ fn domain() -> String {
 }
 
 fn install(login: bool) {
+    let source = std::env::current_exe().unwrap().with_file_name("fsearch-extract");
+    if !source.is_file() {
+        die("missing fsearch-extract beside fsearch; build both binaries or unpack the complete release");
+    }
     // A plain reinstall keeps an existing login agent.
     let login = login || plist_path().exists();
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
@@ -216,6 +229,11 @@ fn install(login: bool) {
     // reinstalling from the installed copy works too.
     let tmp = bin.with_extension("new");
     std::fs::copy(std::env::current_exe().unwrap(), &tmp).and_then(|_| std::fs::rename(&tmp, &bin)).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    {
+        let helper = bin.with_file_name("fsearch-extract");
+        let tmp = helper.with_extension("new");
+        std::fs::copy(source, &tmp).and_then(|_| std::fs::rename(&tmp, &helper)).unwrap_or_else(|e| die(&format!("copy helper: {e}")));
+    }
     let agents =
         format!("for coding agents: claude mcp add -s user fsearch -- {0} mcp\n                   codex mcp add fsearch -- {0} mcp", bin.display());
     if !login {

@@ -28,7 +28,7 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=apple-m1
       - run: |
-          tar -czf fsearch-aarch64-apple-darwin.tar.gz -C target/release fsearch
+          tar -czf fsearch-aarch64-apple-darwin.tar.gz -C target/release fsearch fsearch-extract -C ../.. LICENSE DOCUMENT-LICENSE
           shasum -a 256 fsearch-aarch64-apple-darwin.tar.gz > fsearch-aarch64-apple-darwin.tar.gz.sha256
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --generate-notes
           gh release upload "$TAG" --clobber fsearch-aarch64-apple-darwin.tar.gz fsearch-aarch64-apple-darwin.tar.gz.sha256

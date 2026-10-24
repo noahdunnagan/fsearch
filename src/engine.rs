@@ -67,6 +67,7 @@ pub struct Status {
     pub content_segments: usize,
     pub content_bytes: usize,
     pub content_pending: usize,
+    pub document_indexing: bool,
     pub full_disk_access: bool,
     /// Writes the index files (false: following another process's).
     pub owner: bool,
@@ -250,6 +251,7 @@ impl Engine {
             let _ = walk::SKIP.set(skip);
         }
         let dir = opts.dir;
+        crate::document::configure(&dir);
         let loading = Index::load(&dir.join("index.bin"));
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
@@ -333,6 +335,19 @@ impl Engine {
             apply_loop(&s, rx);
         });
         Ok(Engine { s: shared })
+    }
+
+    /// Opt-in document indexing; applies to both CLI and GUI clients.
+    pub fn set_document_indexing(&self, enabled: bool) -> Result<(), String> {
+        if !self.s.owner() {
+            return Err("change settings through the owning daemon".into());
+        }
+        if enabled == crate::document::enabled() {
+            return Ok(());
+        }
+        crate::document::set_enabled(&self.s.dir, enabled).map_err(|e| e.to_string())?;
+        self.s.content_tx.send((Vec::new(), vec![self.s.home.as_bytes().to_vec()])).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn home(&self) -> &str {
@@ -440,6 +455,7 @@ impl Engine {
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
             content_pending: self.s.content_pending.load(Ordering::Relaxed),
+            document_indexing: crate::document::enabled(),
             full_disk_access: walk::SKIP.get().is_none(),
             owner: self.s.owner(),
         }
@@ -557,6 +573,7 @@ impl Shared {
     /// A follower picks up what the owner wrote: a newer name-index save
     /// (replaying FSEvents from it) and content segment changes.
     fn follow(&self) {
+        crate::document::configure(&self.dir);
         let path = self.dir.join("index.bin");
         let saved = Index::saved_event_id(&path).unwrap_or(0);
         let ours = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.event_id);
