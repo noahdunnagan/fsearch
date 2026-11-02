@@ -569,6 +569,10 @@ impl Query {
         q
     }
 
+    fn filter_only(&self) -> bool {
+        self.grep.is_none() && self.tokens.iter().all(|t| t.negate)
+    }
+
     /// Apply filter `k:v`; false if `k` is not a filter name.
     pub fn filter(&mut self, k: &str, v: &str, home: &str) -> Result<bool, String> {
         match k {
@@ -1658,13 +1662,15 @@ fn token_matches(name: &[u8], t: &Token) -> bool {
     }
 }
 
-/// Top k by (score, then lower entry index): a total order, so the result
-/// does not depend on which thread saw which entry first. Candidates above
-/// the floor collect in a buffer that is cut back to k now and then, which
-/// is cheaper than a heap when most of the disk matches.
+#[derive(Clone, Copy)]
+struct RankedKey {
+    order: u64,
+    score: i32,
+}
+
 struct TopK {
     k: usize,
-    buf: Vec<u64>,
+    buf: Vec<RankedKey>,
     /// Keys at or below this cannot get in.
     floor: u64,
 }
@@ -1684,13 +1690,22 @@ fn entry_key(score: i32, i: u32, file: bool) -> u64 {
     key(score, i | 1 << 31) | (file as u64) << 31
 }
 
+#[inline(always)]
+fn result_key(q: &Query, score: i32, i: u32, file: bool, mtime: u32) -> u64 {
+    if q.filter_only() {
+        ((mtime as u64) << 32) | (!i as u64)
+    } else {
+        entry_key(score, i, file)
+    }
+}
+
 impl TopK {
     fn new(k: usize, floor: u64) -> TopK {
         TopK { k, buf: Vec::new(), floor: if k == 0 { u64::MAX } else { floor } }
     }
     #[inline]
-    fn push(&mut self, key: u64) {
-        if key > self.floor {
+    fn push(&mut self, key: RankedKey) {
+        if key.order > self.floor {
             self.buf.push(key);
             if self.buf.len() >= self.k.saturating_mul(2).max(64) {
                 self.cut();
@@ -1700,9 +1715,9 @@ impl TopK {
     /// Keep the k best; the k-th becomes the floor.
     fn cut(&mut self) {
         if self.buf.len() > self.k {
-            self.buf.select_nth_unstable_by(self.k - 1, |a, b| b.cmp(a));
+            self.buf.select_nth_unstable_by(self.k - 1, |a, b| b.order.cmp(&a.order));
             self.buf.truncate(self.k);
-            self.floor = self.buf[self.k - 1];
+            self.floor = self.buf[self.k - 1].order;
         }
     }
 }
@@ -1798,15 +1813,15 @@ fn top_k(n: usize, k: usize, visits: usize, floor: u64, visit: impl Fn(std::ops:
     };
     // A full piece's k-th best already bounds the overall k-th from below.
     let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
-    let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
+    let mut keys: Vec<RankedKey> = tops.into_iter().flat_map(|t| t.buf).filter(|x| x.order >= floor).collect();
     if keys.len() > k {
         if k == 0 {
             return Vec::new();
         }
-        keys.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+        keys.select_nth_unstable_by(k - 1, |a, b| b.order.cmp(&a.order));
         keys.truncate(k);
     }
-    keys.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32) & !(1 << 31), over: None }).collect()
+    keys.into_iter().map(|x| Hit { score: x.score, idx: !(x.order as u32) & !(1 << 31), over: None }).collect()
 }
 
 /// `f` of each piece of `0..words`, in parallel pieces (one if few).
@@ -2069,7 +2084,7 @@ impl Searcher<'_> {
         // hold at all would run one every time.
         hits.extend(self.search_once(&other));
         // An entry both find, once, at its best.
-        hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(h)));
+        hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(q, h)));
         let mut seen = std::collections::HashSet::new();
         hits.retain(|h| seen.insert((h.idx, h.over.clone())));
         hits.truncate(q.limit);
@@ -2118,18 +2133,17 @@ impl Searcher<'_> {
         let mut hits = self.search_base(q);
         hits.extend(self.search_overlay(q));
         // Each hit's key once: a scan for grep lists up to 200k hits.
-        hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(h)));
+        hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(q, h)));
         hits.truncate(q.limit);
         hits
     }
 
-    /// A hit's `entry_key`; an overlay entry's sorts after the base's.
-    fn sort_key(&self, h: &Hit) -> u64 {
-        let file = match &h.over {
-            Some(p) => self.live.over.get(p).is_some_and(|o| o.kind & 3 == KIND_FILE),
-            None => self.live.base.kind(h.idx as usize) & 3 == KIND_FILE,
+    fn sort_key(&self, q: &Query, h: &Hit) -> u64 {
+        let (kind, mtime) = match &h.over {
+            Some(p) => self.live.over.get(p).map_or((0, 0), |o| (o.kind, o.mtime)),
+            None => (self.live.base.kind(h.idx as usize), self.live.base.mtime(h.idx as usize)),
         };
-        entry_key(h.score, h.idx.min(i32::MAX as u32), file)
+        result_key(q, h.score, h.idx, kind & 3 == KIND_FILE, mtime)
     }
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
@@ -2321,9 +2335,9 @@ impl Searcher<'_> {
         // The best `limit` hits so far, the limit-th one's score (i32::MIN if
         // fewer) and key (0 if fewer).
         let best = |mut hits: Vec<Hit>| {
-            hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(h)));
+            hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(q, h)));
             hits.truncate(q.limit);
-            let last = hits.get(q.limit - 1).map(|h| (h.score, self.sort_key(h)));
+            let last = hits.get(q.limit - 1).map(|h| (h.score, self.sort_key(q, h)));
             let (floor, fkey) = last.unwrap_or((i32::MIN, 0));
             (hits, floor, fkey)
         };
@@ -2716,9 +2730,9 @@ impl Searcher<'_> {
         // The most a word brings an entry through its folders.
         let most: Vec<i32> = (0..m).map(|i| by_dir(i, base[i] + FULL - pen(pos[i].text.len() + 1))).collect();
         let best = |mut hits: Vec<Hit>| {
-            hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(h)));
+            hits.sort_by_cached_key(|h| std::cmp::Reverse(self.sort_key(q, h)));
             hits.truncate(q.limit);
-            let last = hits.get(q.limit - 1).map(|h| (h.score, self.sort_key(h)));
+            let last = hits.get(q.limit - 1).map(|h| (h.score, self.sort_key(q, h)));
             let (floor, fkey) = last.unwrap_or((i32::MIN, 0));
             (hits, floor, fkey)
         };
@@ -3392,8 +3406,12 @@ impl Searcher<'_> {
             out
         };
         let mut hits = if cands.len() <= OVERLAY_CHUNK { score(&cands) } else { cands.par_chunks(OVERLAY_CHUNK).flat_map_iter(score).collect() };
-        // Best first, equal scores by path (the overlay map's order).
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
+        if q.filter_only() {
+            let mtime = |h: &Hit| h.over.as_ref().and_then(|p| self.live.over.get(p)).map_or(0, |o| o.mtime);
+            hits.sort_by(|a, b| mtime(b).cmp(&mtime(a)).then_with(|| a.over.cmp(&b.over)));
+        } else {
+            hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
+        }
         hits.truncate(q.limit);
         hits
     }
@@ -3474,7 +3492,16 @@ impl<'a> Scan<'a> {
     #[inline(always)]
     /// `re` is the caller's own copy of `path_re` (see `score_names`).
     #[allow(clippy::too_many_arguments)]
-    fn score(&self, i: usize, p: u32, nh: NameHit, memo: DirMemo, floor: u64, pbuf: &mut Vec<u8>, re: Option<&regex::bytes::Regex>) -> Option<u64> {
+    fn score(
+        &self,
+        i: usize,
+        p: u32,
+        nh: NameHit,
+        memo: DirMemo,
+        floor: u64,
+        pbuf: &mut Vec<u8>,
+        re: Option<&regex::bytes::Regex>,
+    ) -> Option<RankedKey> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind(i);
@@ -3511,7 +3538,7 @@ impl<'a> Scan<'a> {
             return None;
         }
         score += idx.dir_prior()[p as usize] as i32 + rank_tweaks(nh.flags, k, mtime, self.now);
-        let key = entry_key(score, i as u32, k & 3 == KIND_FILE);
+        let key = result_key(q, score, i as u32, k & 3 == KIND_FILE, mtime);
         if key <= floor {
             return None;
         }
@@ -3528,7 +3555,7 @@ impl<'a> Scan<'a> {
                 return None;
             }
         }
-        Some(key)
+        Some(RankedKey { order: key, score })
     }
 
     /// One sequential pass over every entry in `ranges`.
@@ -4064,6 +4091,33 @@ mod tests {
     fn live() -> Live {
         let ent = |off| RawEnt { name_off: off, name_len: 3, kind: KIND_FILE, size: 1, mtime: 1, child: NONE };
         Live::new(Index::build(vec![Listing { id: 0, names: b"abcabd".to_vec(), ents: vec![ent(0), ent(3)] }], 0, 0, b"/h"))
+    }
+
+    #[test]
+    fn filter_only_limit_keeps_newest_mtimes() {
+        let ents = [(0, 10), (3, 20), (6, 30)].map(|(name_off, mtime)| RawEnt {
+            name_off,
+            name_len: 3,
+            kind: KIND_FILE,
+            size: 1,
+            mtime,
+            child: NONE,
+        });
+        let live = Live::new(Index::build(
+            vec![Listing { id: 0, names: b"oldmidnew".to_vec(), ents: ents.to_vec() }],
+            0,
+            0,
+            b"/h",
+        ));
+        let q = Query::parse("kind:file limit:2", "/h").unwrap();
+
+        let hits = Searcher { live: &live }.search(&q);
+        let names = |hits: &[Hit]| hits.iter().map(|h| live.base.name(h.idx as usize).to_vec()).collect::<Vec<_>>();
+
+        assert_eq!(names(&hits), [b"new".to_vec(), b"mid".to_vec()]);
+        let q = Query::parse("kind:file !mid limit:2", "/h").unwrap();
+        let hits = Searcher { live: &live }.search(&q);
+        assert_eq!(names(&hits), [b"new".to_vec(), b"old".to_vec()]);
     }
 
     /// limit: takes any number; the largest overflowed `TopK`.

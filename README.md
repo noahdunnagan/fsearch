@@ -60,6 +60,9 @@ and `!exclude`. Filters: `ext:` `type:` `kind:` `in:` `size:` `mtime:`
 `staged` `untracked` `clean` `tracked` `ignored` `conflict`). Content search is
 smart-case, and regexes match within a line, as in ripgrep.
 
+Queries with no positive name terms return the newest matches first. `limit:`
+keeps the newest matches.
+
 ## What grep covers
 
 Text files up to 1 MB, and up to 10 MB inside git repos, minus what git
