@@ -349,6 +349,9 @@ impl Engine {
             }
             if let Some(l) = s.live.read().unwrap().as_ref() {
                 l.base.prefault();
+                if let Some(z) = walk::LAZY.get() {
+                    z.seed(&l.base);
+                }
             }
             if owner {
                 rescan_unskipped(&s);

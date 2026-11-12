@@ -15,7 +15,7 @@
 //! the bits their largest value needs (`Bits`), in runs of 64 from a base
 //! (`Runs`), and parents as one bit per entry (see `parent`).
 
-use crate::walk::{KIND_DIR, Listing, NONE};
+use crate::walk::{KIND_DIR, KIND_FILE, Listing, NONE};
 use memmap2::{Mmap, MmapMut};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -630,6 +630,20 @@ impl Index {
             out.push(b'/');
             out.extend_from_slice(&self.name(e as usize));
         }
+    }
+
+    /// The folders holding a regular file called `name`. (A name is stored
+    /// once: its id is found first, then the entries that carry it.)
+    pub fn holding(&self, name: &[u8]) -> Vec<Vec<u8>> {
+        let (info, len) = (self.name_info(), NameInfo::of(name, 0).len);
+        let Some(id) = (0..self.u).find(|&k| info[k].len == len && *self.uname(k as u32) == *name) else { return Vec::new() };
+        let (names, mut path, mut out) = (self.ent_names(), Vec::new(), Vec::new());
+        for i in (1..self.n).filter(|&i| names.get(i) == id as u32 && self.kind(i) & 3 == KIND_FILE) {
+            self.path(i, &mut path);
+            path.truncate(path.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1));
+            out.push(path.clone());
+        }
+        out
     }
 
     /// Resolve an absolute path to its entry.

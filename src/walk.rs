@@ -82,6 +82,15 @@ impl LazyDirs {
         !self.prefixes.is_empty() || !self.names.is_empty() || self.cache_dirs
     }
 
+    /// Learn the CACHEDIR.TAG folders `idx` already holds: a restart loads
+    /// an index rather than crawling, and listings are the only other way
+    /// a tagged folder is learned.
+    pub fn seed(&self, idx: &crate::index::Index) {
+        if self.cache_dirs {
+            self.cachedir.write().unwrap().extend(idx.holding(CACHE_TAG));
+        }
+    }
+
     /// Forget CACHEDIR dirs whose tag file is gone: a folder that lost its
     /// tag (or was deleted) stops being a lazy unit. Costly — compaction
     /// calls this, nothing else.
@@ -301,6 +310,8 @@ pub fn list_one(path: &[u8]) -> Option<Listing> {
     }
     let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
     if !list_into(path, &mut l) {
+        // Gone, or no longer a folder: it holds no tag now.
+        learn_cachedir(Some(path), &Listing::default());
         return None;
     }
     learn_cachedir(Some(path), &l);
@@ -606,6 +617,48 @@ mod tests {
         assert!(LAZY.get().unwrap().cachedir.read().unwrap().contains(&tagged.to_vec()));
         assert_eq!(LAZY.get().unwrap().unit(&[tagged.as_slice(), b"/x"].concat()), Some(tagged.len()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A restart loads an index rather than crawling: the folders it holds
+    /// a CACHEDIR.TAG file in are cache dirs from the start (a folder
+    /// merely named so is not).
+    #[test]
+    fn cachedir_is_seeded_from_an_index() {
+        let ent = |off: usize, len: usize, kind, child| RawEnt { name_off: off as u32, name_len: len as u16, kind, size: 0, mtime: 0, child };
+        let tag = CACHE_TAG.len();
+        let ls = vec![
+            Listing { id: 0, names: b"pq".to_vec(), ents: vec![ent(0, 1, KIND_DIR, 1), ent(1, 1, KIND_DIR, 2)] },
+            Listing { id: 1, names: b"target".to_vec(), ents: vec![ent(0, 6, KIND_DIR, 3)] },
+            Listing { id: 2, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_DIR, 4)] },
+            Listing { id: 3, names: [CACHE_TAG, b"debug"].concat(), ents: vec![ent(0, tag, KIND_FILE, NONE), ent(tag, 5, KIND_DIR, 5)] },
+            Listing { id: 4, ..Default::default() },
+            Listing { id: 5, ..Default::default() },
+        ];
+        let s = LazyDirs::build(b"/h", false);
+        s.seed(&crate::index::Index::build(ls, 0, 0, b"/h"));
+        assert_eq!(*s.cachedir.read().unwrap(), HashSet::from([b"/p/target".to_vec()]));
+        assert_eq!(s.unit(b"/p/target/debug/x"), Some(b"/p/target".len()));
+        assert_eq!(s.unit(b"/q/CACHEDIR.TAG/x"), None);
+        // With the defaults off, nothing is learned.
+        let s = LazyDirs::build(b"/h", true);
+        s.seed(&crate::index::Index::build(
+            vec![Listing { id: 0, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_FILE, NONE)] }],
+            0,
+            0,
+            b"/h",
+        ));
+        assert!(s.cachedir.read().unwrap().is_empty());
+    }
+
+    /// A tagged folder that is gone (a failed listing) is forgotten at
+    /// once, rather than kept until a compaction prunes it.
+    #[test]
+    fn cachedir_gone_is_forgotten() {
+        let _ = LAZY.set(LazyDirs::build(b"/h", false));
+        let gone = b"/nonexistent-fsearch-cachedir".to_vec();
+        LAZY.get().unwrap().cachedir.write().unwrap().insert(gone.clone());
+        assert!(list_one(&gone).is_none());
+        assert!(!LAZY.get().unwrap().cachedir.read().unwrap().contains(&gone));
     }
 
     /// A folder whose listing loses its CACHEDIR.TAG is forgotten (and one
