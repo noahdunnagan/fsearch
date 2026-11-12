@@ -995,7 +995,10 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             let mut ahead = std::collections::VecDeque::new();
             for i in run.clone() {
                 while ahead.len() <= AHEAD && i + ahead.len() < run.end {
-                    ahead.push_back(open_ahead(docs.path(i + ahead.len())));
+                    let j = i + ahead.len();
+                    // An empty file can't match a grep, so it isn't opened; it is
+                    // still a document, so that recovery after lost events sees it grow.
+                    ahead.push_back((docs.items[j].2 > 0).then(|| open_ahead(docs.path(j))).flatten());
                 }
                 buf.clear();
                 let text = (ahead.pop_front().flatten())
@@ -1624,9 +1627,7 @@ impl<'a> Scope<'a> {
         };
         let Some(place) = place else { return false };
         let cap = if json_ext(name) { MAX_FILE } else { MAX_REPO_FILE };
-        // A zero-byte file can't match a grep: never opened. (If it grows,
-        // its folder's next resync picks it up with the new size.)
-        let ok = size > 0 && if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
+        let ok = if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
         ok && !generated(name, size) && !ignored(&place.rules, self.global.as_deref(), path, false)
     }
 
@@ -4750,10 +4751,10 @@ mod tests {
         matches_in(g, b"/f", buf, false).map_or(Vec::new(), |f| f.lines)
     }
 
-    /// A zero-byte file is never opened for indexing; once it is
-    /// non-empty again, its folder's resync picks it up.
+    /// A zero-byte file is a document like any other (its recorded size is
+    /// what lets a recovery after lost events see it grow), but not opened.
     #[test]
-    fn zero_byte_files_are_never_picked() {
+    fn zero_byte_files_stay_documents() {
         let want_for = |size: u64| {
             let dir = |id: u32, name: &[u8], child: u32| Listing {
                 id,
@@ -4770,8 +4771,35 @@ mod tests {
             let want = wanted(&live, b"/t", b"/t/d", true);
             (0..want.len()).map(|i| want.path(i).to_vec()).collect::<Vec<_>>()
         };
-        assert_eq!(want_for(0), vec![b"/t/d/full.txt".to_vec()]);
-        assert_eq!(want_for(3), vec![b"/t/d/empty.txt".to_vec(), b"/t/d/full.txt".to_vec()]);
+        assert_eq!(want_for(0), want_for(3));
+        assert_eq!(want_for(0), vec![b"/t/d/empty.txt".to_vec(), b"/t/d/full.txt".to_vec()]);
+    }
+
+    /// A file recorded as empty isn't opened for indexing, so whatever it
+    /// holds now is not found; but it is a document, and a recovery after
+    /// lost events (an in-place write changes no folder's mtime) sees that
+    /// it grew.
+    #[test]
+    fn empty_file_is_not_opened_but_its_growth_is_seen() {
+        let d = std::env::temp_dir().join(format!("fsearch-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Real, as the index holds paths: files are opened refusing links.
+        let d = d.canonicalize().unwrap();
+        let p = d.join("grew.txt");
+        std::fs::write(&p, "needle\n").unwrap();
+        let mut docs = Docs::default();
+        docs.push(p.as_os_str().as_bytes(), 0, 1);
+        let mut c = Content::open(d.join("idx"));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..1).unwrap());
+        let mut g = Grep::new("needle", GrepMode::Literal).unwrap();
+        g.budget = None;
+        let found = c.search(&g, &Query::parse("", "/h").unwrap()).files.len();
+        let changed = c.changed_dirs(u32::MAX);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(found, 0, "opened");
+        assert_eq!(changed, vec![d.as_os_str().as_bytes().to_vec()]);
     }
 
     /// `$` ends a line before a \r\n as before a \n.
