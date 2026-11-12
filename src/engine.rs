@@ -1038,7 +1038,8 @@ impl Pace {
     /// Hold back the folders of `dirs` that ran too far ahead; add the held
     /// ones now free.
     fn sort(&mut self, dirs: &mut HashMap<Vec<u8>, (bool, u64)>, now: Instant) {
-        let early: Vec<Vec<u8>> = dirs.keys().filter(|d| !self.free(d, now)).cloned().collect();
+        // (A restoration's id 0 is never held: its record goes with the save it asks for.)
+        let early: Vec<Vec<u8>> = dirs.iter().filter(|&(d, &(_, id))| id != 0 && !self.free(d, now)).map(|(d, _)| d.clone()).collect();
         for d in early {
             let (r, id) = dirs.remove(&d).unwrap();
             let h = self.held.entry(d).or_insert((r, id));
@@ -1404,9 +1405,12 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         }
         if !shared.owner() && (owner_wrote || last_follow.elapsed() > FOLLOW_EVERY) {
             last_follow = Instant::now();
-            if !try_upgrade(shared) {
-                shared.follow();
+            if try_upgrade(shared) {
+                // (Its restoration events are queued, not applied: a save now
+                // would clear their record. The next pass receives them first.)
+                continue;
             }
+            shared.follow();
         }
         if !shared.owner() {
             continue;
@@ -1731,6 +1735,7 @@ mod tests {
         let saved = Index::load(&path).expect("saved");
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved.lookup(folder.as_os_str().as_bytes()).is_some(), "saved without the folder it was asked for after restoring");
+        assert!(saved.lookup(folder.join("f.txt").as_os_str().as_bytes()).is_some(), "saved without the files in it");
     }
 
     /// Yesterday's changes replayed into a lazy unit, the replay done, a
@@ -1840,5 +1845,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(s.replaying.load(Ordering::Relaxed), "an old stream's marker ended the new replay");
         assert!(saved.synced_at <= yesterday, "saved synced_at {} moved on while the replay is still going", saved.synced_at);
+    }
+    /// A restoration (event id 0) is listed at once even in a folder listed
+    /// a lot lately: held back, its record would go with the save it asks for.
+    #[test]
+    fn restoration_is_never_paced() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        pace.listed(b"/f", Duration::from_secs(1), now);
+        let mut dirs = HashMap::from([(b"/f".to_vec(), (false, 7))]);
+        pace.sort(&mut dirs, now);
+        assert!(dirs.is_empty() && pace.held.len() == 1, "an ordinary event is held");
+        let mut dirs = HashMap::from([(b"/g".to_vec(), (true, 0))]);
+        pace.listed(b"/g", Duration::from_secs(1), now);
+        pace.sort(&mut dirs, now);
+        assert!(dirs.contains_key(b"/g".as_slice()) && pace.held.len() == 1, "a restoration is listed");
+    }
+
+    /// A follower that takes over restores the folders the saved index
+    /// lacked: queued events, so the save it asks for must wait until they
+    /// are applied, or its record (the skipped file) goes without them.
+    #[test]
+    fn takeover_applies_the_restoration_before_it_saves() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-takeover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let folder = d.join("restored");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("f.txt"), "x").unwrap();
+        std::fs::write(d.join(SKIPPED), [folder.as_os_str().as_bytes(), b"\n"].concat()).unwrap();
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        s.owner.store(false, Ordering::Relaxed);
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        // The old owner wrote under the data dir: the follower checks for it at once.
+        let wrote = fsevents::Event { path: d.join("index.bin").as_os_str().as_bytes().to_vec(), flags: 0, id: 101, stream: 0 };
+        s.wake.send(vec![wrote]).unwrap();
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::load(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(s.owner.load(Ordering::Relaxed));
+        assert!(saved.lookup(folder.join("f.txt").as_os_str().as_bytes()).is_some(), "saved before the restoration was applied");
     }
 }
