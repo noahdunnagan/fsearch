@@ -1242,8 +1242,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 }
                 let d = crate::live::normalize(&e.path);
                 // A lazy folder's changes batch under its unit instead of
-                // listing now; Pace is for prompt paths only.
-                if let Some(u) = walk::LAZY.get().and_then(|l| l.unit(&d)) {
+                // listing now; Pace is for prompt paths only. (Not a
+                // restoration's id 0: its record goes with the save it asks for.)
+                if e.id != 0
+                    && let Some(u) = walk::LAZY.get().and_then(|l| l.unit(&d))
+                {
                     let unit = d[..u].to_vec();
                     lazy.add(&unit, d, e.flags & MUST_SCAN_SUBDIRS != 0, e.id, evt, wall);
                     continue;
@@ -1547,14 +1550,11 @@ mod tests {
         assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/u".to_vec(), true)]);
     }
 
-    /// An owner over a one-folder index at event 100, for driving the apply
-    /// loop without a stream (nothing here calls `watch`). Its `synced_at`
-    /// is far ahead, so a relist finds nothing changed and lists nothing:
-    /// a real one would crawl the disk.
-    fn owner(d: &Path) -> (Arc<Shared>, Receiver<Vec<fsevents::Event>>) {
+    /// An owner over `idx`, for driving the apply loop without a stream
+    /// (nothing here calls `watch`).
+    fn owner(d: &Path, idx: Index) -> (Arc<Shared>, Receiver<Vec<fsevents::Event>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (ctx, crx) = std::sync::mpsc::channel();
-        let idx = Index::build(vec![Listing::default()], 100, u32::MAX, b"/h");
         let shared = Arc::new(Shared {
             live: RwLock::new(Some(Live::new(idx))),
             loading: (Mutex::new(false), Condvar::new()),
@@ -1591,7 +1591,9 @@ mod tests {
         let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-relist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        let (s, rx) = owner(&d);
+        // At event 100, with a `synced_at` far ahead: a relist finds nothing
+        // changed and lists nothing (a real one would crawl the disk).
+        let (s, rx) = owner(&d, Index::build(vec![Listing::default()], 100, u32::MAX, b"/h"));
         let looping = s.clone();
         std::thread::spawn(move || apply_loop(&looping, rx));
         let wait = |what: &str, done: &dyn Fn() -> bool| {
@@ -1624,5 +1626,46 @@ mod tests {
         let saved = Index::saved_event_id(&path).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved < 200, "saved watermark {saved} is past the kernel drop at 200 whose relist is still pending");
+    }
+    /// The folders above `path`, as listings of an index that holds nothing
+    /// else.
+    fn above(path: &Path) -> Vec<Listing> {
+        let comps: Vec<&[u8]> = path.as_os_str().as_bytes().split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let dir = |i: usize, c: &[u8]| {
+            let e = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: i as u32 + 1 };
+            Listing { id: i as u32, names: c.to_vec(), ents: vec![e] }
+        };
+        let mut ls: Vec<Listing> = comps.iter().enumerate().map(|(i, c)| dir(i, c)).collect();
+        ls.push(Listing { id: comps.len() as u32, ..Default::default() });
+        ls
+    }
+
+    /// A folder the saved index lacked is restored when access is granted:
+    /// listed at once, even under a lazy name. Deferred in a lazy unit, the
+    /// save it asks for would clear its record (the skipped file) while
+    /// the restoration still waits, and a restart would lose both.
+    #[test]
+    fn restoration_is_not_deferred() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let folder = d.join("node_modules");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("f.txt"), "x").unwrap();
+        std::fs::write(d.join(SKIPPED), [folder.as_os_str().as_bytes(), b"\n"].concat()).unwrap();
+        // (Per-process, like the engine tests' own: the same config.)
+        let _ = walk::LAZY.set(walk::LazyDirs::build(b"/h", false));
+        assert!(walk::LAZY.get().is_some_and(|l| l.unit(folder.as_os_str().as_bytes()).is_some()));
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        rescan_unskipped(&s);
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::load(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(saved.lookup(folder.as_os_str().as_bytes()).is_some(), "saved without the folder it was asked for after restoring");
     }
 }
