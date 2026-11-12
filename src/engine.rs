@@ -1104,7 +1104,10 @@ struct Lazy {
 impl Lazy {
     fn add(&mut self, unit: &[u8], dir: Vec<u8>, recursive: bool, id: u64, now: Instant, wall: u32) {
         let p = self.units.entry(unit.to_vec()).or_default();
-        p.first.get_or_insert((now, wall));
+        // (The wall time only goes back: a replayed change may be older than
+        // what the unit already holds. The age bound counts from its first arrival.)
+        let first = p.first.get_or_insert((now, wall));
+        first.1 = first.1.min(wall);
         p.last = Some(now);
         p.min_id = if p.min_id == 0 { id } else { p.min_id.min(id) };
         if !p.whole {
@@ -1498,6 +1501,19 @@ mod tests {
     fn skip_entries() {
         follower("skip", "/h");
         assert!(walk::blocked(b"/nonexistent-fsearch-skip/x") && !walk::blocked(b"/usr"));
+    }
+
+    /// A unit pending since today that yesterday's replayed change lands in
+    /// goes back to yesterday's wall time; a later live change doesn't undo
+    /// it.
+    #[test]
+    fn lazy_wall_only_goes_back() {
+        let (t0, sec) = (Instant::now(), Duration::from_secs);
+        let mut l = Lazy::default();
+        l.add(b"/u", b"/u/a".to_vec(), false, 10, t0, 2000);
+        l.add(b"/u", b"/u/b".to_vec(), false, 5, t0 + sec(1), 1000);
+        l.add(b"/u", b"/u/c".to_vec(), false, 11, t0 + sec(2), 3000);
+        assert_eq!(l.earliest_wall(), Some(1000));
     }
 
     /// Compaction: always when asked, past the hard bound even mid-churn,
