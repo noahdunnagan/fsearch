@@ -415,8 +415,8 @@ impl Segment {
         }
         let mut dead = vec![0u64; ndocs.div_ceil(64)];
         if let Ok(b) = std::fs::read(dead_path(dir, id)) {
-            for (w, c) in dead.iter_mut().zip(b.chunks_exact(8)) {
-                *w = u64::from_le_bytes(c.try_into().unwrap());
+            for (w, c) in dead.iter_mut().zip(b.as_chunks::<8>().0) {
+                *w = u64::from_le_bytes(*c);
             }
             // (Bits past the last doc: a corrupt file.)
             if let Some(w) = dead.last_mut().filter(|_| !ndocs.is_multiple_of(64)) {
@@ -597,12 +597,12 @@ fn content_hash(b: &[u8]) -> u64 {
         let x = [word(w, 0), word(w, 1), word(w, 2), word(w, 3)];
         s = [mix(x[0] ^ K[0], x[1] ^ s[0]), mix(x[1] ^ K[1], x[0] ^ s[1]), mix(x[2] ^ K[2], x[3] ^ s[2]), mix(x[3] ^ K[3], x[2] ^ s[3])];
     };
-    let mut blocks = b.chunks_exact(32);
-    for w in &mut blocks {
+    let (blocks, rem) = b.as_chunks::<32>();
+    for w in blocks {
         step(w);
     }
     let mut last = [0u8; 32];
-    last[..blocks.remainder().len()].copy_from_slice(blocks.remainder());
+    last[..rem.len()].copy_from_slice(rem);
     step(&last);
     mix(mix(s[0] ^ K[1], s[2] ^ K[2]) ^ s[1], s[3] ^ K[0])
 }
@@ -1624,7 +1624,9 @@ impl<'a> Scope<'a> {
         };
         let Some(place) = place else { return false };
         let cap = if json_ext(name) { MAX_FILE } else { MAX_REPO_FILE };
-        let ok = if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
+        // A zero-byte file can't match a grep: never opened. (If it grows,
+        // its folder's next resync picks it up with the new size.)
+        let ok = size > 0 && if place.repo { size <= cap && name != b".git" && !binary_ext(name) } else { name_ok(name, size) };
         ok && !generated(name, size) && !ignored(&place.rules, self.global.as_deref(), path, false)
     }
 
@@ -4746,6 +4748,30 @@ mod tests {
     /// The lines of `buf` a grep shows.
     fn lines(g: &Grep, buf: &[u8]) -> Vec<(usize, String)> {
         matches_in(g, b"/f", buf, false).map_or(Vec::new(), |f| f.lines)
+    }
+
+    /// A zero-byte file is never opened for indexing; once it is
+    /// non-empty again, its folder's resync picks it up.
+    #[test]
+    fn zero_byte_files_are_never_picked() {
+        let want_for = |size: u64| {
+            let dir = |id: u32, name: &[u8], child: u32| Listing {
+                id,
+                names: name.to_vec(),
+                ents: vec![RawEnt { name_off: 0, name_len: name.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child }],
+            };
+            let names = b"empty.txtfull.txt".to_vec();
+            let ents = vec![
+                RawEnt { name_off: 0, name_len: 9, kind: KIND_FILE, size, mtime: 1, child: crate::walk::NONE },
+                RawEnt { name_off: 9, name_len: 8, kind: KIND_FILE, size: 3, mtime: 1, child: crate::walk::NONE },
+            ];
+            let idx = crate::index::Index::build(vec![dir(0, b"t", 1), dir(1, b"d", 2), Listing { id: 2, names, ents }], 0, 0, b"/t/d");
+            let live = Live::new(idx);
+            let want = wanted(&live, b"/t", b"/t/d", true);
+            (0..want.len()).map(|i| want.path(i).to_vec()).collect::<Vec<_>>()
+        };
+        assert_eq!(want_for(0), vec![b"/t/d/full.txt".to_vec()]);
+        assert_eq!(want_for(3), vec![b"/t/d/empty.txt".to_vec(), b"/t/d/full.txt".to_vec()]);
     }
 
     /// `$` ends a line before a \r\n as before a \n.

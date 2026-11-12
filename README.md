@@ -70,6 +70,11 @@ build-output folders outside repos. To leave out more, list folders in
 (`~` and `#` comments work). Names are always indexed, and a grep inside
 a file you name still reads it.
 
+Churn folders — caches, logs, build output, `node_modules`, folders with a
+`CACHEDIR.TAG` — are indexed like everything else, but their changes show
+up only once they quiet down (a few seconds; a minute at most under
+churn that never stops).
+
 ## Full Disk Access
 
 From a terminal with Full Disk Access it indexes everything. As a login

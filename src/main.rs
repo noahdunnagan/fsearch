@@ -22,6 +22,7 @@ const USAGE: &str = "usage:
   fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
                                 (needs Full Disk Access granted to ~/.local/bin/fsearch)
   fsearch uninstall             remove the login agent (keeps the index)
+  fsearch version               print the version
   fsearch bench <query...>      time a query in-process against the saved index";
 
 const LABEL: &str = "mt.nd.fsearch";
@@ -55,6 +56,7 @@ fn main() {
         Some("stdio") => stdio(),
         Some("mcp") => mcp::run(data_dir()),
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
+        Some("version" | "--version") => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),

@@ -9,6 +9,11 @@ pub const KERNEL_DROPPED: u32 = 0x4;
 pub const HISTORY_DONE: u32 = 0x10;
 const CREATE_FLAG_NO_DEFER: u32 = 0x2;
 
+/// How long fseventsd may hold an event while batching it with more: under
+/// churn 0.5 s turns a wakeup per write into one per burst. NO_DEFER still
+/// pushes an isolated change through at once.
+const LATENCY: f64 = 0.5;
+
 pub struct Event {
     pub path: Vec<u8>,
     pub flags: u32,
@@ -21,6 +26,9 @@ pub struct Event {
 struct Info {
     tx: Sender<Vec<Event>>,
     stream: u32,
+    /// The data dir: events under it always pass the skip filter (a
+    /// follower sees its owner's writes).
+    ours: Vec<u8>,
 }
 
 #[repr(C)]
@@ -104,12 +112,20 @@ unsafe extern "C" {
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
     let info = unsafe { &*(info as *const Info) };
     let paths = paths as *const *const i8;
-    let batch = (0..n)
+    // Events under a skipped folder are dropped here rather than waking the
+    // apply loop — but never events on "/" (drop and history flags live on
+    // it), HISTORY_DONE, or ones under the data dir.
+    let keep =
+        |path: &[u8], flags: u32| path == b"/" || flags & HISTORY_DONE != 0 || crate::engine::under(path, &info.ours) || !crate::walk::blocked(path);
+    let batch: Vec<Event> = (0..n)
         .map(|i| unsafe {
             Event { path: CStr::from_ptr(*paths.add(i)).to_bytes().to_vec(), flags: *flags.add(i), id: *ids.add(i), stream: info.stream }
         })
+        .filter(|e| keep(&e.path, e.flags))
         .collect();
-    let _ = info.tx.send(batch);
+    if !batch.is_empty() {
+        let _ = info.tx.send(batch);
+    }
 }
 
 extern "C" fn release_info(info: *const c_void) {
@@ -137,22 +153,23 @@ impl Drop for Stream {
 }
 
 /// Watch `/` from `since` (an event id). Batches of directory-level events,
-/// stamped with `stream`, arrive on `tx` until the returned stream is dropped.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> Stream {
+/// stamped with `stream`, arrive on `tx` until the returned stream is
+/// dropped. `ours` (the data dir) always passes the skip filter.
+pub fn watch(since: u64, tx: Sender<Vec<Event>>, stream: u32, ours: &[u8]) -> Stream {
     let a = api();
     unsafe {
         let root = (a.string)(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
         let arr = (a.array)(std::ptr::null(), &root, 1, a.array_callbacks);
         let ctx = Context {
             version: 0,
-            info: Box::into_raw(Box::new(Info { tx, stream })) as *mut c_void,
+            info: Box::into_raw(Box::new(Info { tx, stream, ours: ours.to_vec() })) as *mut c_void,
             retain: std::ptr::null(),
             release: release_info as *const c_void,
             copy_description: std::ptr::null(),
         };
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
-        let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
+        let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, LATENCY, CREATE_FLAG_NO_DEFER);
         (a.cf_release)(arr);
         (a.cf_release)(root);
         // The callback only copies paths out, but it must not queue behind
