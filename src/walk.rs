@@ -52,9 +52,14 @@ pub struct LazyDirs {
     names: Vec<Vec<u8>>,
     /// Folders found holding a CACHEDIR.TAG, in crawl or live listings.
     pub cachedir: RwLock<HashSet<Vec<u8>>>,
+    /// What `cachedir` held after its last prune.
+    kept: AtomicUsize,
     /// CACHEDIR.TAG marking is on (off with the defaults).
     cache_dirs: bool,
 }
+
+/// The set is not pruned on growth below twice this.
+const PRUNE_MIN: usize = 1024;
 
 /// `p` as an absolute normalized path: `~` and bare names are home-relative.
 pub(crate) fn expand(p: &[u8], home: &[u8]) -> Vec<u8> {
@@ -73,6 +78,7 @@ impl LazyDirs {
             prefixes: if no_lazy { Vec::new() } else { LAZY_PREFIXES.iter().map(|p| expand(p.as_bytes(), home)).collect() },
             names: if no_lazy { Vec::new() } else { LAZY_NAMES.iter().map(|n| n.as_bytes().to_vec()).collect() },
             cachedir: RwLock::new(HashSet::new()),
+            kept: AtomicUsize::new(0),
             cache_dirs: !no_lazy,
         }
     }
@@ -91,15 +97,30 @@ impl LazyDirs {
         }
     }
 
+    /// Remember a tagged folder. A folder deleted whole is never listed to
+    /// be forgotten, and compaction may be far off: once the set has
+    /// doubled since the last prune it prunes itself.
+    fn learn(&self, path: &[u8]) {
+        let n = {
+            let mut set = self.cachedir.write().unwrap();
+            set.insert(path.to_vec());
+            set.len()
+        };
+        if n > 2 * self.kept.load(Ordering::Relaxed).max(PRUNE_MIN) {
+            self.prune();
+        }
+    }
+
     /// Forget CACHEDIR dirs whose tag file is gone: a folder that lost its
     /// tag (or was deleted) stops being a lazy unit. Costly — compaction
-    /// calls this, nothing else.
+    /// calls this, and `learn` as the set doubles.
     pub fn prune(&self) {
         let mut set = self.cachedir.write().unwrap();
         set.retain(|p| {
             let tag = [p.as_slice(), b"/", CACHE_TAG].concat();
             std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(&tag)).is_ok_and(|m| m.is_file())
         });
+        self.kept.store(set.len(), Ordering::Relaxed);
     }
 
     /// The unit a lazy path's changes batch under, as its length within
@@ -192,7 +213,7 @@ fn learn_cachedir(path: Option<&[u8]>, l: &Listing) {
     let Some(p) = path else { return };
     let set = &LAZY.get().unwrap().cachedir;
     if tagged {
-        set.write().unwrap().insert(p.to_vec());
+        LAZY.get().unwrap().learn(p);
     } else if set.read().unwrap().contains(p) {
         set.write().unwrap().remove(p);
     }
@@ -659,6 +680,26 @@ mod tests {
         LAZY.get().unwrap().cachedir.write().unwrap().insert(gone.clone());
         assert!(list_one(&gone).is_none());
         assert!(!LAZY.get().unwrap().cachedir.read().unwrap().contains(&gone));
+    }
+
+    /// Tagged folders deleted whole (their parent's listing alone says so)
+    /// are never listed to be forgotten: unique ones created and deleted
+    /// over and over, with compaction far off, may not pile up for good.
+    #[test]
+    fn cachedir_set_stays_bounded() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("CACHEDIR.TAG"), b"tag").unwrap();
+        let s = LazyDirs::build(b"/h", false);
+        s.learn(root.to_str().unwrap().as_bytes());
+        for i in 0..5000 {
+            s.learn(format!("/nonexistent-fsearch-bound/{i}").as_bytes());
+        }
+        let (n, kept) = (s.cachedir.read().unwrap().len(), s.cachedir.read().unwrap().contains(root.to_str().unwrap().as_bytes()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(n <= 2048, "{n} folders held, nearly all gone");
+        assert!(kept, "a tagged folder that is there was forgotten");
     }
 
     /// A folder whose listing loses its CACHEDIR.TAG is forgotten (and one

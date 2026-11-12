@@ -593,6 +593,9 @@ impl Shared {
             && let Some(base) = Index::load(&path)
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
+            if let Some(z) = walk::LAZY.get() {
+                z.seed(&base);
+            }
             self.watch(base.event_id);
             *self.live.write().unwrap() = Some(Live::new(base));
         }

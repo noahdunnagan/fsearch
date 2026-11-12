@@ -637,8 +637,8 @@ impl Index {
     pub fn holding(&self, name: &[u8]) -> Vec<Vec<u8>> {
         let (info, len) = (self.name_info(), NameInfo::of(name, 0).len);
         let Some(id) = (0..self.u).find(|&k| info[k].len == len && *self.uname(k as u32) == *name) else { return Vec::new() };
-        let (names, mut path, mut out) = (self.ent_names(), Vec::new(), Vec::new());
-        for i in (1..self.n).filter(|&i| names.get(i) == id as u32 && self.kind(i) & 3 == KIND_FILE) {
+        let (mut path, mut out) = (Vec::new(), Vec::new());
+        for i in self.ents(id as u32).map(|i| i as usize).filter(|&i| self.kind(i) & 3 == KIND_FILE) {
             self.path(i, &mut path);
             path.truncate(path.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1));
             out.push(path.clone());
