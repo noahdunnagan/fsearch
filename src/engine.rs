@@ -1207,7 +1207,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         let mut dirs: HashMap<Vec<u8>, (bool, u64)> = HashMap::new();
         if had_events {
             let (evt, wall) = (Instant::now(), crate::query::now_secs());
-            let mut last_good = shared.live.read().unwrap().as_ref().map_or(0, |l| l.event_id);
+            let (mut last_good, synced) = shared.live.read().unwrap().as_ref().map_or((0, 0), |l| (l.event_id, l.synced_at));
             let current = shared.streams.load(Ordering::Relaxed);
             for e in events {
                 if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
@@ -1248,6 +1248,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     && let Some(u) = walk::LAZY.get().and_then(|l| l.unit(&d))
                 {
                     let unit = d[..u].to_vec();
+                    // A replayed event happened any time since the save: it
+                    // counts from the last sync, not from its arrival.
+                    let wall = if shared.replaying.load(Ordering::Relaxed) { synced } else { wall };
                     lazy.add(&unit, d, e.flags & MUST_SCAN_SUBDIRS != 0, e.id, evt, wall);
                     continue;
                 }
@@ -1667,5 +1670,38 @@ mod tests {
         let saved = Index::load(&path).expect("saved");
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved.lookup(folder.as_os_str().as_bytes()).is_some(), "saved without the folder it was asked for after restoring");
+    }
+    /// Yesterday's changes replayed into a lazy unit, the replay done, a
+    /// save before the unit flushes: they are not applied yet, so the saved
+    /// `synced_at` can't have moved to today, or a relist after lost history
+    /// would look only since then.
+    #[test]
+    fn replayed_lazy_events_hold_synced_at() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-replayed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let _ = walk::LAZY.set(walk::LazyDirs::build(b"/h", false));
+        let (event, history_done) = (d.join("node_modules/pkg"), b"/".to_vec());
+        assert!(walk::LAZY.get().is_some_and(|l| l.unit(event.as_os_str().as_bytes()).is_some()));
+        let yesterday = crate::query::now_secs() - 86_400;
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, yesterday, b"/h"));
+        s.replaying.store(true, Ordering::Relaxed);
+        s.save_requested.store(true, Ordering::Relaxed);
+        s.wake
+            .send(vec![
+                fsevents::Event { path: event.as_os_str().as_bytes().to_vec(), flags: 0, id: 150, stream: 0 },
+                fsevents::Event { path: history_done, flags: HISTORY_DONE, id: 151, stream: 0 },
+            ])
+            .unwrap();
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::load(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(saved.synced_at <= yesterday, "saved synced_at {} is past the unflushed changes replayed from {yesterday}", saved.synced_at);
     }
 }
