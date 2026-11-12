@@ -1224,6 +1224,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                         continue;
                     }
                     root_flags |= e.flags;
+                    // Recovered by a relist that may wait out RELIST_COOLDOWN:
+                    // hold the watermark at the last safe id until it has run.
+                    gap = Some((gap.map_or(last_good, |(g, _)| g.min(last_good)), Instant::now()));
                 }
                 seen_max = seen_max.max(e.id);
                 if gap.is_none() {
@@ -1542,5 +1545,84 @@ mod tests {
             l.add(b"/u", format!("/u/d{i}").into_bytes(), false, i as u64 + 1, t0, 100);
         }
         assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/u".to_vec(), true)]);
+    }
+
+    /// An owner over a one-folder index at event 100, for driving the apply
+    /// loop without a stream (nothing here calls `watch`). Its `synced_at`
+    /// is far ahead, so a relist finds nothing changed and lists nothing:
+    /// a real one would crawl the disk.
+    fn owner(d: &Path) -> (Arc<Shared>, Receiver<Vec<fsevents::Event>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctx, crx) = std::sync::mpsc::channel();
+        let idx = Index::build(vec![Listing::default()], 100, u32::MAX, b"/h");
+        let shared = Arc::new(Shared {
+            live: RwLock::new(Some(Live::new(idx))),
+            loading: (Mutex::new(false), Condvar::new()),
+            content: RwLock::new(Content::open_shared(d.join("content"))),
+            home: "/h".into(),
+            dir: d.to_path_buf(),
+            wake: tx,
+            save_requested: AtomicBool::new(false),
+            content_tx: ctx,
+            content_rx: Mutex::new(Some(crx)),
+            content_pending: AtomicUsize::new(0),
+            dirty: Default::default(),
+            owner: AtomicBool::new(true),
+            lock: std::fs::File::create(d.join("daemon.lock")).unwrap(),
+            stream: Mutex::new(None),
+            streams: Default::default(),
+            since: AtomicU64::new(0),
+            ours: d.as_os_str().as_bytes().to_vec(),
+            replaying: AtomicBool::new(false),
+            content_seen: Mutex::new(None),
+            early: Mutex::new(Vec::new()),
+            content_ready: AtomicBool::new(true),
+            content_early: Mutex::new(Vec::new()),
+            on_change: RwLock::new(Vec::new()),
+        });
+        (shared, rx)
+    }
+
+    /// A root drop whose relist waits out RELIST_COOLDOWN must not let a
+    /// save stamp the watermark past it: a restart would replay from after
+    /// the lost changes, and the relist, only in memory, would be gone.
+    #[test]
+    fn deferred_relist_holds_the_watermark() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-relist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, rx) = owner(&d);
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !done() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(done(), "timed out waiting for {what}");
+        };
+        let event_id = || s.live.read().unwrap().as_ref().unwrap().event_id;
+        let kernel_drop = |id| fsevents::Event { path: b"/".to_vec(), flags: MUST_SCAN_SUBDIRS | KERNEL_DROPPED, id, stream: 0 };
+        // The first drop is relisted at once, which starts the cooldown, and
+        // the watermark then catches up to it.
+        s.wake.send(vec![kernel_drop(150)]).unwrap();
+        wait("the first relist", &|| s.live.read().unwrap().as_ref().unwrap().synced_at != u32::MAX);
+        s.wake.send(Vec::new()).unwrap();
+        wait("the watermark to catch up", &|| event_id() == 150);
+        // The second waits the cooldown out. Once the loop has it in hand,
+        // a save is asked for.
+        let (seen, loop_has_it) = std::sync::mpsc::channel();
+        s.on_change.write().unwrap().push(Box::new(move |_| {
+            let _ = seen.send(());
+        }));
+        s.wake.send(vec![kernel_drop(200)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+        s.save_requested.store(true, Ordering::Relaxed);
+        s.wake.send(Vec::new()).unwrap();
+        let path = d.join("index.bin");
+        wait("the save", &|| Index::saved_event_id(&path).is_some());
+        let saved = Index::saved_event_id(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(saved < 200, "saved watermark {saved} is past the kernel drop at 200 whose relist is still pending");
     }
 }
