@@ -1576,8 +1576,15 @@ mod tests {
         // /v quieted; /u is still fresh.
         assert_eq!(l.due(t0 + LAZY_QUIET), vec![(b"/v".to_vec(), false)]);
         assert_eq!(l.floor(), 8);
-        // /u flushes once too old, quiet or not.
-        assert_eq!(l.due(t0 + LAZY_MAX), vec![(b"/u/a".to_vec(), false), (b"/u/b".to_vec(), true)]);
+        // /u keeps churning, an event a second, so it is never quiet: it
+        // flushes once LAZY_MAX old all the same, not before.
+        let sec = Duration::from_secs;
+        for s in 5..LAZY_MAX.as_secs() {
+            l.add(b"/u", b"/u/c".to_vec(), false, 100 + s, t0 + sec(s), 100);
+            assert!(l.due(t0 + sec(s)).is_empty(), "flushed at {s} s");
+        }
+        assert_eq!(l.wait(t0 + sec(58)), Some(sec(2)));
+        assert_eq!(l.due(t0 + LAZY_MAX), vec![(b"/u/a".to_vec(), false), (b"/u/b".to_vec(), true), (b"/u/c".to_vec(), false)]);
         assert_eq!(l.floor(), u64::MAX);
         assert!(l.earliest_wall().is_none());
         // Past LAZY_COLLAPSE folders, the unit is rescanned whole.
