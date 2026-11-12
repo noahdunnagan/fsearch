@@ -21,9 +21,11 @@ use std::time::{Duration, Instant};
 // the base once it grows — and grows with the base: a big index tolerates a
 // bigger overlay. Below the soft bound compaction waits for the disk to go
 // quiet; past the hard one it runs anyway. Otherwise only twice a day;
-// restart replays FSEvents anyway.
+// restart replays FSEvents anyway. Memory caps both: an overlay entry is
+// ~190 bytes and its path twice, ~400 B at 100 bytes of path, so the hard
+// bound is ~140 MB however big the base, the soft one half of it.
 const COMPACT_PENDING: usize = 50_000;
-const COMPACT_HARD: usize = 500_000;
+const COMPACT_HARD: usize = 350_000;
 const COMPACT_QUIET: Duration = Duration::from_secs(30);
 const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
@@ -1187,7 +1189,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // Wake when the compaction quiet window closes while enough is
         // pending, when a deferred relist's cooldown ends (now, if it
         // already has), and when the earliest lazy unit is due.
-        if pending > COMPACT_PENDING.max(n_base / 8) {
+        if pending > compact_soft(n_base) {
             wait = wait.min(COMPACT_QUIET.saturating_sub(last_events.elapsed()));
         }
         if relist_due.is_some() {
@@ -1424,17 +1426,21 @@ fn advance(cur: u64, seen_max: u64, floor: u64, gap: Option<u64>) -> u64 {
     gap.map_or(cur.max(seen_max.min(floor.saturating_sub(1))), |from| cur.min(from))
 }
 
+/// The overlay size past which compaction waits only for quiet: it grows
+/// with the base, up to half of COMPACT_HARD.
+fn compact_soft(n_base: usize) -> usize {
+    COMPACT_PENDING.max(n_base / 8).min(COMPACT_HARD / 2)
+}
+
 /// Whether to fold the overlay into the base now: always when asked; past
 /// the hard bound even mid-churn; past the soft one once the disk has been
 /// quiet for COMPACT_QUIET; or with unsaved changes twice a day, again once
 /// quiet. (`stale_for`: how long the last save is, when changes are
 /// unsaved.)
 fn should_compact(pending: usize, n_base: usize, quiet_for: Duration, stale_for: Option<Duration>, asked: bool) -> bool {
-    let soft = COMPACT_PENDING.max(n_base / 8);
-    let hard = COMPACT_HARD.max(n_base / 2);
     asked
-        || pending > hard
-        || (pending > soft && quiet_for >= COMPACT_QUIET)
+        || pending > COMPACT_HARD
+        || (pending > compact_soft(n_base) && quiet_for >= COMPACT_QUIET)
         || (stale_for.is_some_and(|s| s >= COMPACT_EVERY) && quiet_for >= COMPACT_QUIET)
 }
 
@@ -1500,16 +1506,29 @@ mod tests {
         assert!(should_compact(COMPACT_HARD + 1, 0, Duration::ZERO, None, false));
         assert!(!should_compact(COMPACT_PENDING + 1, 0, Duration::ZERO, None, false));
         assert!(should_compact(COMPACT_PENDING + 1, 0, COMPACT_QUIET, None, false));
-        // Both bounds grow with the base: under soft for a 1M-entry index
-        // even when quiet, and over the old hard bound but under the grown
-        // one for a 2M-entry index while churn goes on.
+        // The soft bound grows with the base: under it for a 1M-entry index
+        // even when quiet.
         assert!(!should_compact(COMPACT_PENDING + 1, 1_000_000, COMPACT_QUIET, None, false));
-        assert!(!should_compact(COMPACT_HARD + 1, 2_000_000, Duration::ZERO, None, false));
-        assert!(should_compact(1_000_001, 2_000_000, Duration::ZERO, None, false));
         assert!(should_compact(1, 0, COMPACT_QUIET, Some(COMPACT_EVERY), false));
         assert!(!should_compact(1, 0, COMPACT_QUIET, Some(Duration::from_secs(60)), false));
         assert!(!should_compact(1, 0, Duration::ZERO, Some(COMPACT_EVERY), false));
         assert!(!should_compact(1, 0, COMPACT_QUIET, None, false));
+    }
+
+    /// An overlay entry costs ~190 bytes and two copies of its path (about
+    /// 400 B at 100 bytes of path), so no base, however big, may let more
+    /// than COMPACT_HARD of them pile up mid-churn, nor wait for quiet
+    /// past half of it.
+    #[test]
+    fn compact_bounds_are_absolute() {
+        let big = 9_300_000;
+        assert!(should_compact(COMPACT_HARD + 1, big, Duration::ZERO, None, false));
+        assert!(!should_compact(COMPACT_HARD / 2 + 1, big, Duration::ZERO, None, false));
+        assert!(should_compact(COMPACT_HARD / 2 + 1, big, COMPACT_QUIET, None, false));
+        assert!(!should_compact(COMPACT_HARD / 2, big, COMPACT_QUIET, None, false));
+        // A smaller base still tolerates a smaller overlay: 1M entries, 125k.
+        assert!(!should_compact(125_000, 1_000_000, COMPACT_QUIET, None, false));
+        assert!(should_compact(125_001, 1_000_000, COMPACT_QUIET, None, false));
     }
 
     /// Replay backoff doubles and caps; a relist inside its cooldown tells
