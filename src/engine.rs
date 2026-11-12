@@ -1251,10 +1251,13 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     }
                 }
                 if e.flags & HISTORY_DONE != 0 {
-                    log("replay done");
-                    shared.replaying.store(false, Ordering::Relaxed);
-                    if gap.is_none() {
-                        replays = 0;
+                    // (As above: an earlier stream's marker says nothing of this one's replay.)
+                    if e.stream == current {
+                        log("replay done");
+                        shared.replaying.store(false, Ordering::Relaxed);
+                        if gap.is_none() {
+                            replays = 0;
+                        }
                     }
                     continue;
                 }
@@ -1713,6 +1716,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved.lookup(folder.as_os_str().as_bytes()).is_some(), "saved without the folder it was asked for after restoring");
     }
+
     /// Yesterday's changes replayed into a lazy unit, the replay done, a
     /// save before the unit flushes: they are not applied yet, so the saved
     /// `synced_at` can't have moved to today, or a relist after lost history
@@ -1791,5 +1795,34 @@ mod tests {
         let saved = Index::saved_event_id(&path).expect("saved");
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(saved, 501, "saved watermark is past what the new stream has replayed");
+    }
+    /// A replaced stream's HISTORY_DONE, still queued, says nothing of the
+    /// new stream's replay: it may not end it, or `synced_at` moves to now
+    /// while the replay still owes older changes.
+    #[test]
+    fn stale_history_done_leaves_the_replay_going() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-stale-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let yesterday = crate::query::now_secs() - 86_400;
+        let (s, rx) = owner(&d, Index::build(above(&d), 500, yesterday, b"/h"));
+        // The new stream (1) replays from 500; the old one (0) is gone.
+        s.streams.store(1, Ordering::Relaxed);
+        s.since.store(500, Ordering::Relaxed);
+        s.replaying.store(true, Ordering::Relaxed);
+        s.save_requested.store(true, Ordering::Relaxed);
+        let event = |path: &[u8], flags, id, stream| fsevents::Event { path: path.to_vec(), flags, id, stream };
+        s.wake.send(vec![event(b"/", HISTORY_DONE, 900, 0), event(b"/nonexistent-fsearch-history/a", 0, 501, 1)]).unwrap();
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::load(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(s.replaying.load(Ordering::Relaxed), "an old stream's marker ended the new replay");
+        assert!(saved.synced_at <= yesterday, "saved synced_at {} moved on while the replay is still going", saved.synced_at);
     }
 }
