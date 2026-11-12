@@ -1174,6 +1174,8 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     // The highest event id ever seen: the watermark may rise to it once
     // nothing is pending, even on wakes that applied nothing new.
     let mut seen_max = 0u64;
+    // The stream the events above came from.
+    let mut stream = shared.streams.load(Ordering::Relaxed);
     let mut pace = Pace::default();
     // Churn folders' pending changes, batched by lazy unit.
     let mut lazy = Lazy::default();
@@ -1200,6 +1202,14 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         events.extend(rx.try_iter().flatten());
+        // A stream replaced from outside (a follower reloading its owner's
+        // save) replays from its own start into a snapshot that holds none
+        // of what was seen before: seen_max and a gap restart from there.
+        let current = shared.streams.load(Ordering::Relaxed);
+        if current != stream {
+            let since = shared.since.load(Ordering::Relaxed);
+            (stream, seen_max, gap) = (current, since, gap.map(|(_, at)| (since, at)));
+        }
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| under(&e.path, ours));
@@ -1211,7 +1221,6 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         if had_events {
             let (evt, wall) = (Instant::now(), crate::query::now_secs());
             let (mut last_good, synced) = shared.live.read().unwrap().as_ref().map_or((0, 0), |l| (l.event_id, l.synced_at));
-            let current = shared.streams.load(Ordering::Relaxed);
             for e in events {
                 if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
                     // fseventsd still logged what it dropped for us (a kernel
@@ -1231,9 +1240,13 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     // hold the watermark at the last safe id until it has run.
                     gap = Some((gap.map_or(last_good, |(g, _)| g.min(last_good)), Instant::now()));
                 }
-                seen_max = seen_max.max(e.id);
-                if gap.is_none() {
-                    last_good = last_good.max(e.id);
+                // (A replaced stream's stragglers are applied, but the
+                // replay hasn't delivered what lies between.)
+                if e.stream == current {
+                    seen_max = seen_max.max(e.id);
+                    if gap.is_none() {
+                        last_good = last_good.max(e.id);
+                    }
                 }
                 if e.flags & HISTORY_DONE != 0 {
                     log("replay done");
@@ -1706,5 +1719,51 @@ mod tests {
         let saved = Index::load(&path).expect("saved");
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved.synced_at <= yesterday, "saved synced_at {} is past the unflushed changes replayed from {yesterday}", saved.synced_at);
+    }
+    /// A follower that reloads its owner's older snapshot starts a stream
+    /// replaying from the snapshot's id: the watermark may not run ahead to
+    /// what the old stream had seen, nor to a straggler of it still queued,
+    /// before the replay has delivered those events into the new snapshot.
+    #[test]
+    fn reloaded_snapshot_does_not_inherit_the_old_watermark() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        // (Folders that aren't there, and not lazy: /private/var, where a
+        // temp dir sits, is.)
+        let change =
+            |name: &str, id, stream| fsevents::Event { path: format!("/nonexistent-fsearch-reload/{name}").into_bytes(), flags: 0, id, stream };
+        // The old stream delivers up to event 1000.
+        s.wake.send(vec![change("a", 1000, 0)]).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while s.live.read().unwrap().as_ref().unwrap().event_id != 1000 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(s.live.read().unwrap().as_ref().unwrap().event_id, 1000);
+        // The owner's save at 500 replaces the snapshot, and a new stream
+        // replays from there: its first event is 501, and a straggler of the
+        // old stream (900) is still queued.
+        *s.live.write().unwrap() = Some(Live::new(Index::build(above(&d), 500, 0, b"/h")));
+        s.since.store(500, Ordering::Relaxed);
+        s.streams.fetch_add(1, Ordering::Relaxed);
+        let (seen, loop_has_it) = std::sync::mpsc::channel();
+        s.on_change.write().unwrap().push(Box::new(move |_| {
+            let _ = seen.send(());
+        }));
+        s.wake.send(vec![change("b", 900, 0), change("c", 501, 1)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+        s.save_requested.store(true, Ordering::Relaxed);
+        s.wake.send(Vec::new()).unwrap();
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::saved_event_id(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(saved, 501, "saved watermark is past what the new stream has replayed");
     }
 }
