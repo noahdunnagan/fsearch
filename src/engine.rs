@@ -1187,6 +1187,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut gap: Option<(u64, Instant)> = None;
     // Replays in a row that dropped again; the third falls back to a relist.
     let mut replays = 0;
+    // The stream of the last of those, told apart from a replay of a save.
+    let mut retry_stream = None;
+    // A replay of a save dropped, so its retry is that save's second try;
+    // and that retry's stream.
+    let (mut save_dropped, mut save_retry) = (false, None);
     // A relist due inside RELIST_COOLDOWN, as (why, root flags).
     let mut relist_due: Option<(&'static str, u32)> = None;
     let mut last_relist: Option<Instant> = None;
@@ -1237,6 +1242,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| under(&e.path, ours));
         let (mut rebuild, mut root_flags, had_events) = (false, 0, !events.is_empty());
+        let mut save_replay_dropped = None;
         if had_events {
             last_events = Instant::now();
         }
@@ -1253,8 +1259,19 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     // covered by the stream that replaced it.
                     if e.flags & (USER_DROPPED | KERNEL_DROPPED) == USER_DROPPED {
                         if e.stream == current {
-                            let from = if shared.replaying.load(Ordering::Relaxed) { shared.since.load(Ordering::Relaxed) } else { last_good };
+                            let replaying = shared.replaying.load(Ordering::Relaxed);
+                            let from = if replaying { shared.since.load(Ordering::Relaxed) } else { last_good };
                             gap = Some((gap.map_or(from, |(g, _)| g.min(from)), Instant::now()));
+                            // A replay not started for a drop is one from a
+                            // save. Its retry dropping too, it has more
+                            // history behind it than fseventsd hands over:
+                            // replayed again it drops again, and live
+                            // changes queue behind it.
+                            if replaying && save_retry == Some(current) {
+                                save_replay_dropped = Some(e.flags);
+                            } else if replaying && retry_stream != Some(current) {
+                                save_dropped = true;
+                            }
                         }
                         continue;
                     }
@@ -1382,6 +1399,14 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             let live = g.as_mut().unwrap();
             live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
         }
+        // Watch from now and relist what changed since the save instead.
+        if let Some(flags) = save_replay_dropped
+            && relist_in(last_relist, Instant::now()).is_none()
+        {
+            shared.watch(fsevents::current_id());
+            relist_changed(shared, "events dropped replaying since the save", flags);
+            (gap, replays, relist_due, last_relist) = (None, 0, None, Some(Instant::now()));
+        }
         let replay = gap.filter(|(_, at)| at.elapsed() >= replay_delay(replays)).map(|(from, _)| from);
         if rebuild || (replay.is_some() && replays >= 3) && relist_due.is_none() {
             let why = match root_flags {
@@ -1402,6 +1427,8 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         } else if let Some(from) = replay {
             log(format!("FSEvents dropped events before we read them: replaying from {from}"));
             shared.watch(from);
+            retry_stream = Some(shared.streams.load(Ordering::Relaxed));
+            save_retry = retry_stream.filter(|_| std::mem::take(&mut save_dropped));
             // Ids past `from` arrive again from the replay: the watermark
             // mustn't run ahead of them on what was seen before the drop.
             seen_max = from;
@@ -1711,6 +1738,48 @@ mod tests {
         let saved = Index::saved_event_id(&path).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert!(saved < 200, "saved watermark {saved} is past the kernel drop at 200 whose relist is still pending");
+    }
+    /// A replay from the save that drops events is tried once more; when
+    /// that drops too, it has more history behind it than fseventsd hands
+    /// over: the stream restarts from now and what changed since the save is
+    /// relisted at once, not after more replays and minutes of changes going
+    /// unseen.
+    #[test]
+    fn a_save_replay_that_drops_twice_relists_at_once() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-replay-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Saved at the journal head, so the real retry stream has no history
+        // to replay, and replaying from there; with a `synced_at` far ahead,
+        // the relist finds nothing changed and lists nothing.
+        let saved = fsevents::current_id();
+        let (s, rx) = owner(&d, Index::build(vec![Listing::default()], saved, u32::MAX, b"/h"));
+        s.since.store(saved, Ordering::Relaxed);
+        s.replaying.store(true, Ordering::Relaxed);
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let user_drop = |stream| fsevents::Event { path: b"/".to_vec(), flags: MUST_SCAN_SUBDIRS | USER_DROPPED, id: saved + 1, stream };
+        let relisted = || s.live.read().unwrap().as_ref().unwrap().synced_at != u32::MAX;
+        let wait = |done: &dyn Fn() -> bool, within: Duration| {
+            let until = Instant::now() + within;
+            while !done() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done()
+        };
+        // The first drop is retried from the save.
+        s.wake.send(vec![user_drop(0)]).unwrap();
+        assert!(wait(&|| s.streams.load(Ordering::Relaxed) == 1, REPLAY_QUIET * 3), "the save's replay wasn't retried");
+        assert_eq!(s.since.load(Ordering::Relaxed), saved, "the retry doesn't replay from the save");
+        assert!(!relisted(), "the first drop relisted instead of retrying");
+        // The retry drops too: sooner than another replay could start.
+        let head = fsevents::current_id();
+        s.wake.send(vec![user_drop(1)]).unwrap();
+        let done = wait(&|| relisted(), REPLAY_QUIET / 2);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(done, "a save replay that dropped twice waited to replay again instead of relisting");
+        assert_eq!(s.streams.load(Ordering::Relaxed), 2, "the stream still replays the history since the save");
+        assert!(s.since.load(Ordering::Relaxed) >= head, "the new stream starts before the journal head");
     }
     /// The folders above `path`, as listings of an index that holds nothing
     /// else.
