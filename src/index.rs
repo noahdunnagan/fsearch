@@ -52,6 +52,7 @@ enum Sec {
     Zones,
 }
 const NSEC: usize = 24;
+const EXT_SLOTS: usize = 256;
 #[rustfmt::skip]
 const SEC_NAMES: [&str; NSEC] = [
     "NameBits", "NameBase", "NameOff", "Names", "EntName", "Kind", "Parent", "ParentRank", "ParentMap", "Size", "Mtime", "DirEntry",
@@ -69,7 +70,6 @@ pub struct Index {
     pub words: usize,
     bits_len: usize,
     zones_len: usize,
-    ext_slots: usize,
     /// Words of the per-64 `Parent` and `ParentRank` arrays.
     n64: usize,
     /// Entries of `ParentMap`.
@@ -430,15 +430,22 @@ impl Index {
     // Per distinct name, its extension as an `ext_table` slot: 0 none, 255
     // one not in the table.
     sec!(name_ext, Sec::NameExt, u8, u);
-    // The EXT_SLOTS most common extensions among the names, lowercased: slot
-    // i is `[len, bytes..]` (slot 0 and 255 unused).
-    sec!(ext_table, Sec::Exts, [u8; 16], ext_slots);
+    // The `EXT_SLOTS - 2` most common extensions among the names, lowercased:
+    // slot `i` is `[len, bytes..]` (slots 0 and 255 unused).
+    pub fn ext_table(&self) -> &[[u8; 16]] {
+        unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(self.off[Sec::Exts as usize]) as *const [u8; 16], EXT_SLOTS) }
+    }
 
     /// The `name_ext` slot of extension `e` (lowercase): 255 if it is not
     /// in the table (names with such an extension have to be read).
     pub fn ext_slot(&self, e: &[u8]) -> u8 {
         let t = self.ext_table();
-        (1..255).find(|&i| t[i][0] as usize == e.len() && &t[i][1..1 + e.len()] == e).unwrap_or(255) as u8
+        (1..255)
+            .find(|&i| {
+                let l = t[i][0] as usize;
+                l <= 15 && l == e.len() && &t[i][1..1 + l] == e
+            })
+            .unwrap_or(255) as u8
     }
     // Per ZONE entries: what a filter on size, mtime or kind can skip.
     sec!(zones, Sec::Zones, Zone, zones_len);
@@ -897,8 +904,11 @@ impl Index {
     fn from_map(map: Mmap) -> Option<Index> {
         let f = fields::<15>(&map, MAGIC)?.map(|v| v as usize);
         let [n, d, u, names_len, event_id, synced_at, blocks, name_shift, ..] = f;
+        if n == 0 || d == 0 || u == 0 || name_shift >= 32 || blocks == 0 {
+            return None;
+        }
         let run_words: [usize; 7] = f[8..].try_into().unwrap();
-        let (off, total) = layout(&section_lens(n, d, u, names_len, blocks, name_shift, run_words));
+        let (off, total) = checked_layout(&checked_section_lens(n, d, u, names_len, blocks, name_shift, run_words)?)?;
         let words = u.div_ceil(64);
         if map.len() < total {
             return None;
@@ -911,7 +921,6 @@ impl Index {
             words,
             bits_len: words * NBITMAPS,
             zones_len: n.div_ceil(ZONE),
-            ext_slots: 256,
             n64: n.div_ceil(64),
             blocks,
             name_shift,
@@ -1000,13 +1009,18 @@ pub(crate) fn fields<const N: usize>(b: &[u8], magic: &[u8; 8]) -> Option<[u64; 
 
 /// Section offsets for these lengths, and the file size.
 pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> ([usize; N], usize) {
+    checked_layout(lens).expect("layout overflow")
+}
+
+/// Checked section offsets for these lengths, and the file size.
+fn checked_layout<const N: usize>(lens: &[usize; N]) -> Option<([usize; N], usize)> {
     let mut off = [0usize; N];
     let mut at = HDR;
     for (k, &l) in lens.iter().enumerate() {
         off[k] = at;
-        at = (at + l + 63) & !63;
+        at = at.checked_add(l)?.checked_add(63)? & !63;
     }
-    (off, at)
+    Some((off, at))
 }
 
 pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -1086,16 +1100,43 @@ impl NameInfo {
 
 /// Section lengths: `blocks` entries in ParentMap, 2^`shift` names per
 /// NameBase entry, `w` words in the `Runs` (see `Index::run_words`).
-#[rustfmt::skip]
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize, blocks: usize, shift: usize, w: [usize; 7]) -> [usize; NSEC] {
+    checked_section_lens(n, d, u, names_len, blocks, shift, w).expect("section_lens overflow")
+}
+
+fn checked_section_lens(n: usize, d: usize, u: usize, names_len: usize, blocks: usize, shift: usize, w: [usize; 7]) -> Option<[usize; NSEC]> {
     let n64 = n.div_ceil(64);
-    let runs = |len: usize, words: usize| (len.div_ceil(64) + 1 + words) * 8 + 8;
-    let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
-    [
-        u.div_ceil(64) * NBITMAPS * 8, (u + 1).div_ceil(1 << shift) * 4, (u + 1) * 2, names_len, bits_len(n, width(u)), bits_len(n, 4),
-        n64 * 8, n64 * 4, bits_len(blocks, width(d)), runs(n, w[0]), runs(n, w[1]), runs(d, w[2]), runs(d, w[3]), runs(d, w[4]),
-        runs(d, w[5]), d, runs(d, w[6]), bits_len(u + 1, width(n + 1)), bits_len(n, width(n)), u, u * 4, u, 256 * 16, z,
-    ]
+    let u1 = u.checked_add(1)?;
+    let n1 = n.checked_add(1)?;
+    let step = 1usize.checked_shl(u32::try_from(shift).ok()?)?;
+    let runs = |len: usize, words: usize| len.div_ceil(64).checked_add(1)?.checked_add(words)?.checked_mul(8)?.checked_add(8);
+    let z = n.div_ceil(ZONE).checked_mul(std::mem::size_of::<Zone>())?;
+    Some([
+        u.div_ceil(64).checked_mul(NBITMAPS)?.checked_mul(8)?,
+        u1.div_ceil(step).checked_mul(4)?,
+        u1.checked_mul(2)?,
+        names_len,
+        checked_bits_len(n, width(u))?,
+        checked_bits_len(n, 4)?,
+        n64.checked_mul(8)?,
+        n64.checked_mul(4)?,
+        checked_bits_len(blocks, width(d))?,
+        runs(n, w[0])?,
+        runs(n, w[1])?,
+        runs(d, w[2])?,
+        runs(d, w[3])?,
+        runs(d, w[4])?,
+        runs(d, w[5])?,
+        d,
+        runs(d, w[6])?,
+        checked_bits_len(u1, width(n1))?,
+        checked_bits_len(n, width(n))?,
+        u,
+        u.checked_mul(4)?,
+        u,
+        EXT_SLOTS * 16,
+        z,
+    ])
 }
 
 /// The first i below `n` where `before(i)` is false (it holds up to some i).
@@ -1144,8 +1185,8 @@ fn read(p: &[u8], b: usize, w: u32) -> u32 {
     ((word(p, b / 8) >> (b % 8)) & ((1 << w) - 1)) as u32
 }
 
-fn bits_len(len: usize, w: u32) -> usize {
-    (len * w as usize).div_ceil(8) + 8
+fn checked_bits_len(len: usize, w: u32) -> Option<usize> {
+    len.checked_mul(w as usize)?.div_ceil(8).checked_add(8)
 }
 
 /// Write `v` into zeroed `out` as `Bits` of width `w`.
@@ -1403,5 +1444,42 @@ mod tests {
         let mut p = Vec::new();
         idx.path(idx.n - 1, &mut p);
         assert_eq!(p, b"/d".repeat(301));
+    }
+
+    fn load_corrupt(name: &str, f: [u64; 15], pad: usize) -> Option<Index> {
+        let path = std::env::temp_dir().join(format!("fsearch-corrupt-{}-{name}.bin", std::process::id()));
+        let mut buf = header(MAGIC, &f);
+        buf.resize(HDR + pad, 0);
+        std::fs::write(&path, &buf).unwrap();
+        let res = Index::load(&path);
+        let _ = std::fs::remove_file(&path);
+        res
+    }
+
+    /// Corrupt or overflowing headers return `None` cleanly instead of panicking or loading.
+    #[test]
+    fn corrupt_header_rejected() {
+        assert!(load_corrupt("zero_n", [0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("shift64", [1, 1, 1, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("shift32", [1, 1, 1, 0, 0, 0, 1, 32, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("max_n", [u64::MAX, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_u", [1, 1, u64::MAX, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_names_len", [1, 1, 1, u64::MAX, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_run_words", [1, 1, 1, 0, 0, 0, 1, 0, u64::MAX, 0, 0, 0, 0, 0, 0], 0).is_none());
+    }
+
+    /// A corrupt `ext_table` length byte (> 15) must not panic in `ext_slot`.
+    #[test]
+    fn corrupt_ext_table_len() {
+        let ls = vec![Listing { id: 0, names: b"a.txt".to_vec(), ents: vec![RawEnt { name_off: 0, name_len: 5, kind: 0, size: 0, mtime: 0, child: NONE }] }];
+        let idx = Index::build(ls, 0, 0, b"/");
+        let path = std::env::temp_dir().join(format!("fsearch-corrupt-ext-{}.bin", std::process::id()));
+        idx.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[idx.off[Sec::Exts as usize] + 16] = 20;
+        std::fs::write(&path, &bytes).unwrap();
+        let bad = Index::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bad.ext_slot(b"01234567890123456789"), 255);
     }
 }
