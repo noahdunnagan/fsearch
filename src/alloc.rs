@@ -19,6 +19,10 @@ pub struct Alloc;
 
 /// Blocks of this size and up come from mmap.
 const BIG: usize = 1 << 20;
+#[cfg(target_arch = "aarch64")]
+const PAGE: usize = 16384;
+#[cfg(not(target_arch = "aarch64"))]
+const PAGE: usize = 4096;
 /// Free lists for 16 B, 32 B, ... 64 KB: list c holds blocks of at least
 /// 16 << c bytes. Requests under 16 bytes are made as 16 (malloc's least
 /// anyway), so any block freed can go on a list.
@@ -151,7 +155,7 @@ fn take(l: Layout) -> Option<*mut u8> {
 
 unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() >= BIG && l.align() <= 16384 {
+        if l.size() >= BIG && l.align() <= PAGE {
             let p =
                 unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
             return if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 };
@@ -161,7 +165,7 @@ unsafe impl GlobalAlloc for Alloc {
 
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         // Fresh anonymous pages are already zero.
-        if l.size() >= BIG && l.align() <= 16384 {
+        if l.size() >= BIG && l.align() <= PAGE {
             return unsafe { self.alloc(l) };
         }
         match take(l) {
@@ -174,7 +178,7 @@ unsafe impl GlobalAlloc for Alloc {
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if l.size() >= BIG && l.align() <= 16384 {
+        if l.size() >= BIG && l.align() <= PAGE {
             unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
             return;
         }
@@ -188,19 +192,19 @@ unsafe impl GlobalAlloc for Alloc {
         // A thread that keeps blocks moves one to grow it: malloc's realloc
         // is slow in its space-efficient mode.
         if l.size() < BIG && new_size < BIG && l.align() <= 16 && FREE.with(|f| unsafe { (*f.get()).on }) {
-            if new_size <= l.size() {
+            if new_size <= l.size() && list(l.size()) < LISTS {
                 return p;
             }
             let q = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, l.align())) };
             if !q.is_null() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(p, q, l.size());
+                    std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
                     self.dealloc(p, l);
                 }
             }
             return q;
         }
-        if (l.size() < BIG && new_size < BIG) || l.align() > 16384 {
+        if (l.size() < BIG && new_size < BIG) || l.align() > PAGE {
             // Malloc's own, which may grow a block in place (one off a list
             // is malloc's too).
             return unsafe { System.realloc(p, small(l), new_size.max(16)) };
@@ -283,5 +287,28 @@ mod tests {
         for (p, size, b) in rx.lock().unwrap().iter() {
             check(p, size, b);
         }
+    }
+
+    #[test]
+    fn shrink_non_list_block_does_not_pin_huge_alloc_on_small_list() {
+        std::thread::spawn(|| {
+            keep_on_this_thread();
+            let big = Layout::from_size_align(256 * 1024, 8).unwrap();
+            let p = unsafe { Alloc.alloc(big) };
+            assert!(!p.is_null());
+            unsafe { p.write_bytes(0xAB, 64) };
+            let q = unsafe { Alloc.realloc(p, big, 32) };
+            assert!(!q.is_null());
+            assert_ne!(q, p, "shrinking non-list block must not keep huge block in place");
+            assert!(unsafe { std::slice::from_raw_parts(q, 32) }.iter().all(|&b| b == 0xAB));
+            let small = Layout::from_size_align(32, 8).unwrap();
+            unsafe { Alloc.dealloc(q, small) };
+            let r = unsafe { Alloc.alloc(small) };
+            assert_ne!(r, p, "32-byte free list must not hold the 256 KiB allocation");
+            unsafe { Alloc.dealloc(r, small) };
+            drain();
+        })
+        .join()
+        .unwrap();
     }
 }
