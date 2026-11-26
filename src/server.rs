@@ -1095,6 +1095,34 @@ mod tests {
         assert_eq!(r, Ok(()));
     }
 
+    /// A daemon whose binary was replaced (a new copy renamed over it, as
+    /// `install` does) is still recognised and stopped.
+    #[test]
+    fn stop_finds_a_daemon_whose_binary_was_replaced() {
+        let dir = test_dir("replaced");
+        let bin = dir.join("fsearch");
+        std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        let lock = locked(&dir);
+        let fd = lock.as_raw_fd();
+        let mut cmd = Command::new(&bin);
+        cmd.args(["serve", "--exact", "server::tests::idle", "--ignored"]).env("FSEARCH_TEST_IDLE", "1").stdout(Stdio::null()).stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || if libc::fcntl(fd, libc::F_SETFD, 0) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+        }
+        let mut d = cmd.spawn().unwrap();
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), d.id().to_string()).unwrap();
+        let new = dir.join("fsearch.new");
+        std::fs::copy(std::env::current_exe().unwrap(), &new).unwrap();
+        std::fs::rename(&new, &bin).unwrap();
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let _ = d.kill();
+        let status = d.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()));
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
     /// A recorded pid that isn't a daemon's (a crashed daemon's, reused by
     /// a client) is never signalled.
     #[test]
