@@ -3551,11 +3551,8 @@ impl<'a> Scan<'a> {
         if !q.kind_ok(k) || self.ranges.is_some_and(|r| !in_ranges(r, i as u32)) {
             return None;
         }
-        if q.size != (0, u64::MAX) {
-            let sz = crate::index::dec_size(idx.size_raw(i));
-            if sz < q.size.0 || sz > q.size.1 {
-                return None;
-            }
+        if q.size != (0, u64::MAX) && !crate::index::bucket_holds(idx.size_raw(i), q.size.0, q.size.1) {
+            return None;
         }
         let mtime = idx.mtime(i);
         if q.mtime != (0, u32::MAX) && (mtime < q.mtime.0 || mtime > q.mtime.1) {
@@ -3611,7 +3608,7 @@ impl<'a> Scan<'a> {
         // are skipped whole.
         let filtered = q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX);
         let zone_ok = |z: &Zone| {
-            crate::index::dec_size(z.max_size) >= q.size.0
+            crate::index::bucket_reaches(z.max_size, q.size.0)
                 && z.max_mtime >= q.mtime.0
                 && z.min_mtime <= q.mtime.1
                 && q.kind.is_none_or(|k| z.kinds & (1 << k) != 0 || (q.apps && z.kinds & (1 << KIND_LINK) != 0))
@@ -4171,6 +4168,21 @@ mod tests {
         assert_eq!(scope("in:~/x", "/h/"), "/h/x");
         assert_eq!(scope("in:~", "/h"), "/h");
         assert_eq!(expand_home("~/x", "/"), "/x");
+    }
+
+    /// Above 2 GiB the stored size is a 2 MiB bucket. A file in the bucket that
+    /// contains 3 GB matches `size:>3gb`, and a bucket that ends below the bound does not.
+    #[test]
+    fn size_bucket_above_2gib() {
+        let ent = |size| RawEnt { name_off: 0, name_len: 3, kind: KIND_FILE, size, mtime: 1, child: NONE };
+        let live = Live::new(Index::build(vec![Listing { id: 0, names: b"big".to_vec(), ents: vec![ent(3_001_000_000)] }], 0, 0, b"/h"));
+        let n = |q: &str| Searcher { live: &live }.search(&Query::parse(q, "/h").unwrap()).len();
+        assert_eq!(n("size:>3gb big"), 1);
+        assert_eq!(n("size:>3011mb big"), 0);
+        let small = Live::new(Index::build(vec![Listing { id: 0, names: b"big".to_vec(), ents: vec![ent(1000)] }], 0, 0, b"/h"));
+        let n = |q: &str| Searcher { live: &small }.search(&Query::parse(q, "/h").unwrap()).len();
+        assert_eq!(n("size:>500b big"), 1);
+        assert_eq!(n("size:>2000b big"), 0);
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.
