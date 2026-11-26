@@ -934,22 +934,33 @@ fn build_batches(shared: &Shared, pool: &rayon::ThreadPool, todo: &content::Docs
     }
 }
 
+/// Save `idx` and record the folders it could not list. A failed save leaves
+/// `skipped` alone: that file describes the index on disk, and the next
+/// start trusts it.
+fn saved_index(idx: Index, dir: &Path) -> Index {
+    let path = dir.join("index.bin");
+    match idx.save(&path) {
+        Ok(()) => {
+            note_skipped(dir);
+            // Re-map from the file so the index is clean, evictable page
+            // cache rather than anonymous memory.
+            Index::load(&path).unwrap_or(idx)
+        }
+        Err(e) => {
+            log(format!("save failed: {e}"));
+            idx
+        }
+    }
+}
+
 fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
     let ls = walk::scan_disk(SCAN_THREADS);
-    let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    let saved = idx.save(&path);
-    if let Err(e) = &saved {
-        log(format!("save failed: {e}"));
-    }
-    note_skipped(&shared.dir);
+    let idx = saved_index(Index::build(ls, event_id, started, shared.home.as_bytes()), &shared.dir);
     log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
     release_memory();
-    // Re-map from the file so the index is clean, evictable page cache
-    // rather than anonymous memory. (After a failed save the file is older.)
-    if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx }
+    idx
 }
 
 unsafe extern "C" {
@@ -969,15 +980,7 @@ fn compact(shared: &Shared) {
         let live = g.as_ref().unwrap();
         (live.to_listings(), live.event_id, live.synced_at)
     };
-    let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    let saved = idx.save(&path);
-    if let Err(e) = &saved {
-        log(format!("save failed: {e}"));
-    }
-    note_skipped(&shared.dir);
-    // (After a failed save the file is older: keep the one just built.)
-    let idx = if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx };
+    let idx = saved_index(Index::build(ls, eid, synced, shared.home.as_bytes()), &shared.dir);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
     // Rare enough to afford the lstats: forget cache dirs whose tag is gone.
@@ -1617,6 +1620,24 @@ mod tests {
         // A smaller base still tolerates a smaller overlay: 1M entries, 125k.
         assert!(!should_compact(125_000, 1_000_000, COMPACT_QUIET, None, false));
         assert!(should_compact(125_001, 1_000_000, COMPACT_QUIET, None, false));
+    }
+
+    /// `skipped` is rewritten only after the index file is replaced.
+    #[test]
+    fn skipped_only_after_a_successful_save() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-skipped-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let _ = saved_index(Index::build(vec![Listing::default()], 1, 0, b"/h"), &d);
+        assert!(d.join(SKIPPED).is_file());
+        std::fs::remove_file(d.join(SKIPPED)).unwrap();
+        // The save fails: a folder holds index.bin's name.
+        std::fs::remove_file(d.join("index.bin")).unwrap();
+        std::fs::create_dir(d.join("index.bin")).unwrap();
+        let _ = saved_index(Index::build(vec![Listing::default()], 1, 0, b"/h"), &d);
+        let wrote = d.join(SKIPPED).exists();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!wrote, "a failed save rewrote skipped");
     }
 
     /// Replay backoff doubles and caps; a relist inside its cooldown tells
