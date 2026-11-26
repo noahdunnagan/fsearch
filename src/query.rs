@@ -597,7 +597,7 @@ impl Query {
                 })
             }
             "in" => {
-                let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
+                let p = expand_home(v, home);
                 self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
             }
             "size" => self.size = range(v, parse_size)?,
@@ -962,6 +962,19 @@ fn parts_match(parts: &[Part], names: &[&[u8]]) -> bool {
         None => names.is_empty(),
         Some((Part::Any, rest)) => (0..=names.len()).any(|k| parts_match(rest, &names[k..])),
         Some((p, rest)) => names.split_first().is_some_and(|(n, more)| p.matches(n) && parts_match(rest, more)),
+    }
+}
+
+/// `~` and `~/...` expand against `home`. `~user` is left as written.
+pub fn expand_home(p: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let home = if home.is_empty() { "/" } else { home };
+    if p == "~" {
+        home.to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        if home == "/" { format!("/{rest}") } else { format!("{home}/{rest}") }
+    } else {
+        p.to_string()
     }
 }
 
@@ -4221,6 +4234,17 @@ mod tests {
         assert_eq!(expand_braces("{src,include/{foo,bar}}").unwrap(), ["src", "include/foo", "include/bar"]);
         let wide = format!("{{{}}}", (0..65).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
         assert!(expand_braces(&wide).is_err());
+    }
+
+    /// `in:~` and `in:~/x` are under home. `in:~alice/x` is not home with `alice/x` glued on.
+    #[test]
+    fn in_tilde_expands_home_only() {
+        let scope = |q: &str, home: &str| String::from_utf8(Query::parse(q, home).unwrap().scope.unwrap()).unwrap();
+        assert_eq!(scope("in:~alice/x", "/h"), "~alice/x");
+        assert_eq!(scope("in:~/x", "/h"), "/h/x");
+        assert_eq!(scope("in:~/x", "/h/"), "/h/x");
+        assert_eq!(scope("in:~", "/h"), "/h");
+        assert_eq!(expand_home("~/x", "/"), "/x");
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.
