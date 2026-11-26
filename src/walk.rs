@@ -259,6 +259,8 @@ pub struct Listing {
 struct Ctx {
     next_id: AtomicU32,
     out: Vec<Mutex<Vec<Listing>>>,
+    /// Ids of the listings that failed (see `scan_failing`).
+    failed: Mutex<Vec<u32>>,
     /// The whole-disk crawl: counts LISTED, yields to searches.
     disk: bool,
 }
@@ -269,27 +271,39 @@ thread_local! {
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
+    scan_with(root, threads, false).0
+}
+
+/// `scan`, and the ids of the folders that could not be opened or listed to
+/// the end: their listings are empty, or partial, for that reason.
+pub fn scan_failing(root: &[u8], threads: usize) -> (Vec<Listing>, Vec<u32>) {
     scan_with(root, threads, false)
 }
 
 /// The first run's crawl of the whole disk (see `LISTED`, `HOLD`).
 pub fn scan_disk(threads: usize) -> Vec<Listing> {
-    scan_with(b"/", threads, true)
+    scan_with(b"/", threads, true).0
 }
 
-fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
+fn scan_with(root: &[u8], threads: usize, disk: bool) -> (Vec<Listing>, Vec<u32>) {
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip or to learn
     // (a CACHEDIR.TAG needs its folder's path).
     let path = (SKIP.get().is_some() || LAZY.get().is_some()).then(|| root.to_vec());
     let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+    let mut failed = Vec::new();
     if fd >= 0 {
         if disk {
             yield_to_searches();
         }
-        list_fd(fd, &mut l);
-        learn_cachedir(path.as_deref(), &l);
+        if list_fd(fd, &mut l) {
+            learn_cachedir(path.as_deref(), &l);
+        } else {
+            failed.push(0);
+        }
+    } else if !blocked(root) {
+        failed.push(0);
     }
     // A folder holding no folder (most new ones) needs no pool: its threads
     // cost ~120 us of CPU a scan, most of what a burst of new folders costs.
@@ -303,17 +317,17 @@ fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
         if disk {
             LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
         }
-        return vec![l];
+        return (vec![l], failed);
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(), disk };
+    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(), failed: Mutex::new(failed), disk };
     pool.scope(|s| descend(s, fd, path, l, &ctx));
     let parts: Vec<Vec<Listing>> = ctx.out.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
     for p in parts {
         out.extend(p);
     }
-    out
+    (out, ctx.failed.into_inner().unwrap())
 }
 
 fn raise_fd_limit() {
@@ -368,14 +382,18 @@ impl Drop for Fd {
 fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
     if fd < 0 {
+        ctx.failed.lock().unwrap().push(id);
         push(l, ctx);
         return;
     }
     if ctx.disk {
         yield_to_searches();
     }
-    list_fd(fd, &mut l);
-    learn_cachedir(path.as_deref(), &l);
+    if list_fd(fd, &mut l) {
+        learn_cachedir(path.as_deref(), &l);
+    } else {
+        ctx.failed.lock().unwrap().push(id);
+    }
     descend(s, fd, path, l, ctx);
 }
 
@@ -461,19 +479,21 @@ fn rd64(b: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// Returns false if the directory could not be opened.
+/// Returns false if the directory could not be opened or listed.
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
     let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
     if fd < 0 {
         return false;
     }
-    list_fd(fd, l);
+    let ok = list_fd(fd, l);
     unsafe { libc::close(fd) };
-    true
+    ok
 }
 
-fn list_fd(fd: i32, l: &mut Listing) {
+/// False when `getattrlistbulk` fails: only 0 is the end of the folder.
+/// What was read before the failure stays in `l`.
+fn list_fd(fd: i32, l: &mut Listing) -> bool {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     al.commonattr =
@@ -484,7 +504,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
         loop {
             let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             if n <= 0 {
-                break;
+                return n == 0;
             }
             // Size the listing exactly: 8M entries' worth of growth slack
             // would be ~150 MB at the scan's peak.
@@ -506,7 +526,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
                 p += len;
             }
         }
-    });
+    })
 }
 
 fn parse_entry(b: &[u8], l: &mut Listing) {
@@ -607,6 +627,13 @@ mod tests {
         // FSEARCH_NO_LAZY: nothing is lazy.
         let s = LazyDirs::build(b"/home/u", true);
         assert!(!s.used() && s.unit(b"/home/u/.cache/x").is_none() && s.unit(b"/a/node_modules/x").is_none());
+    }
+
+    /// `getattrlistbulk` failing is not the end of an empty folder.
+    #[test]
+    fn list_error_is_not_eof() {
+        let mut l = Listing::default();
+        assert!(!list_fd(-1, &mut l) && l.ents.is_empty());
     }
 
     /// A scan over a temp tree: CACHEDIR.TAG and node_modules children
