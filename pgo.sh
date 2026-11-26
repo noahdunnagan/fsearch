@@ -13,8 +13,10 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/snap"
 cp -c "$data/index.bin" "$tmp/snap/" 2>/dev/null || cp "$data/index.bin" "$tmp/snap/"
 cp -cR "$data/content" "$tmp/snap/" 2>/dev/null || cp -R "$data/content" "$tmp/snap/"
-RUSTFLAGS="-Cprofile-generate=$tmp/prof" cargo build --release --example rig --target-dir "$tmp/target"
+ARCH_FLAGS=""
+[ "$(uname -m)" = "arm64" ] && ARCH_FLAGS="-C target-cpu=native"
+RUSTFLAGS="${ARCH_FLAGS:+$ARCH_FLAGS }-Cprofile-generate=$tmp/prof" cargo build --release --example rig --target-dir "$tmp/target"
 "$tmp/target/release/examples/rig" gen "$tmp/snap" "$tmp/corpus.json"
 "$tmp/target/release/examples/rig" run "$tmp/snap" "$tmp/corpus.json" "$tmp/out.json" >/dev/null
 "$profdata" merge -o "$tmp/fsearch.profdata" "$tmp/prof"
-RUSTFLAGS="-Cprofile-use=$tmp/fsearch.profdata" cargo build --release
+RUSTFLAGS="${ARCH_FLAGS:+$ARCH_FLAGS }-Cprofile-use=$tmp/fsearch.profdata" cargo build --release

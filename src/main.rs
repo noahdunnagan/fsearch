@@ -41,31 +41,77 @@ unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Cmd {
+    Help,
+    Serve,
+    Stdio,
+    Mcp,
+    Status,
+    Version,
+    Bench(String),
+    Install { login: bool },
+    Uninstall,
+    Search { query: String, json: bool },
+}
+
+fn dispatch(args: &[String]) -> Cmd {
+    // `--json` may come anywhere, so take it out before picking the command.
+    let json = args.iter().any(|a| a == "--json");
+    let strs: Vec<&str> = args.iter().map(String::as_str).filter(|&a| a != "--json").collect();
+    match strs.as_slice() {
+        [] | ["-h" | "--help", ..] => Cmd::Help,
+        ["serve"] => Cmd::Serve,
+        ["stdio"] => Cmd::Stdio,
+        ["mcp"] => Cmd::Mcp,
+        ["status"] => Cmd::Status,
+        ["version" | "--version"] => Cmd::Version,
+        ["bench", rest @ ..] => Cmd::Bench(rest.join(" ")),
+        ["install"] => Cmd::Install { login: false },
+        ["install", "--login"] => Cmd::Install { login: true },
+        ["uninstall"] => Cmd::Uninstall,
+        _ => Cmd::Search { query: strs.join(" "), json },
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
     unsafe { setiopolicy_np(3, 0, 1) };
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        None | Some("-h" | "--help") => eprintln!("{USAGE}"),
-        Some("serve") => {
+    match dispatch(&args) {
+        Cmd::Help => eprintln!("{USAGE}"),
+        Cmd::Serve => {
             space_efficient();
             server::serve(data_dir(), home())
         }
-        Some("stdio") => stdio(),
-        Some("mcp") => mcp::run(data_dir()),
-        Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
-        Some("version" | "--version") => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
-        Some("bench") => bench(&args[1..].join(" ")),
-        Some("install") => install(args.iter().any(|a| a == "--login")),
-        Some("uninstall") => uninstall(),
-        Some(_) => {
-            let json = args.iter().any(|a| a == "--json");
-            let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
+        Cmd::Stdio => stdio(),
+        Cmd::Mcp => mcp::run(data_dir()),
+        Cmd::Status => print_one(&serde_json::json!({"op": "status"}), true),
+        Cmd::Version => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
+        Cmd::Bench(q) => bench(&q),
+        Cmd::Install { login } => install(login),
+        Cmd::Uninstall => uninstall(),
+        Cmd::Search { query, json } => {
             // The folder `git:` filters and globs are about, unless `in:` says.
             let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-            print_one(&serde_json::json!({"q": q.join(" "), "cwd": cwd}), json);
+            print_one(&serde_json::json!({"q": query, "cwd": cwd}), json);
         }
     }
 }
@@ -88,11 +134,11 @@ fn space_efficient() {
 
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    s.write_all(format!("{req}\n").as_bytes()).unwrap();
+    s.write_all(format!("{req}\n").as_bytes()).unwrap_or_else(|e| die(&format!("daemon error: {e}")));
     // One request only: the daemon needn't keep the cores warm for a next one.
     let _ = s.shutdown(std::net::Shutdown::Write);
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).unwrap();
+    BufReader::new(&s).read_line(&mut line).unwrap_or_else(|e| die(&format!("daemon error: {e}")));
     if raw {
         print!("{line}");
         return;
@@ -163,7 +209,7 @@ fn bench(qs: &str) {
                 })
                 .collect();
         };
-        let r = if q.scope.as_ref().is_none_or(|s| fsearch::content::in_scope(s, home.as_bytes())) {
+        let r = if q.scope.as_ref().is_none_or(|s| fsearch::content::in_scope(s, home.as_bytes()) && c.holds(s)) {
             pool.install(|| c.search(g, &q))
         } else {
             let paths = pool.install(|| fsearch::content::scan_paths(&live, q.clone_for_scan()));
@@ -225,28 +271,29 @@ fn install(login: bool) {
         return;
     }
     let log = data_dir().join("daemon.log");
+    let bin_xml = xml_escape(&bin.display().to_string());
+    let log_xml = xml_escape(&log.display().to_string());
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
+  <key>ProgramArguments</key><array><string>{bin_xml}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{}</string>
-  <key>StandardErrorPath</key><string>{}</string>
+  <key>StandardOutPath</key><string>{log_xml}</string>
+  <key>StandardErrorPath</key><string>{log_xml}</string>
 </dict>
 </plist>
-"#,
-        bin.display(),
-        log.display(),
-        log.display()
+"#
     );
-    std::fs::write(plist_path(), plist).unwrap();
+    let plist_file = plist_path();
+    std::fs::create_dir_all(plist_file.parent().unwrap()).unwrap();
+    std::fs::write(&plist_file, plist).unwrap();
     // bootout returns before the old job is fully gone; bootstrap fails
     // until it is.
-    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
+    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_file.to_str().unwrap()]);
     let retry = || {
         std::thread::sleep(std::time::Duration::from_millis(100));
         false
@@ -266,4 +313,50 @@ fn uninstall() {
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    #[test]
+    fn xml_escape_escapes_special_chars() {
+        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(xml_escape("/Users/alice/Library/Application Support/FSearch"), "/Users/alice/Library/Application Support/FSearch");
+    }
+
+    #[test]
+    fn dispatch_zero_arg_subcommands_require_exact_arity() {
+        assert_eq!(dispatch(&s(&[])), Cmd::Help);
+        assert_eq!(dispatch(&s(&["-h"])), Cmd::Help);
+        assert_eq!(dispatch(&s(&["--help", "extra"])), Cmd::Help);
+        assert_eq!(dispatch(&s(&["serve"])), Cmd::Serve);
+        assert_eq!(dispatch(&s(&["stdio"])), Cmd::Stdio);
+        assert_eq!(dispatch(&s(&["mcp"])), Cmd::Mcp);
+        assert_eq!(dispatch(&s(&["status"])), Cmd::Status);
+        assert_eq!(dispatch(&s(&["version"])), Cmd::Version);
+        assert_eq!(dispatch(&s(&["--version"])), Cmd::Version);
+        assert_eq!(dispatch(&s(&["uninstall"])), Cmd::Uninstall);
+        assert_eq!(dispatch(&s(&["install"])), Cmd::Install { login: false });
+        assert_eq!(dispatch(&s(&["install", "--login"])), Cmd::Install { login: true });
+        assert_eq!(dispatch(&s(&["bench", "foo", "bar"])), Cmd::Bench("foo bar".into()));
+
+        // Multi-word queries starting with subcommand names must search, not run the subcommand.
+        assert_eq!(dispatch(&s(&["status", "foo"])), Cmd::Search { query: "status foo".into(), json: false });
+        assert_eq!(dispatch(&s(&["version", "check"])), Cmd::Search { query: "version check".into(), json: false });
+        assert_eq!(dispatch(&s(&["serve", "http"])), Cmd::Search { query: "serve http".into(), json: false });
+        assert_eq!(dispatch(&s(&["install", "script"])), Cmd::Search { query: "install script".into(), json: false });
+        assert_eq!(dispatch(&s(&["foo", "--json"])), Cmd::Search { query: "foo".into(), json: true });
+    }
+
+    #[test]
+    fn dispatch_takes_json_flag_anywhere() {
+        assert_eq!(dispatch(&s(&["status", "--json"])), Cmd::Status);
+        assert_eq!(dispatch(&s(&["--json", "status"])), Cmd::Status);
+        assert_eq!(dispatch(&s(&["--json", "foo", "bar"])), Cmd::Search { query: "foo bar".into(), json: true });
+    }
 }
