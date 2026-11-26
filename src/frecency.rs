@@ -34,6 +34,7 @@ pub struct Frecency {
     /// Path → (score at `last`, `last` in seconds).
     map: Mutex<HashMap<Vec<u8>, (f32, u32)>>,
     saving: AtomicBool,
+    dirty: AtomicBool,
 }
 
 fn decayed((score, last): (f32, u32), now: u32) -> f32 {
@@ -47,13 +48,14 @@ impl Frecency {
         for line in text.split(|&b| b == b'\n') {
             let mut f = line.splitn(3, |&b| b == b'\t');
             let (Some(s), Some(t), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
-            let num = |b: &[u8]| -> Option<f64> { std::str::from_utf8(b).ok()?.parse().ok() };
+            let score = std::str::from_utf8(s).ok().and_then(|s| s.parse::<f32>().ok()).filter(|s| s.is_finite() && *s >= 0.0);
+            let ts = std::str::from_utf8(t).ok().and_then(|t| t.parse::<u32>().ok());
             let p = if p.first() == Some(&b'"') { serde_json::from_slice::<String>(p).ok().map(String::into_bytes) } else { Some(p.to_vec()) };
-            if let (Some(s), Some(t), Some(p)) = (num(s), num(t), p) {
-                map.insert(p, (s as f32, t as u32));
+            if let (Some(s), Some(t), Some(p)) = (score, ts, p) {
+                map.insert(p, (s, t));
             }
         }
-        Arc::new(Frecency { file, map: Mutex::new(map), saving: AtomicBool::new(false) })
+        Arc::new(Frecency { file, map: Mutex::new(map), saving: AtomicBool::new(false), dirty: AtomicBool::new(false) })
     }
 
     /// Record an open of `path`; its new score.
@@ -91,36 +93,46 @@ impl Frecency {
     /// Write the file a couple of seconds after a change (one write for a
     /// burst of opens), dropping what decayed away.
     fn save_soon(self: &Arc<Self>) {
-        if self.saving.swap(true, Ordering::Relaxed) {
+        self.dirty.store(true, Ordering::SeqCst);
+        if self.saving.swap(true, Ordering::SeqCst) {
             return;
         }
         let me = self.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            me.saving.store(false, Ordering::Relaxed);
-            let now = fsearch::query::now_secs();
-            let mut out = Vec::new();
-            {
-                let mut map = me.map.lock().unwrap();
-                map.retain(|_, e| decayed(*e, now) >= FLOOR);
-                for (p, &(s, t)) in map.iter() {
-                    // One line each: a path with a newline (or starting
-                    // with a quote) as a JSON string, if it's UTF-8.
-                    let quoted = (p.contains(&b'\n') || p.first() == Some(&b'"'))
-                        .then(|| std::str::from_utf8(p).ok().map(|p| serde_json::json!(p).to_string()));
-                    let p = match &quoted {
-                        None => &p[..],
-                        Some(Some(q)) => q.as_bytes(),
-                        Some(None) => continue,
-                    };
-                    out.extend_from_slice(format!("{s:.3}\t{t}\t").as_bytes());
-                    out.extend_from_slice(p);
-                    out.push(b'\n');
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                me.dirty.store(false, Ordering::SeqCst);
+                let now = fsearch::query::now_secs();
+                let mut out = Vec::new();
+                {
+                    let mut map = me.map.lock().unwrap();
+                    map.retain(|_, e| decayed(*e, now) >= FLOOR);
+                    for (p, &(s, t)) in map.iter() {
+                        // One line each: a path with a newline (or starting
+                        // with a quote) as a JSON string, if it's UTF-8.
+                        let quoted = (p.contains(&b'\n') || p.first() == Some(&b'"'))
+                            .then(|| std::str::from_utf8(p).ok().map(|p| serde_json::json!(p).to_string()));
+                        let p = match &quoted {
+                            None => &p[..],
+                            Some(Some(q)) => q.as_bytes(),
+                            Some(None) => continue,
+                        };
+                        out.extend_from_slice(format!("{s:.3}\t{t}\t").as_bytes());
+                        out.extend_from_slice(p);
+                        out.push(b'\n');
+                    }
                 }
-            }
-            let tmp = me.file.with_extension("new");
-            if let Err(e) = std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &me.file)) {
-                eprintln!("{now} frecency: save failed: {e}");
+                let tmp = me.file.with_extension("new");
+                if let Err(e) = std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &me.file)) {
+                    eprintln!("{now} frecency: save failed: {e}");
+                }
+                if me.dirty.load(Ordering::SeqCst) {
+                    continue;
+                }
+                me.saving.store(false, Ordering::SeqCst);
+                if !me.dirty.load(Ordering::SeqCst) || me.saving.swap(true, Ordering::SeqCst) {
+                    break;
+                }
             }
         });
     }
@@ -148,6 +160,57 @@ mod tests {
         let g = Frecency::load(dir.join("frecency"));
         assert!((g.score(b"/p/src/a.rs", t + 1000) - 2.0).abs() < 0.01, "saved");
         assert!((g.score(b"/p/a\nb.rs", t) - 1.0).abs() < 0.01, "a newline in a name is kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_ignores_invalid_scores_and_timestamps() {
+        let dir = std::env::temp_dir().join(format!("fsearch-frecency-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("frecency");
+        let now = fsearch::query::now_secs();
+        let content = format!(
+            "NaN\t{now}\t/p/nan.rs\n\
+             inf\t{now}\t/p/inf.rs\n\
+             -inf\t{now}\t/p/neginf.rs\n\
+             1e40\t{now}\t/p/overflow.rs\n\
+             -1.0\t{now}\t/p/neg.rs\n\
+             1.5\t{now}.5\t/p/float_ts.rs\n\
+             1.5\t-10\t/p/neg_ts.rs\n\
+             1.5\tbad\t/p/bad_ts.rs\n\
+             2.0\t{now}\t/p/valid.rs\n"
+        );
+        std::fs::write(&file, content).unwrap();
+        let f = Frecency::load(file);
+        let entries = f.under(b"/p", now);
+        assert_eq!(entries.len(), 1, "expected only valid entry, got {entries:?}");
+        assert_eq!(entries[0].0, b"/p/valid.rs");
+        assert!((entries[0].1 - 2.0).abs() < 0.01);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_open_bursts_persist_cleanly() {
+        let dir = std::env::temp_dir().join(format!("fsearch-frecency-burst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("frecency");
+        let f = Frecency::load(file.clone());
+        let now = fsearch::query::now_secs();
+        std::thread::scope(|s| {
+            for tid in 0..8usize {
+                let f = &f;
+                s.spawn(move || {
+                    for i in 0..32usize {
+                        let p = format!("/p/t{tid}/f{i}.rs");
+                        f.open(p.as_bytes(), now);
+                    }
+                });
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(!file.with_extension("new").exists(), "temp file should not remain after save");
+        let reloaded = Frecency::load(file);
+        assert_eq!(reloaded.under(b"/p", now).len(), 8 * 32);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
