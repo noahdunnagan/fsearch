@@ -1425,6 +1425,8 @@ fn skipped(rel: &[u8], name: &[u8], holds: impl Fn(&[u8]) -> bool) -> bool {
 /// holds that folder (then its ignore files decide, see `Scope`)? Cheap: it
 /// touches the disk only to look for a repo above a skipped folder.
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
+    // "/" is the whole disk. An empty prefix keeps the path's own leading slash as the one separator.
+    let home = if home == b"/" { &b""[..] } else { home };
     let Some(rest) = path.strip_prefix(home) else { return false };
     if !rest.is_empty() && rest[0] != b'/' {
         return false;
@@ -4869,6 +4871,16 @@ mod tests {
         for above in [&b"/"[..], b"/Users"] {
             assert_eq!(synced(above), [(b"/Users/me".to_vec(), true)]);
         }
+    }
+
+    /// `HOME=/` is the whole disk. A path under it is in the content index.
+    #[test]
+    fn root_home_includes_absolute_paths() {
+        assert!(in_scope(b"/", b"/"));
+        assert!(in_scope(b"/Users/me/a.txt", b"/"));
+        assert!(!in_scope(b"relative", b"/"));
+        assert!(in_scope(b"/Users/me/a.txt", b"/Users/me"));
+        assert!(!in_scope(b"/Users/me2/a.txt", b"/Users/me"));
     }
 
     /// A file that could not be read is left out. One that was read and is not text stays.
