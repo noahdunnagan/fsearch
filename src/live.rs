@@ -92,6 +92,8 @@ pub struct Fetched {
     attrs: Option<OEnt>,
     listing: Option<Listing>,
     scans: HashMap<Vec<u8>, Vec<Listing>>,
+    /// Ids of the listings in a recursive update's scan that failed.
+    failed: Vec<u32>,
 }
 
 pub enum Applied {
@@ -216,7 +218,7 @@ impl Live {
     /// caller does this under a read lock and searches keep answering.
     pub fn fetch(&self, path: &[u8], recursive: bool) -> Fetched {
         let p = normalize(path);
-        let mut f = Fetched { path: p, recursive, blocked: false, attrs: None, listing: None, scans: HashMap::new() };
+        let mut f = Fetched { path: p, recursive, blocked: false, attrs: None, listing: None, scans: HashMap::new(), failed: Vec::new() };
         // Not even an lstat inside folders we may not touch.
         if walk::blocked(&f.path) {
             f.blocked = true;
@@ -230,7 +232,9 @@ impl Live {
                     a.kind |= FLAG_MOUNT;
                 }
                 if f.attrs.is_some_and(|a| a.kind & 3 == KIND_DIR && a.kind & FLAG_MOUNT == 0) {
-                    f.scans.insert(f.path.clone(), walk::scan(&f.path, 4));
+                    let (ls, failed) = walk::scan_failing(&f.path, 4);
+                    f.scans.insert(f.path.clone(), ls);
+                    f.failed = failed;
                 }
             }
             return f;
@@ -292,11 +296,17 @@ impl Live {
             if p == b"/" {
                 return Applied::Rebuild;
             }
-            self.remove_path(&p);
-            if let Some(attrs) = f.attrs {
-                let scan = f.scans.remove(&p);
-                self.add_new(p, attrs, scan);
+            let Some(attrs) = f.attrs else {
+                self.remove_path(&p);
+                return Applied::Done;
+            };
+            // A folder that is there but could not be listed keeps what the index holds in it.
+            if f.failed.contains(&0) && self.indexed_dir(&p) {
+                return Applied::Done;
             }
+            let scan = f.scans.remove(&p).map(|ls| self.graft_failed(ls, &f.failed, &p));
+            self.remove_path(&p);
+            self.add_new(p, attrs, scan);
             return Applied::Done;
         }
         let Some(listing) = f.listing else {
@@ -366,6 +376,68 @@ impl Live {
             }
         }
         Applied::Done
+    }
+
+    fn indexed_dir(&self, p: &[u8]) -> bool {
+        self.base_alive(p).is_some_and(|e| self.base.kind(e as usize) & 3 == KIND_DIR) || self.over.get(p).is_some_and(|o| o.kind & 3 == KIND_DIR)
+    }
+
+    /// `scan` (of `root`) with the listings `failed` replaced by what the
+    /// index holds there, so removing `root` and adding `scan` keeps it.
+    fn graft_failed(&self, scan: Vec<Listing>, failed: &[u32], root: &[u8]) -> Vec<Listing> {
+        if failed.is_empty() {
+            return scan;
+        }
+        let mut path_of = HashMap::from([(0, root.to_vec())]);
+        for_each_path(&scan, root, |p, r| {
+            if r.child != NONE {
+                path_of.insert(r.child, p);
+            }
+        });
+        let mut next = scan.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        let mut grafted = HashMap::new();
+        let mut extra = Vec::new();
+        for id in failed {
+            let Some(path) = path_of.get(id) else { continue };
+            let mut ls = self.listings_from_index(path, *id, &mut next).into_iter();
+            grafted.insert(*id, ls.next().unwrap());
+            extra.extend(ls);
+        }
+        let mut out: Vec<Listing> = scan.into_iter().map(|l| grafted.remove(&l.id).unwrap_or(l)).collect();
+        out.extend(extra);
+        out
+    }
+
+    /// What the index holds under `path`, as listings for `add_new`: `path`'s
+    /// own first, with id `id`; its folders' take ids from `next`.
+    fn listings_from_index(&self, path: &[u8], id: u32, next: &mut u32) -> Vec<Listing> {
+        let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+        let mut more = Vec::new();
+        for (name, c) in self.current_children(path) {
+            let (kind, size, mtime, descend) = match c {
+                Some(c) => {
+                    let c = c as usize;
+                    (self.base.kind(c), self.base.size_of(c), self.base.mtime(c), self.base.dir_of(c as u32).is_some())
+                }
+                None => {
+                    let o = self.over[&join(path, &name)];
+                    (o.kind, o.size, o.mtime, o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0)
+                }
+            };
+            let child = if descend {
+                let c = *next;
+                *next += 1;
+                more.extend(self.listings_from_index(&join(path, &name), c, next));
+                c
+            } else {
+                NONE
+            };
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child });
+            l.names.extend_from_slice(&name);
+        }
+        let mut out = vec![l];
+        out.extend(more);
+        out
     }
 
     /// Add an entry and, if it is a directory, its subtree (`scan`, read
@@ -534,6 +606,7 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// An index of `root` with real paths: the folders above it as one-entry
     /// listings, then a scan of it.
@@ -593,5 +666,57 @@ mod tests {
         let f = live.fetch(b"/dev", true);
         assert!(f.scans.is_empty() && f.attrs.is_some_and(|a| a.kind & FLAG_MOUNT != 0));
         assert!(!walk::is_mount(b"/usr/bin") && !walk::is_mount(b"/Users") && walk::is_mount(b"/System/Volumes/Data"));
+    }
+    /// A folder under the ignored target/ (not the temp dir, a lazy prefix)
+    /// holding sub/file, and an index of it.
+    fn sub_with_file(name: &str) -> (std::path::PathBuf, Vec<u8>, Live) {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/file"), "x").unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let live = Live::new(base_for(&root));
+        (d, root, live)
+    }
+
+    fn alive(live: &Live, p: &[u8]) -> bool {
+        live.base_alive(p).is_some() || live.over.contains_key(p)
+    }
+
+    /// `apply_dir` with sub unreadable (mode 000).
+    fn apply_unreadable(live: &mut Live, d: &std::path::Path, path: &[u8]) {
+        let sub = d.join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        live.apply_dir(path, true);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A recursive rescan of a folder that is there but cannot be listed
+    /// keeps its indexed children; one that lists empty does not.
+    #[test]
+    fn unreadable_directory_keeps_its_children() {
+        let (d, root, mut live) = sub_with_file("live-unreadable");
+        let (sub, file) = (join(&root, b"sub"), join(&root, b"sub/file"));
+        assert!(alive(&live, &file));
+        apply_unreadable(&mut live, &d, &sub);
+        assert!(alive(&live, &file), "an open failure dropped indexed children");
+        std::fs::remove_file(d.join("sub/file")).unwrap();
+        live.apply_dir(&sub, true);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!alive(&live, &file), "a folder listed empty kept a deleted child");
+    }
+
+    /// The same for a folder that cannot be listed below the one rescanned.
+    #[test]
+    fn unreadable_nested_directory_keeps_its_children() {
+        let (d, root, mut live) = sub_with_file("live-nested");
+        let file = join(&root, b"sub/file");
+        apply_unreadable(&mut live, &d, &root);
+        assert!(alive(&live, &file), "a nested open failure dropped indexed children");
+        std::fs::remove_file(d.join("sub/file")).unwrap();
+        live.apply_dir(&root, true);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!alive(&live, &file), "a listed folder kept a deleted child");
     }
 }
