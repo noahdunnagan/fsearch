@@ -18,16 +18,25 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
+/// The socket lock, or None if another daemon holds it. The login agent's
+/// daemon stops a stray one (say, started on first use mid-install) and
+/// takes over: if it gave way, launchd (KeepAlive) would respawn it forever.
+fn take_socket_lock(dir: &Path, as_agent: bool) -> Option<std::fs::File> {
+    // Opened without truncating: a loser must not wipe the owner's pid.
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")).ok()?;
+    (try_lock(&lock) || (as_agent && stop(dir).is_ok() && try_lock(&lock))).then_some(lock)
+}
+
 pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
-    // Opened without truncating: a loser must not wipe the owner's pid.
-    let Ok(mut lock) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")) else { return };
-    if !try_lock(&lock) {
+    // launchd names the job it started in XPC_SERVICE_NAME: the login agent's.
+    let as_agent = std::env::var("XPC_SERVICE_NAME").is_ok_and(|n| n == super::LABEL);
+    let Some(mut lock) = take_socket_lock(&dir, as_agent) else {
         eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
         return;
-    }
+    };
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
     let git = Git::new(&home);
@@ -1102,6 +1111,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(r.is_err_and(|e| e.contains("not an fsearch daemon")));
         assert!(alive, "signalled a process that isn't a daemon");
+    }
+
+    /// A stray daemon holds the lock: a plain daemon gives way, but the
+    /// login agent's stops it and takes over.
+    #[test]
+    fn the_agents_daemon_takes_over_from_a_stray() {
+        let dir = test_dir("agent");
+        let lock = locked(&dir);
+        let mut stray = fake(true, Some(&lock));
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), stray.id().to_string()).unwrap();
+        assert!(take_socket_lock(&dir, false).is_none());
+        assert!(stray.try_wait().unwrap().is_none(), "a plain daemon leaves it running");
+        let got = take_socket_lock(&dir, true);
+        let _ = stray.kill();
+        let status = stray.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_some(), "the agent's daemon takes the lock");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     #[test]
