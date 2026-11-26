@@ -1001,9 +1001,16 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                     ahead.push_back((docs.items[j].2 > 0).then(|| open_ahead(docs.path(j))).flatten());
                 }
                 buf.clear();
-                let text = (ahead.pop_front().flatten())
-                    .and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_REPO_FILE && is_text(&buf));
+                // A file that could not be opened or read is omitted. A buffer that was
+                // read and is not text stays, so the next sync does not retry it.
+                // An empty file (never opened, above) stays a document holding nothing.
+                let opened = ahead.pop_front().flatten();
+                let text = if docs.items[i].2 == 0 {
+                    false
+                } else {
+                    let Some(n) = opened.and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok()) else { continue };
+                    n as u64 <= MAX_REPO_FILE && is_text(&buf)
+                };
                 let holds = if !text {
                     Holds::Nothing
                 } else {
@@ -1418,6 +1425,8 @@ fn skipped(rel: &[u8], name: &[u8], holds: impl Fn(&[u8]) -> bool) -> bool {
 /// holds that folder (then its ignore files decide, see `Scope`)? Cheap: it
 /// touches the disk only to look for a repo above a skipped folder.
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
+    // "/" is the whole disk. An empty prefix keeps the path's own leading slash as the one separator.
+    let home = if home == b"/" { &b""[..] } else { home };
     let Some(rest) = path.strip_prefix(home) else { return false };
     if !rest.is_empty() && rest[0] != b'/' {
         return false;
@@ -3463,7 +3472,10 @@ impl Grep {
         let q = match self.mode {
             // Exactly the docs that define it (plus rare hash collisions,
             // which reading the file weeds out).
-            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => return TQ::Tri(symbol_key(self.pattern.as_bytes())),
+            // An insensitive symbol search folds through the trigram index. Smart case stays on the exact name.
+            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) && !self.case_insensitive => {
+                return TQ::Tri(symbol_key(self.pattern.as_bytes()));
+            }
             GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
             GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
         };
@@ -4864,6 +4876,76 @@ mod tests {
         }
     }
 
+    /// `HOME=/` is the whole disk. A path under it is in the content index.
+    #[test]
+    fn root_home_includes_absolute_paths() {
+        assert!(in_scope(b"/", b"/"));
+        assert!(in_scope(b"/Users/me/a.txt", b"/"));
+        assert!(!in_scope(b"relative", b"/"));
+        assert!(in_scope(b"/Users/me/a.txt", b"/Users/me"));
+        assert!(!in_scope(b"/Users/me2/a.txt", b"/Users/me"));
+    }
+
+    /// `case: insensitive` symbol search finds `fn Foo`. Smart case stays exact.
+    #[test]
+    fn symbol_search_folds_when_asked() {
+        let d = std::env::temp_dir().join(format!("fsearch-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let p = d.join("a.rs");
+        let text = "fn Foo() {}\n";
+        std::fs::write(&p, text).unwrap();
+        let mut docs = Docs::default();
+        docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+        let mut c = Content::open(d.join("idx"));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        let found = |mut g: Grep| {
+            g.budget = None;
+            !c.search(&g, &Query::parse("", "/h").unwrap()).files.is_empty()
+        };
+        let hit = (
+            found(Grep::with_case("foo", GrepMode::Symbol, Case::Insensitive).unwrap()),
+            found(Grep::new("foo", GrepMode::Symbol).unwrap()),
+            found(Grep::with_case("Foo", GrepMode::Symbol, Case::Sensitive).unwrap()),
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(hit, (true, false, true));
+    }
+
+    /// A file that could not be read is left out. One that was read and is not text stays.
+    #[test]
+    fn failed_read_is_not_stored() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fsearch-readfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let good = d.join("good.txt");
+        let bad = d.join("bad.txt");
+        let bin = d.join("bin.dat");
+        std::fs::write(&good, "hello\n").unwrap();
+        std::fs::write(&bad, "secret\n").unwrap();
+        std::fs::write(&bin, b"a\0b\0c").unwrap();
+        let mut perms = std::fs::metadata(&bad).unwrap().permissions();
+        perms.set_mode(0o0);
+        std::fs::set_permissions(&bad, perms.clone()).unwrap();
+        let mut docs = Docs::default();
+        docs.push(good.as_os_str().as_bytes(), 6, 1);
+        docs.push(bad.as_os_str().as_bytes(), 7, 1);
+        docs.push(bin.as_os_str().as_bytes(), 5, 1);
+        docs.sort();
+        let seg = build_segment(&d, 1, &docs, 0..docs.len()).unwrap();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&bad, perms).unwrap();
+        let paths: Vec<Vec<u8>> = seg.all_paths().collect();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(paths.iter().any(|p| p.ends_with(b"good.txt")));
+        assert!(paths.iter().any(|p| p.ends_with(b"bin.dat")), "a read that is not text was dropped");
+        assert!(paths.iter().all(|p| !p.ends_with(b"bad.txt")), "a failed read was stored");
+    }
+
     /// Bits past the last doc in a `.dead` file (it is only ever written
     /// whole, so a corrupt one) are not counted as dead docs.
     #[test]
@@ -4871,6 +4953,9 @@ mod tests {
         let d = std::env::temp_dir().join(format!("fsearch-dead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // `/var` is a symlink. The indexer opens with O_NOFOLLOW_ANY, so the
+        // path has to be canonical or the file is omitted as unreadable.
+        let d = d.canonicalize().unwrap();
         let p = d.join("a.txt");
         std::fs::write(&p, "text\n").unwrap();
         let mut docs = Docs::default();
