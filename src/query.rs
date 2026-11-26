@@ -493,7 +493,7 @@ impl Query {
     /// Add a glob or folder word (see `Glob`); `*.rs` and `*.{c,h}` are
     /// extensions.
     pub fn push_glob(&mut self, w: &str, negate: bool) -> Result<(), String> {
-        let alts = expand_braces(w);
+        let alts = expand_braces(w)?;
         let ext = |a: &String| {
             a.strip_prefix("*.").filter(|e| !e.is_empty() && !e.contains(['*', '?', '[', '/', '.'])).map(|e| e.to_ascii_lowercase().into_bytes())
         };
@@ -942,12 +942,69 @@ fn parts_match(parts: &[Part], names: &[&[u8]]) -> bool {
 }
 
 /// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`.
-fn expand_braces(w: &str) -> Vec<String> {
-    let Some(open) = w.find('{') else { return vec![w.to_string()] };
-    let Some(len) = w[open..].find('}') else { return vec![w.to_string()] };
-    let (head, body, tail) = (&w[..open], &w[open + 1..open + len], &w[open + len + 1..]);
-    let tails = expand_braces(tail);
-    body.split(',').flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+/// Groups nest. More than 64 alternatives is an error. An unclosed `{` is left as written.
+fn expand_braces(w: &str) -> Result<Vec<String>, String> {
+    fn matching(w: &str, open: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for (i, b) in w.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn parts(body: &str) -> Vec<&str> {
+        let (mut out, mut start, mut depth) = (Vec::new(), 0, 0i32);
+        for (i, b) in body.as_bytes().iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(&body[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&body[start..]);
+        out
+    }
+    fn walk(w: &str, out: &mut Vec<String>) -> Result<(), String> {
+        let Some(open) = w.find('{') else {
+            out.push(w.to_string());
+            return Ok(());
+        };
+        let Some(close) = matching(w, open) else {
+            out.push(w.to_string());
+            return Ok(());
+        };
+        let (head, body, tail) = (&w[..open], &w[open + 1..close], &w[close + 1..]);
+        let mut tails = Vec::new();
+        walk(tail, &mut tails)?;
+        for alt in parts(body) {
+            let mut expanded = Vec::new();
+            walk(alt, &mut expanded)?;
+            for e in expanded {
+                for t in &tails {
+                    if out.len() >= 64 {
+                        return Err("too many alternatives".into());
+                    }
+                    out.push(format!("{head}{e}{t}"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(w, &mut out)?;
+    Ok(out)
 }
 
 /// An `Alt` from one brace-free alternative.
@@ -4080,6 +4137,16 @@ mod tests {
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// `{a,{b,c}}` is a, b and c. A flat group still expands, and 65 alternatives is an error.
+    #[test]
+    fn nested_braces_expand() {
+        assert_eq!(expand_braces("{a,{b,c}}").unwrap(), ["a", "b", "c"]);
+        assert_eq!(expand_braces("*.{c,h}").unwrap(), ["*.c", "*.h"]);
+        assert_eq!(expand_braces("{src,include/{foo,bar}}").unwrap(), ["src", "include/foo", "include/bar"]);
+        let wide = format!("{{{}}}", (0..65).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        assert!(expand_braces(&wide).is_err());
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.
