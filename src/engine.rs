@@ -650,6 +650,7 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
 const SKIPPED: &str = "skipped";
 
 fn note_skipped(dir: &Path) {
+    walk::prune_denied();
     let denied = walk::DENIED.lock().unwrap();
     // (A folder listed early is listed again by the whole-disk crawl.)
     let mut all: Vec<&Vec<u8>> = walk::SKIP.get().into_iter().flatten().chain(denied.iter()).collect();
@@ -660,7 +661,7 @@ fn note_skipped(dir: &Path) {
         out.extend_from_slice(p);
         out.push(b'\n');
     }
-    if let Err(e) = std::fs::write(dir.join(SKIPPED), out) {
+    if let Err(e) = crate::index::write_atomic(&dir.join(SKIPPED), &[&out]) {
         log(format!("save failed: {e}"));
     }
 }
@@ -683,7 +684,7 @@ fn rescan_unskipped(shared: &Shared) {
         if readable {
             now.push(fsevents::Event { path, flags: MUST_SCAN_SUBDIRS, id: 0, stream: 0 });
         } else {
-            walk::DENIED.lock().unwrap().push(path);
+            walk::DENIED.lock().unwrap().insert(path);
         }
     }
     if now.is_empty() {
@@ -1506,6 +1507,53 @@ mod tests {
         let e = Engine::start(Options { dir: d.clone(), home: home.into(), skip }).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         e
+    }
+
+    /// `skipped` forgets refused folders that are gone or no longer
+    /// folders. One that merely reads now stays: the next start rescans it.
+    #[test]
+    fn skipped_forgets_gone_folders() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-skipped-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("open")).unwrap();
+        std::fs::write(d.join("file"), b"x").unwrap();
+        let path = |n: &str| d.join(n).as_os_str().as_bytes().to_vec();
+        let (open, gone, file) = (path("open"), path("gone"), path("file"));
+        walk::DENIED.lock().unwrap().extend([open.clone(), gone.clone(), file.clone()]);
+        note_skipped(&d);
+        let saved = std::fs::read(d.join(SKIPPED)).unwrap();
+        let lines: Vec<&[u8]> = saved.split(|&b| b == b'\n').collect();
+        let kept = {
+            let mut denied = walk::DENIED.lock().unwrap();
+            let kept = [&open, &gone, &file].map(|p| denied.contains(p));
+            denied.retain(|p| !p.starts_with(d.as_os_str().as_bytes()));
+            kept
+        };
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(kept, [true, false, false]);
+        assert!(lines.contains(&open.as_slice()));
+        assert!(!lines.contains(&gone.as_slice()) && !lines.contains(&file.as_slice()));
+    }
+
+    /// `skipped` is replaced whole: a write that fails midway leaves the
+    /// old list, not a truncated one.
+    #[test]
+    fn skipped_is_replaced_whole() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-skipped-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // The temp file can't be created: a folder holds its name.
+        std::fs::create_dir_all(d.join("skipped.tmp")).unwrap();
+        std::fs::write(d.join(SKIPPED), b"/old\n").unwrap();
+        note_skipped(&d);
+        let failed = std::fs::read(d.join(SKIPPED)).unwrap();
+        std::fs::remove_dir(d.join("skipped.tmp")).unwrap();
+        note_skipped(&d);
+        let written = std::fs::read(d.join(SKIPPED)).unwrap();
+        let tmp_left = d.join("skipped.tmp").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(failed, b"/old\n");
+        assert_ne!(written, b"/old\n");
+        assert!(!tmp_left);
     }
 
     /// Home written with a trailing slash is home: content scope and the
