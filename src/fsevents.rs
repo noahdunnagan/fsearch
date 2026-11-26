@@ -107,6 +107,7 @@ pub fn current_id() -> u64 {
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
     fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, relative_priority: i32) -> *const c_void;
+    fn dispatch_release(obj: *mut c_void);
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
@@ -134,8 +135,11 @@ extern "C" fn release_info(info: *const c_void) {
     }
 }
 
-/// A running stream; dropping it stops it.
-pub struct Stream(*mut c_void);
+/// A running stream and its queue; dropping it stops it and frees both.
+pub struct Stream {
+    s: *mut c_void,
+    q: *mut c_void,
+}
 
 // The stream is only started and stopped, never shared mid-call.
 unsafe impl Send for Stream {}
@@ -145,9 +149,12 @@ impl Drop for Stream {
     fn drop(&mut self) {
         unsafe {
             let a = api();
-            (a.stop)(self.0);
-            (a.invalidate)(self.0);
-            (a.release)(self.0);
+            (a.stop)(self.s);
+            (a.invalidate)(self.s);
+            (a.release)(self.s);
+            // Ours from dispatch_queue_create: invalidated, the stream no
+            // longer uses it (followers re-watch on every owner save).
+            dispatch_release(self.q);
         }
     }
 }
@@ -180,6 +187,6 @@ pub fn watch(since: u64, tx: Sender<Vec<Event>>, stream: u32, ours: &[u8]) -> St
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
         (a.start)(s);
-        Stream(s)
+        Stream { s, q }
     }
 }

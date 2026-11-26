@@ -18,16 +18,25 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("fsearch.sock")
 }
 
+/// The socket lock, or None if another daemon holds it. The login agent's
+/// daemon stops a stray one (say, started on first use mid-install) and
+/// takes over: if it gave way, launchd (KeepAlive) would respawn it forever.
+fn take_socket_lock(dir: &Path, as_agent: bool) -> Option<std::fs::File> {
+    // Opened without truncating: a loser must not wipe the owner's pid.
+    let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")).ok()?;
+    (try_lock(&lock) || (as_agent && stop(dir).is_ok() && try_lock(&lock))).then_some(lock)
+}
+
 pub fn serve(dir: PathBuf, home: String) {
     // One daemon per socket. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
-    // Opened without truncating: a loser must not wipe the owner's pid.
-    let Ok(mut lock) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")) else { return };
-    if !try_lock(&lock) {
+    // launchd names the job it started in XPC_SERVICE_NAME: the login agent's.
+    let as_agent = std::env::var("XPC_SERVICE_NAME").is_ok_and(|n| n == super::LABEL);
+    let Some(mut lock) = take_socket_lock(&dir, as_agent) else {
         eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
         return;
-    }
+    };
     // The pid lets `stop` find us.
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
     let git = Git::new(&home);
@@ -73,25 +82,65 @@ fn try_lock(f: &std::fs::File) -> bool {
 /// let go of the socket lock. One already on its way out (say, after a
 /// launchd bootout) is just waited for.
 pub fn stop(dir: &Path) -> Result<(), String> {
+    stop_within(dir, Duration::from_secs(30))
+}
+
+fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
     let path = dir.join("socket.lock");
     let Ok(lock) = std::fs::File::open(&path) else { return Ok(()) };
-    let mut killed = None;
-    for _ in 0..300 {
+    let me = std::process::id() as i32;
+    let (mut killed, mut named) = (None, None);
+    for _ in 0..timeout.as_millis().div_ceil(100) {
         if try_lock(&lock) {
             return Ok(());
         }
-        if killed.is_none() {
-            killed = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
-            if let Some(pid) = killed {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-            }
+        // Read every pass: a client may have started a new daemon once the
+        // old one let go (mid-install), and a pid that isn't a daemon's (a
+        // crashed one's, reused) is never signalled.
+        let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
+        named = pid.or(named);
+        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_daemon(p)) {
+            unsafe { libc::kill(p, libc::SIGTERM) };
+            killed = Some(p);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(match killed {
-        Some(pid) => format!("daemon {pid} did not exit"),
-        None => "a daemon is running but did not record its pid; stop it by hand".into(),
+    Err(match (killed, named) {
+        (Some(pid), _) => format!("daemon {pid} did not exit"),
+        (None, Some(p)) => format!("socket.lock names pid {p}, not an fsearch daemon; stop the daemon holding the lock by hand"),
+        (None, None) => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
+}
+
+/// Whether `pid` is a daemon: an fsearch binary (or its test harness) run
+/// as `serve`.
+fn is_daemon(pid: i32) -> bool {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let exe = n > 0 && Path::new(std::ffi::OsStr::from_bytes(&buf[..n as usize])).file_name().is_some_and(|f| f.as_bytes().starts_with(b"fsearch"));
+    exe && args(pid).get(1).is_some_and(|a| a == b"serve")
+}
+
+/// `pid`'s argv, empty if it can't be read (KERN_PROCARGS2: argc, the exec
+/// path and its NUL padding, then argv).
+fn args(pid: i32) -> Vec<Vec<u8>> {
+    let mut max: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 2, (&raw mut max).cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; max.max(0) as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 || len < 4 {
+        return Vec::new();
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let rest = &buf[4..len];
+    let path_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let start = rest[path_end..].iter().position(|&b| b != 0).map_or(rest.len(), |i| path_end + i);
+    rest[start..].split(|&b| b == 0).take(argc).map(<[u8]>::to_vec).collect()
 }
 
 /// How long the cores stay clocked up after an answer to a client that is
@@ -956,6 +1005,160 @@ pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Child, Command, Stdio};
+
+    /// A folder for one test's lock file, next to the test binary (in the
+    /// target dir, never the real data dir).
+    fn test_dir(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let d = exe.parent().unwrap().join(format!("server-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// What `fake` runs: idle until signalled.
+    #[test]
+    #[ignore]
+    fn idle() {
+        if std::env::var_os("FSEARCH_TEST_IDLE").is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// This test binary (named fsearch-…), idling; as `<exe> serve …` when
+    /// `serve`, like a daemon. It shares `lock` (and its flock) if given.
+    fn fake(serve: bool, lock: Option<&std::fs::File>) -> Child {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        if serve {
+            // An extra test filter that matches nothing.
+            cmd.arg("serve");
+        }
+        cmd.args(["--exact", "server::tests::idle", "--ignored"]).env("FSEARCH_TEST_IDLE", "1").stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(fd) = lock.map(AsRawFd::as_raw_fd) {
+            unsafe {
+                cmd.pre_exec(move || if libc::fcntl(fd, libc::F_SETFD, 0) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+            }
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// socket.lock in `dir`, locked as a daemon's.
+    fn locked(dir: &Path) -> std::fs::File {
+        let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join("socket.lock")).unwrap();
+        assert!(try_lock(&f));
+        f
+    }
+
+    #[test]
+    fn only_fsearch_serve_is_a_daemon() {
+        // Our own argv, read back; we're no daemon (unless run as `… serve`).
+        let ours: Vec<Vec<u8>> = std::env::args_os().map(|a| a.as_bytes().to_vec()).collect();
+        let me = std::process::id() as i32;
+        assert_eq!(args(me), ours);
+        assert_eq!(is_daemon(me), ours.get(1).is_some_and(|a| a == b"serve"));
+
+        let (mut d, mut client) = (fake(true, None), fake(false, None));
+        // Not fsearch, though `serve` is its first argument.
+        let dir = test_dir("is-daemon");
+        std::fs::write(dir.join("serve"), "sleep 60\nexit 0\n").unwrap();
+        let mut sh = Command::new("/bin/sh").arg("serve").current_dir(&dir).spawn().unwrap();
+        let got = (is_daemon(d.id() as i32), is_daemon(client.id() as i32), is_daemon(sh.id() as i32));
+        for c in [&mut d, &mut client, &mut sh] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, (true, false, false));
+    }
+
+    /// The daemon stop signalled exits, and a client starts a new one that
+    /// takes the lock (mid-install): stop signals that one too.
+    #[test]
+    fn stop_signals_a_daemon_started_after_the_first() {
+        let dir = test_dir("restarted");
+        let lock = locked(&dir);
+        // Both share the locked file: it stays locked until both are gone.
+        let (mut a, mut b) = (fake(true, Some(&lock)), fake(true, Some(&lock)));
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), a.id().to_string()).unwrap();
+        let d = dir.clone();
+        let stopping = std::thread::spawn(move || stop_within(&d, Duration::from_secs(20)));
+        assert_eq!(a.wait().unwrap().signal(), Some(libc::SIGTERM));
+        std::fs::write(dir.join("socket.lock"), b.id().to_string()).unwrap();
+        let r = stopping.join().unwrap();
+        let _ = b.kill();
+        assert_eq!(b.wait().unwrap().signal(), Some(libc::SIGTERM));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()));
+    }
+
+    /// A daemon whose binary was replaced (a new copy renamed over it, as
+    /// `install` does) is still recognised and stopped.
+    #[test]
+    fn stop_finds_a_daemon_whose_binary_was_replaced() {
+        let dir = test_dir("replaced");
+        let bin = dir.join("fsearch");
+        std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        let lock = locked(&dir);
+        let fd = lock.as_raw_fd();
+        let mut cmd = Command::new(&bin);
+        cmd.args(["serve", "--exact", "server::tests::idle", "--ignored"]).env("FSEARCH_TEST_IDLE", "1").stdout(Stdio::null()).stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || if libc::fcntl(fd, libc::F_SETFD, 0) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+        }
+        let mut d = cmd.spawn().unwrap();
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), d.id().to_string()).unwrap();
+        let new = dir.join("fsearch.new");
+        std::fs::copy(std::env::current_exe().unwrap(), &new).unwrap();
+        std::fs::rename(&new, &bin).unwrap();
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let _ = d.kill();
+        let status = d.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()));
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// A recorded pid that isn't a daemon's (a crashed daemon's, reused by
+    /// a client) is never signalled.
+    #[test]
+    fn stop_never_signals_a_non_daemon() {
+        let dir = test_dir("non-daemon");
+        let lock = locked(&dir);
+        let mut client = fake(false, Some(&lock));
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), client.id().to_string()).unwrap();
+        let r = stop_within(&dir, Duration::from_millis(300));
+        let alive = client.try_wait().unwrap().is_none();
+        let _ = client.kill();
+        let _ = client.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(r.is_err_and(|e| e.contains("not an fsearch daemon")));
+        assert!(alive, "signalled a process that isn't a daemon");
+    }
+
+    /// A stray daemon holds the lock: a plain daemon gives way, but the
+    /// login agent's stops it and takes over.
+    #[test]
+    fn the_agents_daemon_takes_over_from_a_stray() {
+        let dir = test_dir("agent");
+        let lock = locked(&dir);
+        let mut stray = fake(true, Some(&lock));
+        drop(lock);
+        std::fs::write(dir.join("socket.lock"), stray.id().to_string()).unwrap();
+        assert!(take_socket_lock(&dir, false).is_none());
+        assert!(stray.try_wait().unwrap().is_none(), "a plain daemon leaves it running");
+        let got = take_socket_lock(&dir, true);
+        let _ = stray.kill();
+        let status = stray.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_some(), "the agent's daemon takes the lock");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
 
     #[test]
     fn near() {
