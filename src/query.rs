@@ -379,6 +379,7 @@ pub struct Query {
     pub kind: Option<u8>,
     /// `type:app`: a folder kind also takes symlinks, since the system apps
     /// in /Applications link into the cryptex (/Applications/Safari.app).
+    /// Among other types, no kind: only .app names need be folders or links.
     pub apps: bool,
     pub exts: Vec<Vec<u8>>,
     /// Extensions a match may not have (`!*.md`).
@@ -586,6 +587,8 @@ impl Query {
                 }
             }
             "kind" => {
+                // The last kind-setting filter wins: no app widening after it.
+                self.apps = false;
                 self.kind = Some(match v {
                     "file" | "f" => KIND_FILE,
                     "dir" | "folder" | "d" => KIND_DIR,
@@ -601,7 +604,12 @@ impl Query {
             "mtime" | "modified" => {
                 // mtime:<7d means "modified within the last 7 days".
                 let now = now_secs();
-                let (lo, hi) = range(v, parse_age)?;
+                let (lo, mut hi) = range(v, parse_age)?;
+                // A bare age is that whole unit, like `find -mtime`:
+                // mtime:3d is 3 to 4 days ago, mtime:2h 2 to 3 hours.
+                if !v.starts_with(['<', '>']) && !v.contains("..") {
+                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).map_or(0, |u| u - 1));
+                }
                 self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo.min(now as u64) as u32));
                 if hi == u64::MAX {
                     self.mtime.0 = 0;
@@ -614,6 +622,11 @@ impl Query {
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
             _ => return Ok(false),
+        }
+        // `type:app` among other extensions (type:app,image) is a union:
+        // no kind, but .app names must still be folders or links.
+        if self.apps && self.exts.iter().any(|e| e != b"app") {
+            self.kind = None;
         }
         Ok(true)
     }
@@ -630,6 +643,16 @@ impl Query {
             // (Links stand in for app folders only, not under a later kind:file.)
             Some(want) => kind & 3 == want || (self.apps && want == KIND_DIR && kind & 3 == KIND_LINK),
         }
+    }
+
+    /// `type:app` with other types and no kind: is `name` no app, or a
+    /// folder or link?
+    #[inline(always)]
+    fn app_kind_ok(&self, name: &[u8], kind: u8) -> bool {
+        !self.apps
+            || self.kind.is_some()
+            || matches!(kind & 3, KIND_DIR | KIND_LINK)
+            || !(name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".app"))
     }
 
     /// Does a full path pass every filter and token? Returns the match score.
@@ -659,6 +682,7 @@ impl Query {
         let name = &path[cut + 1..];
         if name.is_empty()
             || !self.kind_ok(kind)
+            || !self.app_kind_ok(name, kind)
             || (!self.exts.is_empty() && !ext_ok(name, &self.exts))
             || size < self.size.0
             || size > self.size.1
@@ -1058,11 +1082,18 @@ fn split_words(s: &str) -> Vec<String> {
 
 fn range(v: &str, p: fn(&str) -> Option<u64>) -> Result<(u64, u64), String> {
     let bad = || format!("bad range {v}");
-    if let Some(r) = v.strip_prefix(">=").or(v.strip_prefix('>')) {
+    if let Some(r) = v.strip_prefix(">=") {
         return Ok((p(r).ok_or_else(bad)?, u64::MAX));
     }
-    if let Some(r) = v.strip_prefix("<=").or(v.strip_prefix('<')) {
+    // Strict bounds past the ends are empty, (1, 0).
+    if let Some(r) = v.strip_prefix('>') {
+        return Ok(p(r).ok_or_else(bad)?.checked_add(1).map_or((1, 0), |lo| (lo, u64::MAX)));
+    }
+    if let Some(r) = v.strip_prefix("<=") {
         return Ok((0, p(r).ok_or_else(bad)?));
+    }
+    if let Some(r) = v.strip_prefix('<') {
+        return Ok(p(r).ok_or_else(bad)?.checked_sub(1).map_or((1, 0), |hi| (0, hi)));
     }
     if let Some((a, b)) = v.split_once("..") {
         return Ok((p(a).ok_or_else(bad)?, p(b).ok_or_else(bad)?));
@@ -3478,7 +3509,7 @@ impl<'a> Scan<'a> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind(i);
-        if !q.kind_ok(k) || self.ranges.is_some_and(|r| !in_ranges(r, i as u32)) {
+        if !q.kind_ok(k) || (q.apps && !q.app_kind_ok(&idx.name(i), k)) || self.ranges.is_some_and(|r| !in_ranges(r, i as u32)) {
             return None;
         }
         if q.size != (0, u64::MAX) {
@@ -4072,6 +4103,49 @@ mod tests {
         let l = live();
         let q = Query::parse(&format!("limit:{} ab", usize::MAX), "/h").unwrap();
         assert_eq!(Searcher { live: &l }.search(&q).len(), 2);
+    }
+
+    /// Strict bounds leave the bound out: size:>5 and size:<5 don't take 5.
+    #[test]
+    fn strict_bounds() {
+        let size = |s| Query::parse(s, "/h").unwrap().size;
+        assert_eq!((size("size:>5"), size("size:<5")), ((6, u64::MAX), (0, 4)));
+        assert_eq!((size("size:>=5"), size("size:<=5")), ((5, u64::MAX), (0, 5)));
+        assert_eq!((range(">1h", parse_age), range("<1h", parse_age)), (Ok((3601, u64::MAX)), Ok((0, 3599))));
+        assert!(Query::parse("size:<0", "/h").unwrap().match_path(b"/f", KIND_FILE, 0, 1).is_none());
+    }
+
+    /// A bare age is that whole unit, like `find -mtime`: 3d is 3 to 4 days ago.
+    #[test]
+    fn bare_mtime_is_whole_unit() {
+        let now = now_secs();
+        let (lo, hi) = Query::parse("mtime:3d", "/h").unwrap().mtime;
+        assert!(hi.abs_diff(now - 3 * 86400) <= 1 && hi - lo == 86400 - 1, "{lo} {hi}");
+        let (lo, hi) = Query::parse("mtime:2h", "/h").unwrap().mtime;
+        assert_eq!(hi - lo, 3600 - 1);
+    }
+
+    /// The last kind-setting filter wins: kind:dir after type:app means
+    /// folders, not the links that stand in for apps.
+    #[test]
+    fn kind_after_app_drops_links() {
+        assert!(!Query::parse("type:app kind:dir", "/h").unwrap().kind_ok(KIND_LINK));
+        assert!(Query::parse("kind:dir type:app", "/h").unwrap().kind_ok(KIND_LINK));
+    }
+
+    /// type:app,image is apps or images: .app folders and links, image files.
+    #[test]
+    fn app_among_types() {
+        let ent = |off, kind| RawEnt { name_off: off, name_len: 5, kind, size: 1, mtime: 1, child: NONE };
+        let ents = vec![ent(0, KIND_DIR), ent(5, KIND_LINK), ent(10, KIND_FILE), ent(15, KIND_FILE)];
+        let l = Live::new(Index::build(vec![Listing { id: 0, names: b"a.appb.appc.pngd.app".to_vec(), ents }], 0, 0, b"/h"));
+        for s in ["type:app,image", "type:image type:app"] {
+            let q = Query::parse(s, "/h").unwrap();
+            let mut got: Vec<Vec<u8>> = Searcher { live: &l }.search(&q).iter().map(|h| l.base.name(h.idx as usize).to_vec()).collect();
+            got.sort();
+            assert_eq!(got, [&b"a.app"[..], b"b.app", b"c.png"], "{s}");
+            assert!(q.match_path(b"/c.png", KIND_FILE, 1, 1).is_some() && q.match_path(b"/d.app", KIND_FILE, 1, 1).is_none(), "{s}");
+        }
     }
 
     /// An age past what a u32 of seconds holds (136 years) is older than
