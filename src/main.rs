@@ -56,7 +56,9 @@ enum Cmd {
 }
 
 fn dispatch(args: &[String]) -> Cmd {
-    let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `--json` may come anywhere, so take it out before picking the command.
+    let json = args.iter().any(|a| a == "--json");
+    let strs: Vec<&str> = args.iter().map(String::as_str).filter(|&a| a != "--json").collect();
     match strs.as_slice() {
         [] | ["-h" | "--help", ..] => Cmd::Help,
         ["serve"] => Cmd::Serve,
@@ -68,11 +70,7 @@ fn dispatch(args: &[String]) -> Cmd {
         ["install"] => Cmd::Install { login: false },
         ["install", "--login"] => Cmd::Install { login: true },
         ["uninstall"] => Cmd::Uninstall,
-        _ => {
-            let json = strs.contains(&"--json");
-            let q: Vec<&str> = strs.into_iter().filter(|&a| a != "--json").collect();
-            Cmd::Search { query: q.join(" "), json }
-        }
+        _ => Cmd::Search { query: strs.join(" "), json },
     }
 }
 
@@ -353,5 +351,12 @@ mod tests {
         assert_eq!(dispatch(&s(&["serve", "http"])), Cmd::Search { query: "serve http".into(), json: false });
         assert_eq!(dispatch(&s(&["install", "script"])), Cmd::Search { query: "install script".into(), json: false });
         assert_eq!(dispatch(&s(&["foo", "--json"])), Cmd::Search { query: "foo".into(), json: true });
+    }
+
+    #[test]
+    fn dispatch_takes_json_flag_anywhere() {
+        assert_eq!(dispatch(&s(&["status", "--json"])), Cmd::Status);
+        assert_eq!(dispatch(&s(&["--json", "status"])), Cmd::Status);
+        assert_eq!(dispatch(&s(&["--json", "foo", "bar"])), Cmd::Search { query: "foo bar".into(), json: true });
     }
 }
