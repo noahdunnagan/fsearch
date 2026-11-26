@@ -1001,9 +1001,16 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                     ahead.push_back((docs.items[j].2 > 0).then(|| open_ahead(docs.path(j))).flatten());
                 }
                 buf.clear();
-                let text = (ahead.pop_front().flatten())
-                    .and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_REPO_FILE && is_text(&buf));
+                // A file that could not be opened or read is omitted. A buffer that was
+                // read and is not text stays, so the next sync does not retry it.
+                // An empty file (never opened, above) stays a document holding nothing.
+                let opened = ahead.pop_front().flatten();
+                let text = if docs.items[i].2 == 0 {
+                    false
+                } else {
+                    let Some(n) = opened.and_then(|f| f.take(MAX_REPO_FILE + 1).read_to_end(&mut buf).ok()) else { continue };
+                    n as u64 <= MAX_REPO_FILE && is_text(&buf)
+                };
                 let holds = if !text {
                     Holds::Nothing
                 } else {
@@ -4864,6 +4871,38 @@ mod tests {
         }
     }
 
+    /// A file that could not be read is left out. One that was read and is not text stays.
+    #[test]
+    fn failed_read_is_not_stored() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("fsearch-readfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let good = d.join("good.txt");
+        let bad = d.join("bad.txt");
+        let bin = d.join("bin.dat");
+        std::fs::write(&good, "hello\n").unwrap();
+        std::fs::write(&bad, "secret\n").unwrap();
+        std::fs::write(&bin, b"a\0b\0c").unwrap();
+        let mut perms = std::fs::metadata(&bad).unwrap().permissions();
+        perms.set_mode(0o0);
+        std::fs::set_permissions(&bad, perms.clone()).unwrap();
+        let mut docs = Docs::default();
+        docs.push(good.as_os_str().as_bytes(), 6, 1);
+        docs.push(bad.as_os_str().as_bytes(), 7, 1);
+        docs.push(bin.as_os_str().as_bytes(), 5, 1);
+        docs.sort();
+        let seg = build_segment(&d, 1, &docs, 0..docs.len()).unwrap();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&bad, perms).unwrap();
+        let paths: Vec<Vec<u8>> = seg.all_paths().collect();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(paths.iter().any(|p| p.ends_with(b"good.txt")));
+        assert!(paths.iter().any(|p| p.ends_with(b"bin.dat")), "a read that is not text was dropped");
+        assert!(paths.iter().all(|p| !p.ends_with(b"bad.txt")), "a failed read was stored");
+    }
+
     /// Bits past the last doc in a `.dead` file (it is only ever written
     /// whole, so a corrupt one) are not counted as dead docs.
     #[test]
@@ -4871,6 +4910,9 @@ mod tests {
         let d = std::env::temp_dir().join(format!("fsearch-dead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // `/var` is a symlink. The indexer opens with O_NOFOLLOW_ANY, so the
+        // path has to be canonical or the file is omitted as unreadable.
+        let d = d.canonicalize().unwrap();
         let p = d.join("a.txt");
         std::fs::write(&p, "text\n").unwrap();
         let mut docs = Docs::default();
