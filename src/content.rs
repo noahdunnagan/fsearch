@@ -3472,7 +3472,10 @@ impl Grep {
         let q = match self.mode {
             // Exactly the docs that define it (plus rare hash collisions,
             // which reading the file weeds out).
-            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => return TQ::Tri(symbol_key(self.pattern.as_bytes())),
+            // An insensitive symbol search folds through the trigram index. Smart case stays on the exact name.
+            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) && !self.case_insensitive => {
+                return TQ::Tri(symbol_key(self.pattern.as_bytes()));
+            }
             GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
             GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
         };
@@ -4881,6 +4884,34 @@ mod tests {
         assert!(!in_scope(b"relative", b"/"));
         assert!(in_scope(b"/Users/me/a.txt", b"/Users/me"));
         assert!(!in_scope(b"/Users/me2/a.txt", b"/Users/me"));
+    }
+
+    /// `case: insensitive` symbol search finds `fn Foo`. Smart case stays exact.
+    #[test]
+    fn symbol_search_folds_when_asked() {
+        let d = std::env::temp_dir().join(format!("fsearch-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let p = d.join("a.rs");
+        let text = "fn Foo() {}\n";
+        std::fs::write(&p, text).unwrap();
+        let mut docs = Docs::default();
+        docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+        let mut c = Content::open(d.join("idx"));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        let found = |mut g: Grep| {
+            g.budget = None;
+            !c.search(&g, &Query::parse("", "/h").unwrap()).files.is_empty()
+        };
+        let hit = (
+            found(Grep::with_case("foo", GrepMode::Symbol, Case::Insensitive).unwrap()),
+            found(Grep::new("foo", GrepMode::Symbol).unwrap()),
+            found(Grep::with_case("Foo", GrepMode::Symbol, Case::Sensitive).unwrap()),
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(hit, (true, false, true));
     }
 
     /// A file that could not be read is left out. One that was read and is not text stays.
