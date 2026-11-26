@@ -104,6 +104,9 @@ pub struct Snap {
     /// Its config names programs git would run (see `Git::trusted`): no
     /// status is read.
     untrusted: bool,
+    /// Folders ("" the root) holding a `.gitignore` above an ignored entry:
+    /// only deleting one of those can un-ignore anything.
+    ignores: HashSet<Box<[u8]>>,
 }
 
 impl Snap {
@@ -435,7 +438,9 @@ impl Git {
             s.untrusted = true;
             return Some(s);
         }
-        for (path, bits) in parse(&self.run(&r.root, &status_args(), &[])?) {
+        let found = parse(&self.run(&r.root, &status_args(), &[])?);
+        note_ignores(&mut s, &r.root, &found);
+        for (path, bits) in found {
             insert(&mut s, path, bits);
         }
         s.head = self.head(&r.root);
@@ -475,11 +480,10 @@ impl Git {
                 *rec = true;
             }
             let gi = [&r.root[..], b"/", d, if d.is_empty() { b"" } else { b"/" }, b".gitignore"].concat();
+            // A deleted one re-decides only if it ignored something.
             let recheck = match std::fs::metadata(OsStr::from_bytes(&gi)) {
                 Ok(m) => m.modified().is_ok_and(|m| m.elapsed().is_ok_and(|e| e < Duration::from_secs(5))),
-                Err(_) => s.dirs.iter().chain(s.files.iter()).any(|(p, &b)| {
-                    b & IGNORED != 0 && (d.is_empty() || p.as_ref() == d.as_slice() || (p.starts_with(d) && p.get(d.len()) == Some(&b'/')))
-                }),
+                Err(_) => s.ignores.remove(d.as_slice()),
             };
             *rec |= recheck;
         }
@@ -552,6 +556,7 @@ impl Git {
                 && !dirs.contains_key(p.as_ref())
                 && !restaged.iter().any(|r| r == p.as_ref() || (r.starts_with(p.as_ref()) && r.get(p.len()) == Some(&b'/')))
         });
+        note_ignores(&mut s, &r.root, &found);
         for (path, bits) in found {
             insert(&mut s, path, bits);
         }
@@ -626,6 +631,26 @@ impl Git {
 
 fn status_args() -> [&'static str; 6] {
     ["status", "--porcelain=v2", "-z", "--ignored=traditional", "--untracked-files=normal", "--ignore-submodules=all"]
+}
+
+/// Record the folders above `found`'s ignored entries that hold a `.gitignore`
+/// (see `Snap::ignores`). One stat per folder not yet seen.
+fn note_ignores(s: &mut Snap, root: &[u8], found: &[(Vec<u8>, u8)]) {
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    for (path, _) in found.iter().filter(|(_, b)| b & IGNORED != 0) {
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        let ends = std::iter::once(0).chain(path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(i, _)| i));
+        for end in ends {
+            let d = &path[..end];
+            if !seen.insert(d) || s.ignores.contains(d) {
+                continue;
+            }
+            let gi = [root, b"/", d, if d.is_empty() { b"" } else { b"/" }, b".gitignore"].concat();
+            if std::fs::metadata(OsStr::from_bytes(&gi)).is_ok_and(|m| m.is_file()) {
+                s.ignores.insert(d.into());
+            }
+        }
+    }
 }
 
 fn insert(s: &mut Snap, path: Vec<u8>, bits: u8) {
@@ -767,12 +792,7 @@ mod tests {
     }
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new(git_bin().expect("git binary"))
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = std::process::Command::new(git_bin().expect("git binary")).arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     }
 
@@ -835,6 +855,48 @@ mod tests {
         let snap3 = g.update(&r, &snap2, HashMap::from([(b"sub".to_vec(), false)]), false).unwrap();
         assert_eq!(snap3.status(b"sub/deep/ign/f.txt"), UNTRACKED);
         assert_eq!(snap3.status(b"sub/deep/x.log"), UNTRACKED);
+    }
+
+    /// Only folders whose `.gitignore` ignores something are tracked (so an
+    /// event at a root without one is not a full re-read); one added later is
+    /// tracked once it ignores something, and deleting it re-evaluates its folder.
+    #[test]
+    fn gitignore_folders_are_tracked() {
+        let tmp = TempDir::new("gitignore-track");
+        let root = &tmp.0;
+        run_git(root, &["init"]);
+        std::fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
+        std::fs::create_dir_all(root.join("a/deep")).unwrap();
+        std::fs::create_dir_all(root.join("sub/ign")).unwrap();
+        std::fs::write(root.join("a/deep/x.log"), b"log").unwrap();
+        std::fs::write(root.join("a/deep/t.txt"), b"t").unwrap();
+        std::fs::write(root.join("sub/.gitignore"), b"ign/\n").unwrap();
+        std::fs::write(root.join("sub/ign/f.txt"), b"f").unwrap();
+
+        let g = Git::new("/nonexistent");
+        let r = g.add(root.as_os_str().as_bytes());
+        let old = g.read_all(&r).unwrap();
+        let set = |s: &Snap| {
+            let mut v: Vec<Vec<u8>> = s.ignores.iter().map(|d| d.to_vec()).collect();
+            v.sort();
+            v
+        };
+        // `a` and `a/deep` hold ignored entries but no `.gitignore`.
+        assert_eq!(set(&old), vec![b"".to_vec(), b"sub".to_vec()]);
+
+        // A `.gitignore` added in `a` is tracked once it ignores something...
+        std::fs::write(root.join("a/.gitignore"), b"*.tmp\n").unwrap();
+        std::fs::write(root.join("a/deep/z.tmp"), b"z").unwrap();
+        let snap = g.update(&r, &old, HashMap::from([(b"a".to_vec(), false), (b"a/deep".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap.status(b"a/deep/z.tmp"), IGNORED);
+        assert_eq!(set(&snap), vec![b"".to_vec(), b"a".to_vec(), b"sub".to_vec()]);
+
+        // ...and deleting it re-evaluates `a` recursively.
+        std::fs::remove_file(root.join("a/.gitignore")).unwrap();
+        let snap = g.update(&r, &snap, HashMap::from([(b"a".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap.status(b"a/deep/z.tmp"), UNTRACKED);
+        assert_eq!(snap.status(b"a/deep/x.log"), IGNORED);
+        assert_eq!(set(&snap), vec![b"".to_vec(), b"sub".to_vec()]);
     }
 
     #[test]
