@@ -349,27 +349,16 @@ impl Engine {
                 // (A save from before event ids were stamped: from now.)
                 let from = if owner && from == 0 { fsevents::current_id() } else { from };
                 let head = fsevents::current_id();
-                if from > head {
-                    // fseventsd re-based its journal below the saved id (the
-                    // saved id then sits in the future): replaying from it
-                    // delivers nothing. Treat it as lost history: relist the
-                    // folders that changed since the save, and re-stamp the
-                    // id so the next save is replayable again.
-                    log(format!("saved event id {from} is ahead of the journal head {head}: relisting folders changed since the save"));
-                    s.watch(head);
-                    s.live.write().unwrap().as_mut().unwrap().event_id = head;
-                    relist_changed(&s, "event ids re-based below our save", 0);
-                } else {
-                    s.watch(from);
-                }
+                start_replay(&s, owner, from, head, |id| s.watch(id));
+            } else if let Some(z) = walk::LAZY.get()
+                && let Some(l) = s.live.read().unwrap().as_ref()
+            {
+                z.seed(&l.base);
             }
             if let Some(l) = s.live.read().unwrap().as_ref() {
                 l.base.prefault();
-                if let Some(z) = walk::LAZY.get() {
-                    z.seed(&l.base);
-                }
             }
-            if owner {
+            if owner && replay.is_some() {
                 rescan_unskipped(&s);
             }
             apply_loop(&s, rx);
@@ -601,9 +590,11 @@ impl Shared {
     /// (replaying FSEvents from it) and content segment changes.
     fn follow(&self) {
         let path = self.dir.join("index.bin");
-        let saved = Index::saved_event_id(&path).unwrap_or(0);
+        let saved = Index::saved_event_id(&path);
         let ours = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.event_id);
-        if saved > ours
+        // Any non-zero event id differing from ours (higher, or lower after a
+        // journal rebase) means the owner wrote a newer snapshot.
+        if saved.is_some_and(|id| id != 0 && id != ours)
             && let Some(base) = Index::load(&path)
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
@@ -623,6 +614,33 @@ impl Shared {
     }
 }
 
+fn start_replay(s: &Shared, owner: bool, from: u64, head: u64, watch: impl FnOnce(u64)) {
+    // Seed cachedir tags before `relist_changed` so folders whose tag was
+    // removed while away stay forgotten rather than being re-seeded from base.
+    if let Some(z) = walk::LAZY.get()
+        && let Some(l) = s.live.read().unwrap().as_ref()
+    {
+        z.seed(&l.base);
+    }
+    if from > head {
+        // fseventsd re-based its journal below the saved id (the
+        // saved id then sits in the future): replaying from it
+        // delivers nothing. Treat it as lost history: relist the
+        // folders that changed since the save, and re-stamp the
+        // id so the next save is replayable again.
+        log(format!("saved event id {from} is ahead of the journal head {head}: relisting folders changed since the save"));
+        watch(head);
+        s.live.write().unwrap().as_mut().unwrap().event_id = head;
+        relist_changed(s, "event ids re-based below our save", 0);
+        if owner {
+            s.save_requested.store(true, Ordering::Relaxed);
+            let _ = s.wake.send(Vec::new());
+        }
+    } else {
+        watch(from);
+    }
+}
+
 fn start_content(s: &Arc<Shared>) {
     let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
     let s = s.clone();
@@ -639,8 +657,23 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
     }
     s.owner.store(true, Ordering::Relaxed);
     log("took over the index from a previous owner");
-    *s.content.write().unwrap() = Content::open(s.dir.join("content"));
-    rescan_unskipped(s);
+    // Load the previous owner's last save before compacting this process's
+    // older base and overlay over it. (Before `live` exists, from
+    // `wait_for_index`, the caller loads index.bin itself.)
+    if s.live.read().unwrap().is_some() {
+        s.follow();
+    }
+    let content = Content::open(s.dir.join("content"));
+    if content.segs.is_empty() {
+        s.content_ready.store(false, Ordering::Release);
+    }
+    *s.content.write().unwrap() = content;
+    // Only restore previously skipped folders when taking over an already
+    // loaded index; when upgrading inside `wait_for_index` before `full_build`,
+    // `full_build` will crawl the disk itself.
+    if s.live.read().unwrap().is_some() {
+        rescan_unskipped(s);
+    }
     start_content(s);
     true
 }
@@ -714,12 +747,24 @@ fn folder_listings(dir: &[u8]) -> Vec<Listing> {
     let comps: Vec<&[u8]> = dir.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
     let (mut out, mut path) = (Vec::new(), b"/".to_vec());
     for (i, &c) in comps.iter().enumerate() {
-        let found = walk::list_one(&path).and_then(|l| l.ents.iter().copied().find(|e| &l.names[e.name_off as usize..][..e.name_len as usize] == c));
+        let Some(l) = walk::list_one(&path) else { return out };
+        let found = l.ents.iter().copied().find(|e| &l.names[e.name_off as usize..][..e.name_len as usize] == c);
         let Some(e) = found else { return out };
         path = crate::live::join(&path, c);
         let descend = e.kind & 3 == KIND_DIR && e.kind & walk::FLAG_MOUNT == 0 && !walk::blocked(&path);
         let child = if descend { i as u32 + 1 } else { NONE };
-        out.push(Listing { id: i as u32, names: c.to_vec(), ents: vec![RawEnt { name_off: 0, child, ..e }] });
+        let mut names = c.to_vec();
+        let mut ents = vec![RawEnt { name_off: 0, child, ..e }];
+        // Keep ancestor repo/ignore markers so early content indexing sees
+        // the same git repo root and ignore rules as the full index.
+        for s in &l.ents {
+            let nm = &l.names[s.name_off as usize..][..s.name_len as usize];
+            if nm != c && matches!(nm, b".git" | b".gitignore" | b".ignore") {
+                ents.push(RawEnt { name_off: names.len() as u32, child: NONE, ..*s });
+                names.extend_from_slice(nm);
+            }
+        }
+        out.push(Listing { id: i as u32, names, ents });
         if !descend {
             return out;
         }
@@ -1018,7 +1063,9 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
         std::mem::take(&mut live.trees)
     };
     let n = dirs.len();
-    let _ = shared.content_tx.send((dirs, trees));
+    if shared.owner() {
+        let _ = shared.content_tx.send((dirs, trees));
+    }
     shared.on_change.read().unwrap().iter().for_each(|f| f(&[(&b"/"[..], true)]));
     log(format!(
         "FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
@@ -1340,9 +1387,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
                 trees.append(&mut live.trees);
             }
-            let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, (r, _))| *r);
-            trees.extend(rec.into_iter().map(|(p, _)| p));
-            let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+            if shared.owner() {
+                let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, (r, _))| *r);
+                trees.extend(rec.into_iter().map(|(p, _)| p));
+                let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+            }
         }
         // A lazy unit flushes once quiet (or once too old): its folders go
         // through the same fetch-under-read-lock, apply-under-write-lock
@@ -1372,9 +1421,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
                 trees.append(&mut live.trees);
             }
-            let (rec, flat): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, r)| *r);
-            trees.extend(rec.into_iter().map(|(p, _)| p));
-            let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+            if shared.owner() {
+                let (rec, flat): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, r)| *r);
+                trees.extend(rec.into_iter().map(|(p, _)| p));
+                let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+            }
         } else if !had_dirs {
             // A wake that applied nothing — the floor may still have
             // risen: the watermark catches up to what arrived.
@@ -1906,5 +1957,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(s.owner.load(Ordering::Relaxed));
         assert!(saved.lookup(folder.join("f.txt").as_os_str().as_bytes()).is_some(), "saved before the restoration was applied");
+    }
+
+    /// Rebase recovery (`from > head`) must schedule a save for the owner and
+    /// seed `LAZY` before `relist_changed`, so a removed `CACHEDIR.TAG` stays
+    /// forgotten rather than being re-seeded from the old base index.
+    #[test]
+    fn rebase_requests_save_and_forgets_removed_cachedir() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-rebase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cached = d.join("cached");
+        std::fs::create_dir_all(&cached).unwrap();
+        let mut ls = above(&cached);
+        ls.last_mut().unwrap().names = b"CACHEDIR.TAG".to_vec();
+        ls.last_mut().unwrap().ents.push(RawEnt { name_off: 0, name_len: 12, kind: walk::KIND_FILE, size: 0, mtime: 0, child: NONE });
+        let _ = walk::LAZY.set(walk::LazyDirs::build(b"/h", false));
+        let synced = crate::query::now_secs() + SYNC_MARGIN - 10;
+        let (s, _rx) = owner(&d, Index::build(ls, 500, synced, b"/h"));
+        let mut watched = None;
+        start_replay(&s, true, 500, 100, |id| watched = Some(id));
+        let cached_bytes = cached.as_os_str().as_bytes().to_vec();
+        let still_cached = walk::LAZY.get().unwrap().cachedir.read().unwrap().contains(&cached_bytes);
+        walk::LAZY.get().unwrap().cachedir.write().unwrap().remove(&cached_bytes);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(watched, Some(100));
+        assert_eq!(s.live.read().unwrap().as_ref().unwrap().event_id, 100);
+        assert!(s.save_requested.load(Ordering::Relaxed), "owner rebase recovery must schedule a save");
+        assert!(!still_cached, "removed CACHEDIR.TAG was re-seeded after relist_changed");
+    }
+
+    /// A follower whose pre-rebase index holds a higher `event_id` than the
+    /// owner's post-rebase save must still reload the new snapshot.
+    #[test]
+    fn follower_reloads_after_downward_rebase() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-follow-rebase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let rebased_id = fsevents::current_id();
+        let pre_rebase_id = rebased_id + 1000;
+        let (s, _rx) = owner(&d, Index::build(above(&d), pre_rebase_id, 0, b"/h"));
+        s.owner.store(false, Ordering::Relaxed);
+        Index::build(above(&d), rebased_id, 0, b"/h").save(&d.join("index.bin")).unwrap();
+        s.follow();
+        let loaded_id = s.live.read().unwrap().as_ref().unwrap().base.event_id;
+        *s.stream.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(loaded_id, rebased_id, "follower failed to reload owner save after downward rebase");
+    }
+
+    /// A follower does not own the content index and must not buffer resync
+    /// tuples into `content_tx` (whose receiver is never started).
+    #[test]
+    fn follower_does_not_queue_content_resyncs() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-follower-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, u32::MAX, b"/h"));
+        // Hold a second lock on daemon.lock so `try_upgrade` cannot flip owner.
+        let held = std::fs::File::open(d.join("daemon.lock")).unwrap();
+        assert!(try_lock(&held));
+        s.owner.store(false, Ordering::Relaxed);
+        let crx = s.content_rx.lock().unwrap().take().unwrap();
+
+        relist_changed(&s, "test", 0);
+        let (seen, loop_has_it) = std::sync::mpsc::channel();
+        s.on_change.write().unwrap().push(Box::new(move |_| {
+            let _ = seen.send(());
+        }));
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let event = |path: &[u8], id| fsevents::Event { path: path.to_vec(), flags: 0, id, stream: 0 };
+        s.wake.send(vec![event(b"/nonexistent-fsearch-fc/a", 101)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Send a second batch so the first iteration's post-apply `content_tx`
+        // send (if any) has definitely completed.
+        s.wake.send(vec![event(b"/nonexistent-fsearch-fc/b", 102)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let queued = crx.try_recv();
+        drop(held);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(queued.is_err(), "follower buffered resync into content_tx: {queued:?}");
+    }
+
+    /// `folder_listings` on a subfolder inside a git repo includes ancestor
+    /// `.git` and `.gitignore` entries so early content indexing honors them.
+    #[test]
+    fn folder_listings_keeps_ancestor_git_and_ignore() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-early-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("repo/.git")).unwrap();
+        std::fs::write(d.join("repo/.gitignore"), "ignored.rs\n").unwrap();
+        std::fs::create_dir_all(d.join("repo/src")).unwrap();
+        std::fs::write(d.join("repo/src/kept.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(d.join("repo/src/ignored.rs"), "fn skip() {}\n").unwrap();
+        let src = d.join("repo/src");
+        let ls = folder_listings(src.as_os_str().as_bytes());
+        let live = Live::new(Index::build(ls, 0, 0, d.as_os_str().as_bytes()));
+        let docs = content::wanted(&live, d.as_os_str().as_bytes(), src.as_os_str().as_bytes(), true);
+        let paths: Vec<Vec<u8>> = (0..docs.len()).map(|i| docs.path(i).to_vec()).collect();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(paths.iter().any(|p| p.ends_with(b"/kept.rs")), "missing kept.rs");
+        assert!(!paths.iter().any(|p| p.ends_with(b"/ignored.rs")), "early index ignored ancestor .gitignore");
+    }
+
+    /// Taking over before any `live` index exists (from `wait_for_index`) must
+    /// not queue `rescan_unskipped` ahead of `full_build`, and must reset
+    /// `content_ready` when no content segments exist yet.
+    #[test]
+    fn try_upgrade_before_live_skips_rescan_and_resets_content_ready() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-upgrade-nolive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let folder = d.join("restored");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(d.join(SKIPPED), [folder.as_os_str().as_bytes(), b"\n"].concat()).unwrap();
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        *s.live.write().unwrap() = None;
+        s.owner.store(false, Ordering::Relaxed);
+        // Take content_rx so start_content doesn't spawn a thread in this test.
+        let _crx = s.content_rx.lock().unwrap().take();
+        assert!(try_upgrade(&s));
+        let queued = rx.try_recv();
+        let ready = s.content_ready.load(Ordering::Acquire);
+        let save_req = s.save_requested.load(Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(queued.is_err(), "try_upgrade before live queued spurious rescan_unskipped events");
+        assert!(!save_req, "try_upgrade before live requested spurious save");
+        assert!(!ready, "try_upgrade left content_ready=true with 0 segments");
+    }
+
+    /// The owner saves and exits within one maintain pass: the follower
+    /// upgrades before `follow()` runs, so `try_upgrade` must load that save
+    /// first rather than compact its older memory over it.
+    #[test]
+    fn try_upgrade_follows_the_owners_last_save() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-upgrade-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, _rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        s.owner.store(false, Ordering::Relaxed);
+        let _crx = s.content_rx.lock().unwrap().take();
+        let mut ls = above(&d);
+        ls.last_mut().unwrap().names = b"owner-only.txt".to_vec();
+        ls.last_mut().unwrap().ents.push(RawEnt { name_off: 0, name_len: 14, kind: walk::KIND_FILE, size: 0, mtime: 0, child: NONE });
+        let saved_id = fsevents::current_id();
+        Index::build(ls, saved_id, 0, b"/h").save(&d.join("index.bin")).unwrap();
+        assert!(try_upgrade(&s));
+        let (id, found) = {
+            let g = s.live.read().unwrap();
+            let l = g.as_ref().unwrap();
+            (l.base.event_id, l.base.lookup(d.join("owner-only.txt").as_os_str().as_bytes()).is_some())
+        };
+        *s.stream.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(id, saved_id, "upgraded without loading the owner's last save");
+        assert!(found, "the owner's last save is missing after the upgrade");
     }
 }
