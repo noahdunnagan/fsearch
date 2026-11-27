@@ -18,7 +18,7 @@
 //! knows about with the docs we hold, reindex what changed, tombstone what
 //! went away. The first build is just a sync of $HOME.
 
-use crate::index::{HDR, as_bytes, fields, header, layout, sec};
+use crate::index::{HDR, as_bytes, fields, header, sec};
 use crate::live::{Live, join};
 use crate::query::{GrepMode, Query, fold};
 use crate::walk::{KIND_DIR, KIND_FILE};
@@ -26,7 +26,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Class, Hir, HirKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -174,9 +174,29 @@ enum S {
 const NS: usize = 20;
 
 #[rustfmt::skip]
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, dict_len: usize) -> [usize; NS] {
-    let (d, c) = (ndocs * 4, nown * 4);
-    [ntri.div_ceil(DICT) * 12, dict_len, plen, ndocs.div_ceil(PATHS) * 4, paths_len, d, d, d, ndocs, d, d, d, d, d, c, c, c * 2, c, c + 4, nwords * 8]
+fn checked_lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, dict_len: usize) -> Option<[usize; NS]> {
+    let d = ndocs.checked_mul(4)?;
+    let c = nown.checked_mul(4)?;
+    Some([
+        ntri.div_ceil(DICT).checked_mul(12)?,
+        dict_len,
+        plen,
+        ndocs.div_ceil(PATHS).checked_mul(4)?,
+        paths_len,
+        d, d, d, ndocs, d, d, d, d, d,
+        c, c, c.checked_mul(2)?, c, c.checked_add(4)?,
+        nwords.checked_mul(8)?,
+    ])
+}
+
+fn checked_layout<const N: usize>(lens: &[usize; N]) -> Option<([usize; N], usize)> {
+    let mut off = [0usize; N];
+    let mut at = HDR;
+    for (k, &l) in lens.iter().enumerate() {
+        off[k] = at;
+        at = at.checked_add(l)?.checked_add(63)? & !63;
+    }
+    Some((off, at))
 }
 
 impl Segment {
@@ -408,8 +428,13 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = std::sync::Arc::new(unsafe { Mmap::map(&f) }.ok()?);
-        let [ndocs, ntri, plen, paths_len, nwords, nown, dict_len] = fields(&map, MAGIC)?.map(|v| v as usize);
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, nwords, nown, dict_len));
+        let raw: [u64; 7] = fields(&map, MAGIC)?;
+        let mut vals = [0usize; 7];
+        for (dst, &src) in vals.iter_mut().zip(&raw) {
+            *dst = usize::try_from(src).ok()?;
+        }
+        let [ndocs, ntri, plen, paths_len, nwords, nown, dict_len] = vals;
+        let (off, total) = checked_layout(&checked_lens(ndocs, ntri, plen, paths_len, nwords, nown, dict_len)?)?;
         if map.len() < total {
             return None;
         }
@@ -447,7 +472,7 @@ impl Segment {
 
     fn save_dead(&self, dir: &Path) {
         let bytes: Vec<u8> = self.dead.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let tmp = dead_path(dir, self.id).with_extension("tmp");
+        let tmp = dead_path(dir, self.id).with_extension("dead.tmp");
         if std::fs::write(&tmp, bytes).is_ok() {
             let _ = std::fs::rename(tmp, dead_path(dir, self.id));
         }
@@ -1288,7 +1313,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         bloom_off.push(blooms.len() as u32);
     }
 
-    let (off, _) = layout(&lens(ndocs, ntri, post.len(), paths.len(), blooms.len(), nown, dict.len()));
+    let (off, _) = checked_layout(&checked_lens(ndocs, ntri, post.len(), paths.len(), blooms.len(), nown, dict.len())?)?;
     let fields = [ndocs, ntri, post.len(), paths.len(), blooms.len(), nown, dict.len()].map(|v| v as u64);
     let hdr = header(MAGIC, &fields);
     let sections: [&[u8]; NS] = [
@@ -1314,7 +1339,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         as_bytes(&blooms),
     ];
     let p = seg_path(dir, id);
-    let tmp = p.with_extension("tmp");
+    let tmp = p.with_extension("fsc.tmp");
     let write = || -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(&hdr)?;
@@ -1555,7 +1580,9 @@ impl<'a> Scope<'a> {
         let mut changed = false;
         for name in [&b".git"[..], b".gitignore", b".ignore"] {
             let p = join(dir, name);
-            let (now, was) = ((self.look)(&p), parsed.get(&p).map(|e| (e.0, e.1)));
+            let now = (self.look)(&p)
+                .filter(|&(kind, ..)| if name == b".git" { kind & 3 != KIND_FILE || !self.linked_worktree(dir) } else { kind & 3 == KIND_FILE });
+            let was = parsed.get(&p).map(|e| (e.0, e.1));
             // (A .git folder's mtime moves with every git command.)
             changed |= if name == b".git" { now.is_some() != was.is_some() } else { now.map(|(_, s, m)| (s, m)) != was };
             if now.is_none() {
@@ -2088,13 +2115,33 @@ fn content_of(gids: &[(u32, u32, u32, u32)], g: u32) -> Option<(usize, u32)> {
     (g - g0 < n).then_some((s as usize, c0 + (g - g0)))
 }
 
+fn read_manifest(dir: &Path) -> Vec<u64> {
+    std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect()
+}
+
 impl Content {
     /// Open the segments the manifest lists, without touching anything: the
     /// view of an engine that follows another process's index.
     pub fn open_shared(dir: PathBuf) -> Content {
-        let manifest: Vec<u64> =
-            std::fs::read_to_string(dir.join("manifest")).unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
-        let segs: Vec<Segment> = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
+        Self::open_shared_with(dir, || {})
+    }
+
+    fn open_shared_with(dir: PathBuf, mut on_attempt: impl FnMut()) -> Content {
+        let mut manifest = read_manifest(&dir);
+        let mut segs = Vec::new();
+        // Retry if the owner swapped `manifest` and unlinked a merged segment mid-load.
+        for attempt in 0..3 {
+            on_attempt();
+            segs = manifest.iter().filter_map(|&id| Segment::load(&dir, id)).collect();
+            if segs.len() == manifest.len() || attempt == 2 {
+                break;
+            }
+            let next = read_manifest(&dir);
+            if next == manifest {
+                break;
+            }
+            manifest = next;
+        }
         let next_id = segs.iter().map(|s| s.id + 1).max().unwrap_or(1);
         #[rustfmt::skip]
         let mut c = Content { dir, segs, next_id, gids: Vec::new(), base: Vec::new(), blocks: Vec::new(), copies: Vec::new(), users: Vec::new(), sources: Vec::new() };
@@ -2871,13 +2918,13 @@ impl Dirty {
     /// The changed files the query's name filters let through, newest first.
     pub fn files(&self, q: &Query) -> Vec<Vec<u8>> {
         let m = self.0.lock().unwrap();
-        let mut out: Vec<(u32, &Vec<u8>)> = (m.values().flatten())
+        let mut out: Vec<(u32, &[u8])> = (m.values().flatten())
             .filter(|(p, size, mtime)| q.match_path(p, KIND_FILE, *size, *mtime).is_some())
-            .map(|(p, _, mtime)| (*mtime, p))
+            .map(|(p, _, mtime)| (*mtime, p.as_slice()))
             .collect();
         out.sort_unstable_by(|a, b| b.cmp(a));
-        out.dedup_by(|a, b| a.1 == b.1);
-        out.into_iter().map(|(_, p)| p.clone()).collect()
+        let mut seen = HashSet::with_capacity(out.len());
+        out.into_iter().filter(|&(_, p)| seen.insert(p)).map(|(_, p)| p.to_vec()).collect()
     }
 }
 
@@ -3211,16 +3258,26 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     Scope::new(home, &look).wanted(live, dir, recursive)
 }
 
+fn above_home(d: &[u8], r: bool, home: &[u8]) -> bool {
+    r && home.starts_with(d) && d.len() < home.len() && (d.ends_with(b"/") || home[d.len()..].starts_with(b"/"))
+}
+
 /// What should be indexed under these folders (direct children unless
 /// recursive) as the name index has them now, for `Dirty::mark`.
 pub fn wanted_now(live: &Live, home: &[u8], dirs: &[(Vec<u8>, bool)]) -> Vec<(Vec<u8>, bool, Docs)> {
     let look = |p: &[u8]| in_index(live, p);
     let mut scope = Scope::new(home, &look);
-    (dirs.iter())
+    // A subtree containing home (e.g. "/" rescanned): all of home, once.
+    let mut targets: Vec<(Vec<u8>, bool)> =
+        dirs.iter().map(|(d, r)| if above_home(d, *r, home) { (home.to_vec(), true) } else { (d.clone(), *r) }).collect();
+    targets.sort();
+    targets.dedup();
+    targets
+        .into_iter()
         .map(|(d, r)| {
-            let mut w = scope.wanted(live, d, *r);
+            let mut w = scope.wanted(live, &d, r);
             w.sort();
-            (d.clone(), *r, w)
+            (d, r, w)
         })
         .collect()
 }
@@ -3242,7 +3299,7 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
         if in_scope(d, home) {
             // A folder whose ignore files changed: so may all below it.
             out.push((d.clone(), r || scope.rules_changed(d)));
-        } else if r && home.starts_with(d) && (d.ends_with(b"/") || home[d.len()..].starts_with(b"/")) {
+        } else if above_home(d, r, home) {
             // A subtree containing home (e.g. "/" rescanned): sync all of home.
             out.push((home.to_vec(), true));
         }
@@ -4790,7 +4847,8 @@ mod tests {
         std::fs::write(&p, "needle\n").unwrap();
         let mut docs = Docs::default();
         docs.push(p.as_os_str().as_bytes(), 0, 1);
-        let mut c = Content::open(d.join("idx"));
+        let mut c = Content::open_shared(d.join("idx"));
+        std::fs::create_dir_all(&c.dir).unwrap();
         let id = c.alloc_id();
         c.push(build_segment(&c.dir, id, &docs, 0..1).unwrap());
         let mut g = Grep::new("needle", GrepMode::Literal).unwrap();
@@ -4826,7 +4884,8 @@ mod tests {
             docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
         }
         docs.sort();
-        let mut c = Content::open(d.join("idx"));
+        let mut c = Content::open_shared(d.join("idx"));
+        std::fs::create_dir_all(&c.dir).unwrap();
         let id = c.alloc_id();
         c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
         let found = |pattern: &str, mode: GrepMode| {
@@ -4881,5 +4940,119 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// Corrupt `.fsc` headers with overflowing section sizes return `None`.
+    #[test]
+    fn segment_load_rejects_overflowing_header() {
+        let d = std::env::temp_dir().join(format!("fsearch-overflow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let hdr = header(MAGIC, &[(usize::MAX / 4 + 1) as u64, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(seg_path(&d, 1), hdr).unwrap();
+        let loaded = Segment::load(&d, 1);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(loaded.is_none());
+    }
+
+    /// `Scope::rules_changed` ignores non-regular `.gitignore`/`.ignore` and
+    /// linked worktrees' `.git` files.
+    #[test]
+    fn rules_changed_ignores_dir_gitignore_and_linked_worktree() {
+        let d = std::env::temp_dir().join(format!("fsearch-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gitignore")).unwrap();
+        std::fs::create_dir_all(d.join("wt")).unwrap();
+        std::fs::write(d.join("wt/.git"), b"gitdir: /tmp/main/.git/worktrees/wt\n").unwrap();
+        let h = d.as_os_str().as_bytes();
+        let look = |p: &[u8]| on_disk(p);
+        let scope = Scope::new(h, &look);
+        let c_root = scope.rules_changed(h);
+        let c_wt = scope.rules_changed(&join(h, b"wt"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!c_root);
+        assert!(!c_wt);
+    }
+
+    /// `Dirty::files` deduplicates paths across entries with different mtimes,
+    /// keeping the newest entry's ordering.
+    #[test]
+    fn dirty_files_dedup_multiple_mtimes() {
+        let dirty = Dirty::default();
+        {
+            let mut m = dirty.0.lock().unwrap();
+            m.insert((b"/a".to_vec(), false), vec![(b"/a/x".to_vec(), 10, 10), (b"/a/y".to_vec(), 10, 15)]);
+            m.insert((b"/".to_vec(), true), vec![(b"/a/x".to_vec(), 10, 20)]);
+        }
+        let files = dirty.files(&Query::parse("", "/").unwrap());
+        assert_eq!(files, vec![b"/a/x".to_vec(), b"/a/y".to_vec()]);
+    }
+
+    /// `wanted_now` maps recursive ancestors above home to `(home, true)`, once.
+    #[test]
+    fn wanted_now_ancestor_above_home() {
+        let dir = |off, len, child| RawEnt { name_off: off, name_len: len, kind: KIND_DIR, size: 0, mtime: 0, child };
+        let file = |off, len| RawEnt { name_off: off, name_len: len, kind: KIND_FILE, size: 5, mtime: 1, child: crate::walk::NONE };
+        let ls = vec![
+            Listing { id: 0, names: b"Users".to_vec(), ents: vec![dir(0, 5, 1)] },
+            Listing { id: 1, names: b"me".to_vec(), ents: vec![dir(0, 2, 2)] },
+            Listing { id: 2, names: b"a.txt".to_vec(), ents: vec![file(0, 5)] },
+        ];
+        let live = Live::new(crate::index::Index::build(ls, 0, 0, b"/Users/me"));
+        let now = wanted_now(&live, b"/Users/me", &[(b"/Users".to_vec(), true), (b"/".to_vec(), true)]);
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].0, b"/Users/me");
+        assert!(now[0].1);
+        assert_eq!(now[0].2.len(), 1);
+        assert_eq!(now[0].2.path(0), b"/Users/me/a.txt");
+    }
+
+    /// `Content::open_shared` retries when the manifest swaps and unlinks a
+    /// segment concurrently, stops immediately when unchanged, and caps retries at 3.
+    #[test]
+    fn open_shared_retries_on_concurrent_manifest_swap_and_stops_on_missing() {
+        let d = std::env::temp_dir().join(format!("fsearch-open-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let idx = d.join("idx");
+        std::fs::create_dir_all(&idx).unwrap();
+        let idx = idx.canonicalize().unwrap();
+        for (id, name, text) in [(1u64, "a.txt", "alpha\n"), (2u64, "b.txt", "beta\n")] {
+            let p = d.join(name);
+            std::fs::write(&p, text).unwrap();
+            let mut docs = Docs::default();
+            docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+            build_segment(&idx, id, &docs, 0..1).unwrap();
+        }
+
+        // 1. Concurrent swap: manifest points to seg 1, then swaps to seg 2 and unlinks seg 1.
+        std::fs::write(idx.join("manifest"), "1\n").unwrap();
+        let mut calls = 0usize;
+        let c = Content::open_shared_with(idx.clone(), || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(idx.join("manifest"), "2\n").unwrap();
+                let _ = std::fs::remove_file(seg_path(&idx, 1));
+            }
+        });
+        assert_eq!(c.segs.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(calls, 2);
+
+        // 2. Genuinely missing segment with unchanged manifest breaks on first attempt.
+        std::fs::write(idx.join("manifest"), "2 999\n").unwrap();
+        let mut missing_calls = 0usize;
+        let c_missing = Content::open_shared_with(idx.clone(), || missing_calls += 1);
+        assert_eq!(c_missing.segs.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(missing_calls, 1);
+
+        // 3. Persistent concurrent manifest swaps never loop past 3 attempts.
+        std::fs::write(idx.join("manifest"), "900\n").unwrap();
+        let mut capped_calls = 0usize;
+        let c_capped = Content::open_shared_with(idx.clone(), || {
+            capped_calls += 1;
+            std::fs::write(idx.join("manifest"), format!("{}\n", 900 + capped_calls)).unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(c_capped.segs.is_empty());
+        assert_eq!(capped_calls, 3);
     }
 }
