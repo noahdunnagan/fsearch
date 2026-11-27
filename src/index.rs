@@ -52,6 +52,7 @@ enum Sec {
     Zones,
 }
 const NSEC: usize = 24;
+const EXT_SLOTS: usize = 256;
 #[rustfmt::skip]
 const SEC_NAMES: [&str; NSEC] = [
     "NameBits", "NameBase", "NameOff", "Names", "EntName", "Kind", "Parent", "ParentRank", "ParentMap", "Size", "Mtime", "DirEntry",
@@ -69,7 +70,6 @@ pub struct Index {
     pub words: usize,
     bits_len: usize,
     zones_len: usize,
-    ext_slots: usize,
     /// Words of the per-64 `Parent` and `ParentRank` arrays.
     n64: usize,
     /// Entries of `ParentMap`.
@@ -238,7 +238,8 @@ fn unpack(p: &[u8]) -> Name<'static> {
         i += 1;
         let (k, digits, uuid) = match h {
             0..=0x7F => {
-                v.extend_from_slice(&p[i..i + h]);
+                let Some(lit) = p.get(i..i + h) else { break };
+                v.extend_from_slice(lit);
                 i += h;
                 continue;
             }
@@ -246,11 +247,13 @@ fn unpack(p: &[u8]) -> Name<'static> {
             0xC0..=0xFD => (h - 0xBF, UPPER, false),
             _ => (32, if h == 0xFE { LOWER } else { UPPER }, true),
         };
+        // A corrupt name may end early: what is there.
+        let Some(bytes) = p.get(i..i + k.div_ceil(2)) else { break };
         for j in 0..k {
             if uuid && matches!(j, 8 | 12 | 16 | 20) {
                 v.push(b'-');
             }
-            let b = p[i + j / 2];
+            let b = bytes[j / 2];
             v.push(digits[(if j % 2 == 0 { b >> 4 } else { b & 15 }) as usize]);
         }
         i += k.div_ceil(2);
@@ -430,15 +433,22 @@ impl Index {
     // Per distinct name, its extension as an `ext_table` slot: 0 none, 255
     // one not in the table.
     sec!(name_ext, Sec::NameExt, u8, u);
-    // The EXT_SLOTS most common extensions among the names, lowercased: slot
-    // i is `[len, bytes..]` (slot 0 and 255 unused).
-    sec!(ext_table, Sec::Exts, [u8; 16], ext_slots);
+    // The `EXT_SLOTS - 2` most common extensions among the names, lowercased:
+    // slot `i` is `[len, bytes..]` (slots 0 and 255 unused).
+    pub fn ext_table(&self) -> &[[u8; 16]] {
+        unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(self.off[Sec::Exts as usize]) as *const [u8; 16], EXT_SLOTS) }
+    }
 
     /// The `name_ext` slot of extension `e` (lowercase): 255 if it is not
     /// in the table (names with such an extension have to be read).
     pub fn ext_slot(&self, e: &[u8]) -> u8 {
         let t = self.ext_table();
-        (1..255).find(|&i| t[i][0] as usize == e.len() && &t[i][1..1 + e.len()] == e).unwrap_or(255) as u8
+        (1..255)
+            .find(|&i| {
+                let l = t[i][0] as usize;
+                l <= 15 && l == e.len() && &t[i][1..1 + l] == e
+            })
+            .unwrap_or(255) as u8
     }
     // Per ZONE entries: what a filter on size, mtime or kind can skip.
     sec!(zones, Sec::Zones, Zone, zones_len);
@@ -891,19 +901,24 @@ impl Index {
         let f: Vec<u64> =
             [n, d, u, stored.len(), event_id as usize, synced_at as usize, nblocks, shift].into_iter().chain(run_words).map(|v| v as u64).collect();
         m[..HDR].copy_from_slice(&header(MAGIC, &f));
-        Index::from_map(m.make_read_only().unwrap()).unwrap()
+        Index::from_map(m.make_read_only().unwrap(), false).unwrap()
     }
 
-    fn from_map(map: Mmap) -> Option<Index> {
+    /// The index in `map`; `check`: whether to check its sections too (see
+    /// `valid`), which a just-built one needs not.
+    fn from_map(map: Mmap, check: bool) -> Option<Index> {
         let f = fields::<15>(&map, MAGIC)?.map(|v| v as usize);
         let [n, d, u, names_len, event_id, synced_at, blocks, name_shift, ..] = f;
+        if n == 0 || d == 0 || u == 0 || name_shift >= 32 || blocks == 0 {
+            return None;
+        }
         let run_words: [usize; 7] = f[8..].try_into().unwrap();
-        let (off, total) = layout(&section_lens(n, d, u, names_len, blocks, name_shift, run_words));
+        let (off, total) = checked_layout(&checked_section_lens(n, d, u, names_len, blocks, name_shift, run_words)?)?;
         let words = u.div_ceil(64);
         if map.len() < total {
             return None;
         }
-        Some(Index {
+        let idx = Index {
             n,
             d,
             u,
@@ -911,7 +926,6 @@ impl Index {
             words,
             bits_len: words * NBITMAPS,
             zones_len: n.div_ceil(ZONE),
-            ext_slots: 256,
             n64: n.div_ceil(64),
             blocks,
             name_shift,
@@ -926,7 +940,79 @@ impl Index {
             counts: std::sync::OnceLock::new(),
             top_prior: std::sync::OnceLock::new(),
             by_key: std::sync::OnceLock::new(),
-        })
+        };
+        (!check || idx.valid()).then_some(idx)
+    }
+
+    /// Whether every id in the sections is in range and the tree has the
+    /// shape every build gives it, which the readers trust: no read goes out
+    /// of bounds, and no walk up, `path` or `memo_plan` can loop.
+    fn valid(&self) -> bool {
+        let (n, d, u) = (self.n, self.d, self.u);
+        // Runs: word offsets ascending from past the header, at most 32 bits
+        // a value, ending where the header says.
+        let runs = [(Sec::Size, n), (Sec::Mtime, n), (Sec::DirEntry, d), (Sec::DirStart, d), (Sec::DirLen, d), (Sec::DirEnd, d), (Sec::DirParent, d)];
+        let runs_ok = runs.into_iter().zip(self.run_words).all(|((s, len), words)| {
+            let (p, nr) = (&self.map[self.off[s as usize]..], len.div_ceil(64));
+            let at = |r: usize| (word(p, r * 8) >> 32) as usize;
+            at(0) == nr + 1 && at(nr) == nr + 1 + words && (0..nr).all(|r| at(r) <= at(r + 1) && at(r + 1) - at(r) <= 32)
+        });
+        // Parent: entry 0 starts a block, ranks count the starts before
+        // each word, `blocks` in all, none past n.
+        let (bits, rank) = (self.parent_bits(), self.parent_rank());
+        let parents_ok = bits[0] & 1 == 1
+            && (n % 64 == 0 || bits[n / 64] >> (n % 64) == 0)
+            && rank[0] == 0
+            && (1..self.n64).into_par_iter().with_min_len(1 << 12).all(|w| rank[w] as u64 == rank[w - 1] as u64 + bits[w - 1].count_ones() as u64)
+            && rank[self.n64 - 1] as usize + bits[self.n64 - 1].count_ones() as usize == self.blocks;
+        let (en, eo, ne) = (self.ent_names(), self.bits(Sec::NameEntsOff, width(n + 1)), self.bits(Sec::NameEnts, width(n)));
+        let names_ok =
+            (0..u).into_par_iter().with_min_len(1 << 12).all(|k| matches!(self.name_span(k as u32), (a, b) if a <= b && b <= self.names_len))
+                && (0..n).into_par_iter().with_min_len(1 << 12).all(|i| (en.get(i) as usize) < u)
+                && eo.get(0) == 0
+                && eo.get(u) as usize == n
+                && (0..u).into_par_iter().with_min_len(1 << 12).all(|k| eo.get(k) <= eo.get(k + 1))
+                && (0..n).into_par_iter().with_min_len(1 << 12).all(|j| (ne.get(j) as usize) < n);
+        if !(runs_ok && parents_ok && names_ok) {
+            return false;
+        }
+        // The tree: folder 0 is entry 0, its block right after it and its
+        // subtree everything; each folder's entry is in its parent's block
+        // (so parents come first), folders ascend by entry, and each
+        // subtree is its block, then its child folders' subtrees in order.
+        let (de, ds, dl, dend, dp) =
+            (self.dir_entries(), self.runs(Sec::DirStart), self.runs(Sec::DirLen), self.runs(Sec::DirEnd), self.dir_parents());
+        let (map, bit) = (self.bits(Sec::ParentMap, width(d)), |i: usize| bits[i / 64] >> (i % 64) & 1 == 1);
+        let dir_ok = |k: usize| {
+            let (e, s, l, end) = (de.get(k) as u64, ds.get(k) as u64, dl.get(k) as u64, dend.get(k) as u64);
+            if !(e < s && s + l <= end && end <= n as u64) {
+                return false;
+            }
+            // A block of children is exactly one Parent block, mapped to k.
+            let (s, l) = (s as usize, l as usize);
+            if l > 0
+                && !(bit(s) && map.get(self.block_of(s)) as usize == k && self.block_of(s + l - 1) == self.block_of(s) && (s + l == n || bit(s + l)))
+            {
+                return false;
+            }
+            if k == 0 {
+                return e == 0 && s == 1 && end == n as u64 && dp.get(0) == 0 && (l > 0 || n == 1);
+            }
+            let p = dp.get(k) as usize;
+            if !(p < k && de.get(k - 1) < de.get(k)) {
+                return false;
+            }
+            let (ps, pe) = (ds.get(p) as usize, ds.get(p) as usize + dl.get(p) as usize);
+            let first = k == 1 || dp.get(k - 1) as usize != p;
+            let last = k + 1 == d || dp.get(k + 1) as usize != p;
+            (ps..pe).contains(&(e as usize)) && s == if first { pe } else { dend.get(k - 1) as usize } && (!last || end == dend.get(p) as u64)
+        };
+        // Every block but the root's own is one folder's, so blocks tile
+        // 1..n, and the tiling above leaves childless folders no room past
+        // their own block.
+        map.get(0) == 0
+            && (0..d).into_par_iter().with_min_len(1 << 12).map(|k| dir_ok(k).then_some((dl.get(k) > 0) as usize)).sum::<Option<usize>>()
+                == Some(self.blocks - 1)
     }
 
     /// Write atomically (tmp + rename), stamping the current event id.
@@ -952,7 +1038,7 @@ impl Index {
 
     pub fn load(path: &Path) -> Option<Index> {
         let f = std::fs::File::open(path).ok()?;
-        Index::from_map(unsafe { Mmap::map(&f) }.ok()?)
+        Index::from_map(unsafe { Mmap::map(&f) }.ok()?, true)
     }
 
     pub fn bytes(&self) -> usize {
@@ -1000,13 +1086,18 @@ pub(crate) fn fields<const N: usize>(b: &[u8], magic: &[u8; 8]) -> Option<[u64; 
 
 /// Section offsets for these lengths, and the file size.
 pub(crate) fn layout<const N: usize>(lens: &[usize; N]) -> ([usize; N], usize) {
+    checked_layout(lens).expect("layout overflow")
+}
+
+/// Checked section offsets for these lengths, and the file size.
+fn checked_layout<const N: usize>(lens: &[usize; N]) -> Option<([usize; N], usize)> {
     let mut off = [0usize; N];
     let mut at = HDR;
     for (k, &l) in lens.iter().enumerate() {
         off[k] = at;
-        at = (at + l + 63) & !63;
+        at = at.checked_add(l)?.checked_add(63)? & !63;
     }
-    (off, at)
+    Some((off, at))
 }
 
 pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -1086,16 +1177,43 @@ impl NameInfo {
 
 /// Section lengths: `blocks` entries in ParentMap, 2^`shift` names per
 /// NameBase entry, `w` words in the `Runs` (see `Index::run_words`).
-#[rustfmt::skip]
 fn section_lens(n: usize, d: usize, u: usize, names_len: usize, blocks: usize, shift: usize, w: [usize; 7]) -> [usize; NSEC] {
+    checked_section_lens(n, d, u, names_len, blocks, shift, w).expect("section_lens overflow")
+}
+
+fn checked_section_lens(n: usize, d: usize, u: usize, names_len: usize, blocks: usize, shift: usize, w: [usize; 7]) -> Option<[usize; NSEC]> {
     let n64 = n.div_ceil(64);
-    let runs = |len: usize, words: usize| (len.div_ceil(64) + 1 + words) * 8 + 8;
-    let z = n.div_ceil(ZONE) * std::mem::size_of::<Zone>();
-    [
-        u.div_ceil(64) * NBITMAPS * 8, (u + 1).div_ceil(1 << shift) * 4, (u + 1) * 2, names_len, bits_len(n, width(u)), bits_len(n, 4),
-        n64 * 8, n64 * 4, bits_len(blocks, width(d)), runs(n, w[0]), runs(n, w[1]), runs(d, w[2]), runs(d, w[3]), runs(d, w[4]),
-        runs(d, w[5]), d, runs(d, w[6]), bits_len(u + 1, width(n + 1)), bits_len(n, width(n)), u, u * 4, u, 256 * 16, z,
-    ]
+    let u1 = u.checked_add(1)?;
+    let n1 = n.checked_add(1)?;
+    let step = 1usize.checked_shl(u32::try_from(shift).ok()?)?;
+    let runs = |len: usize, words: usize| len.div_ceil(64).checked_add(1)?.checked_add(words)?.checked_mul(8)?.checked_add(8);
+    let z = n.div_ceil(ZONE).checked_mul(std::mem::size_of::<Zone>())?;
+    Some([
+        u.div_ceil(64).checked_mul(NBITMAPS)?.checked_mul(8)?,
+        u1.div_ceil(step).checked_mul(4)?,
+        u1.checked_mul(2)?,
+        names_len,
+        checked_bits_len(n, width(u))?,
+        checked_bits_len(n, 4)?,
+        n64.checked_mul(8)?,
+        n64.checked_mul(4)?,
+        checked_bits_len(blocks, width(d))?,
+        runs(n, w[0])?,
+        runs(n, w[1])?,
+        runs(d, w[2])?,
+        runs(d, w[3])?,
+        runs(d, w[4])?,
+        runs(d, w[5])?,
+        d,
+        runs(d, w[6])?,
+        checked_bits_len(u1, width(n1))?,
+        checked_bits_len(n, width(n))?,
+        u,
+        u.checked_mul(4)?,
+        u,
+        EXT_SLOTS * 16,
+        z,
+    ])
 }
 
 /// The first i below `n` where `before(i)` is false (it holds up to some i).
@@ -1144,8 +1262,8 @@ fn read(p: &[u8], b: usize, w: u32) -> u32 {
     ((word(p, b / 8) >> (b % 8)) & ((1 << w) - 1)) as u32
 }
 
-fn bits_len(len: usize, w: u32) -> usize {
-    (len * w as usize).div_ceil(8) + 8
+fn checked_bits_len(len: usize, w: u32) -> Option<usize> {
+    len.checked_mul(w as usize)?.div_ceil(8).checked_add(8)
 }
 
 /// Write `v` into zeroed `out` as `Bits` of width `w`.
@@ -1168,7 +1286,7 @@ impl Runs<'_> {
     #[inline(always)]
     pub fn get(self, i: usize) -> u32 {
         let (lo, s, w) = self.run(i / 64);
-        lo + read(self.0, s * 64 + i % 64 * w as usize, w)
+        lo.wrapping_add(read(self.0, s * 64 + i % 64 * w as usize, w))
     }
 
     /// Run `r`'s minimum.
@@ -1403,5 +1521,222 @@ mod tests {
         let mut p = Vec::new();
         idx.path(idx.n - 1, &mut p);
         assert_eq!(p, b"/d".repeat(301));
+    }
+
+    fn load_corrupt(name: &str, f: [u64; 15], pad: usize) -> Option<Index> {
+        let path = std::env::temp_dir().join(format!("fsearch-corrupt-{}-{name}.bin", std::process::id()));
+        let mut buf = header(MAGIC, &f);
+        buf.resize(HDR + pad, 0);
+        std::fs::write(&path, &buf).unwrap();
+        let res = Index::load(&path);
+        let _ = std::fs::remove_file(&path);
+        res
+    }
+
+    /// Corrupt or overflowing headers return `None` cleanly instead of panicking or loading.
+    #[test]
+    fn corrupt_header_rejected() {
+        assert!(load_corrupt("zero_n", [0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("shift64", [1, 1, 1, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("shift32", [1, 1, 1, 0, 0, 0, 1, 32, 0, 0, 0, 0, 0, 0, 0], 16384).is_none());
+        assert!(load_corrupt("max_n", [u64::MAX, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_u", [1, 1, u64::MAX, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_names_len", [1, 1, 1, u64::MAX, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], 0).is_none());
+        assert!(load_corrupt("max_run_words", [1, 1, 1, 0, 0, 0, 1, 0, u64::MAX, 0, 0, 0, 0, 0, 0], 0).is_none());
+    }
+
+    /// A corrupt `ext_table` length byte (> 15) must not panic in `ext_slot`.
+    #[test]
+    fn corrupt_ext_table_len() {
+        let ls = vec![Listing {
+            id: 0,
+            names: b"a.txt".to_vec(),
+            ents: vec![RawEnt { name_off: 0, name_len: 5, kind: 0, size: 0, mtime: 0, child: NONE }],
+        }];
+        let idx = Index::build(ls, 0, 0, b"/");
+        let path = std::env::temp_dir().join(format!("fsearch-corrupt-ext-{}.bin", std::process::id()));
+        idx.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[idx.off[Sec::Exts as usize] + 16] = 20;
+        std::fs::write(&path, &bytes).unwrap();
+        let bad = Index::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bad.ext_slot(b"01234567890123456789"), 255);
+    }
+
+    /// / holds a, c, f, j; /a holds b, g; /a/b holds h; /c holds i. Folders:
+    /// 0 /, 1 /a, 2 /c, 3 /a/b.
+    fn sample() -> Index {
+        let lst = |id, names: &[(&str, u32)]| {
+            let mut l = Listing { id, ..Default::default() };
+            for &(nm, child) in names {
+                let kind = if child == NONE { KIND_FILE } else { KIND_DIR };
+                l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: nm.len() as u16, kind, size: 0, mtime: 0, child });
+                l.names.extend_from_slice(nm.as_bytes());
+            }
+            l
+        };
+        let ls = vec![
+            lst(0, &[("a", 1), ("c", 3), ("f", NONE), ("j", NONE)]),
+            lst(1, &[("b", 2), ("g", NONE)]),
+            lst(2, &[("h", NONE)]),
+            lst(3, &[("i", NONE)]),
+        ];
+        Index::build(ls, 0, 0, b"/")
+    }
+
+    /// `idx`'s bytes after `edit`, loaded as from disk.
+    fn reload(idx: &Index, edit: impl FnOnce(&mut [u8])) -> Option<Index> {
+        let mut m = MmapMut::map_anon(idx.map.len()).unwrap();
+        m.copy_from_slice(&idx.map);
+        edit(&mut m);
+        Index::from_map(m.make_read_only().unwrap(), true)
+    }
+
+    /// Set value `i` of the `w`-bit values from byte `at` to `v`.
+    fn set_bits(m: &mut [u8], at: usize, i: usize, w: u32, v: u32) {
+        for j in 0..w as usize {
+            let b = i * w as usize + j;
+            m[at + b / 8] = m[at + b / 8] & !(1 << (b % 8)) | ((v >> j & 1) as u8) << (b % 8);
+        }
+    }
+
+    /// Two bytes (DirParent's first run minimum, one ParentMap slot) that
+    /// made a walk up from /a loop: path() overflowed the stack.
+    #[test]
+    fn load_rejects_parent_loop() {
+        let idx = sample();
+        assert!(reload(&idx, |_| {}).is_some());
+        let bad = reload(&idx, |m| {
+            m[idx.off[Sec::DirParent as usize]] += 1;
+            set_bits(m, idx.off[Sec::ParentMap as usize], 1, width(idx.d), 1);
+        });
+        assert!(bad.is_none());
+    }
+
+    /// Set value `i` of Runs section `s` to `v` (it must fit its run).
+    fn set_run(idx: &Index, m: &mut [u8], s: Sec, i: usize, v: u32) {
+        let (lo, at, w) = idx.runs(s).run(i / 64);
+        assert!(v >= lo && ((v - lo) as u64) >> w == 0);
+        set_bits(m, idx.off[s as usize] + at * 8, i % 64, w, v - lo);
+    }
+
+    /// `edit` of the sample, loaded.
+    fn refused(edit: impl FnOnce(&Index, &mut [u8])) -> bool {
+        let idx = sample();
+        reload(&idx, |m| edit(&idx, m)).is_none()
+    }
+
+    /// Every built tree passes: one folder, a deep chain, a wide random one.
+    #[test]
+    fn load_accepts_built_indexes() {
+        let ent = |kind, child| RawEnt { name_off: 0, name_len: 1, kind, size: 0, mtime: 0, child };
+        let chain = (0..=300).map(|i| Listing {
+            id: i,
+            names: b"d".to_vec(),
+            ents: vec![ent(if i < 300 { KIND_DIR } else { KIND_FILE }, if i < 300 { i + 1 } else { NONE })],
+        });
+        let mut x = 1u32;
+        let mut wide: Vec<Listing> = (0..2000).map(|id| Listing { id, ..Default::default() }).collect();
+        for i in 1..2000u32 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let p = (x >> 8) % i;
+            let nm = format!("d{i}");
+            let l = &mut wide[p as usize];
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: nm.len() as u16, ..ent(KIND_DIR, i) });
+            l.names.extend_from_slice(nm.as_bytes());
+            if x.is_multiple_of(3) {
+                l.ents.push(RawEnt { name_off: l.names.len() as u32 - 1, name_len: 1, ..ent(KIND_FILE, NONE) });
+            }
+        }
+        for ls in [vec![Listing { id: 0, ..Default::default() }], chain.collect(), wide] {
+            let idx = Index::build(ls, 0, 0, b"/");
+            assert!(reload(&idx, |_| {}).is_some(), "{} entries, {} folders", idx.n, idx.d);
+        }
+    }
+
+    #[test]
+    fn load_rejects_bad_runs() {
+        assert!(refused(|idx, m| m[idx.off[Sec::Size as usize] + 4] += 1), "first word not past the header");
+        assert!(refused(|idx, m| m[idx.off[Sec::DirParent as usize] + 12] += 1), "last word past the section");
+        assert!(refused(|idx, m| m[idx.off[Sec::Mtime as usize] + 12] += 40), "a run wider than 32 bits");
+    }
+
+    #[test]
+    fn load_rejects_bad_parent_bits() {
+        assert!(refused(|idx, m| m[idx.off[Sec::Parent as usize]] &= !1), "entry 0 starts no block");
+        assert!(refused(|idx, m| m[idx.off[Sec::Parent as usize]] |= 4), "a block start no folder has");
+        assert!(refused(|idx, m| m[idx.off[Sec::ParentRank as usize]] = 1), "rank off");
+    }
+
+    #[test]
+    fn load_rejects_bad_parent_map() {
+        // Blocks: 0 /, 1 /'s children, 2 /a's, 3 /a/b's, 4 /c's.
+        assert!(refused(|idx, m| set_bits(m, idx.off[Sec::ParentMap as usize], 4, width(idx.d), 3)), "/c's block mapped to /a/b");
+        assert!(refused(|idx, m| set_bits(m, idx.off[Sec::ParentMap as usize], 0, width(idx.d), 1)), "the root's own block not the root's");
+    }
+
+    #[test]
+    fn load_rejects_bad_name_ids() {
+        assert!(refused(|idx, m| set_bits(m, idx.off[Sec::EntName as usize], 3, width(idx.u), idx.u as u32)), "name id past the last name");
+        assert!(
+            refused(|idx, m| m[idx.off[Sec::NameOff as usize] + 2 * idx.u..][..2].copy_from_slice(&u16::MAX.to_le_bytes())),
+            "names end past the section"
+        );
+        assert!(
+            refused(|idx, m| m[idx.off[Sec::NameOff as usize] + 4..][..2].copy_from_slice(&u16::MAX.to_le_bytes())),
+            "a name ending before it starts"
+        );
+    }
+
+    #[test]
+    fn load_rejects_bad_name_ents() {
+        assert!(refused(|idx, m| set_bits(m, idx.off[Sec::NameEnts as usize], 0, width(idx.n), idx.n as u32)), "entry past the last");
+        assert!(
+            refused(|idx, m| set_bits(m, idx.off[Sec::NameEntsOff as usize], idx.u, width(idx.n + 1), idx.n as u32 - 1)),
+            "offsets not ending at n"
+        );
+        assert!(refused(|idx, m| set_bits(m, idx.off[Sec::NameEntsOff as usize], 1, width(idx.n + 1), idx.n as u32)), "offsets descending");
+    }
+
+    #[test]
+    fn load_rejects_bad_root() {
+        assert!(refused(|idx, m| m[idx.off[Sec::DirEntry as usize]] += 1), "folder 0 not entry 0");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirStart, 0, 2)), "root's block not right after it");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirEnd, 0, 8)), "root's subtree not everything");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirParent, 0, 1)), "root with a parent");
+    }
+
+    #[test]
+    fn load_rejects_unordered_folders() {
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirEntry, 2, 1)), "/c's entry not after /a's");
+    }
+
+    #[test]
+    fn load_rejects_bad_parents() {
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirParent, 1, 1)), "folder parented by itself");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirParent, 2, 1)), "/c's entry not in its parent's block");
+    }
+
+    #[test]
+    fn load_rejects_bad_subtrees() {
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirEnd, 3, 9)), "/a/b's subtree past /a's");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirEnd, 1, 9)), "/a's subtree over /c's");
+        assert!(refused(|idx, m| set_run(idx, m, Sec::DirStart, 3, 6)), "/a/b's block over /a's");
+    }
+
+    /// A packed name cut short reads as what is there, without panicking.
+    #[test]
+    fn corrupt_packed_name() {
+        let nm = b"0123456789abcdef0123456789abcdef";
+        let ls =
+            vec![Listing { id: 0, names: nm.to_vec(), ents: vec![RawEnt { name_off: 0, name_len: 32, kind: 0, size: 0, mtime: 0, child: NONE }] }];
+        let idx = Index::build(ls, 0, 0, b"/");
+        let (a, _) = idx.name_span(1);
+        assert_eq!(idx.names()[a], PACKED);
+        for seg in [0xBF, 0x7F, 0xFD] {
+            let bad = reload(&idx, |m| m[idx.off[Sec::Names as usize] + a + 1] = seg).unwrap();
+            assert!(bad.uname(1).len() <= 64);
+        }
     }
 }
