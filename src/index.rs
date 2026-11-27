@@ -931,15 +931,10 @@ impl Index {
 
     /// Write atomically (tmp + rename), stamping the current event id.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp)?;
         // The header with the current event id (the rest as built).
         let mut h = self.map[..HDR].to_vec();
         h[8 + 4 * 8..][..16].copy_from_slice(&[self.event_id.to_le_bytes(), (self.synced_at as u64).to_le_bytes()].concat());
-        f.write_all(&h)?;
-        f.write_all(&self.map[HDR..])?;
-        f.sync_data()?;
-        std::fs::rename(tmp, path)
+        write_atomic(path, &[&h, &self.map[HDR..]])
     }
 
     /// The event id a saved index is current as of, from its header alone.
@@ -978,6 +973,18 @@ impl Index {
         self.by_key();
         self.memo_plan();
     }
+}
+
+/// Replace `path` with `parts`, written in order, all at once (tmp +
+/// rename): a crash midway leaves the old file, never half of the new one.
+pub(crate) fn write_atomic(path: &Path, parts: &[&[u8]]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    for p in parts {
+        f.write_all(p)?;
+    }
+    f.sync_data()?;
+    std::fs::rename(tmp, path)
 }
 
 /// Section files (this index, content segments): a 4 KiB header (magic,

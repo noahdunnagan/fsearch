@@ -7,7 +7,7 @@
 
 use rayon::Scope;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -160,7 +160,26 @@ impl LazyDirs {
 /// Folders a scan was refused (EPERM): without Full Disk Access macOS also
 /// silently denies some, like ~/Library/Mail. Recorded only while paths are
 /// tracked, i.e. while SKIP is set.
-pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+pub static DENIED: Mutex<BTreeSet<Vec<u8>>> = Mutex::new(BTreeSet::new());
+
+/// Forget refused folders that are gone (or no longer folders). One that
+/// reads now stays: the next start rescans it. The disk is checked with the
+/// lock released, then again under it, since a scan may have refused a
+/// recreated folder in between.
+pub fn prune_denied() {
+    let gone = |p: &[u8]| {
+        std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(p)).map_or_else(|e| e.kind() == std::io::ErrorKind::NotFound, |m| !m.is_dir())
+    };
+    let listed: Vec<Vec<u8>> = DENIED.lock().unwrap().iter().cloned().collect();
+    let gone_now: Vec<Vec<u8>> = listed.into_iter().filter(|p| gone(p)).collect();
+    if gone_now.is_empty() {
+        return;
+    }
+    let mut denied = DENIED.lock().unwrap();
+    for p in gone_now.iter().filter(|p| gone(p)) {
+        denied.remove(p);
+    }
+}
 
 /// Entries the first run's whole-disk crawl has listed so far.
 pub static LISTED: AtomicUsize = AtomicUsize::new(0);
@@ -411,12 +430,11 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
         let parent = me.clone();
         s.spawn(move |s| {
             let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            // Read errno before the drop: closing the parent may change it.
+            let refused = fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             drop(parent);
-            if fd < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                && let Some(p) = &child_path
-            {
-                DENIED.lock().unwrap().push(p.clone());
+            if refused && let Some(p) = &child_path {
+                DENIED.lock().unwrap().insert(p.clone());
             }
             finish_dir(s, fd, child_path, cid, ctx);
         });
@@ -736,5 +754,17 @@ mod tests {
         s.prune();
         assert!(s.cachedir.read().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A rescan refused the same folder again: it is recorded once.
+    #[test]
+    fn denied_holds_a_folder_once() {
+        let p = format!("/nonexistent-fsearch-denied-{}", std::process::id()).into_bytes();
+        let mut d = DENIED.lock().unwrap();
+        d.extend([p.clone(), p.clone()]);
+        let n = d.iter().filter(|x| **x == p).count();
+        d.retain(|x| *x != p);
+        drop(d);
+        assert_eq!(n, 1);
     }
 }
