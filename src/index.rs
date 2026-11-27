@@ -1471,7 +1471,11 @@ mod tests {
     /// A corrupt `ext_table` length byte (> 15) must not panic in `ext_slot`.
     #[test]
     fn corrupt_ext_table_len() {
-        let ls = vec![Listing { id: 0, names: b"a.txt".to_vec(), ents: vec![RawEnt { name_off: 0, name_len: 5, kind: 0, size: 0, mtime: 0, child: NONE }] }];
+        let ls = vec![Listing {
+            id: 0,
+            names: b"a.txt".to_vec(),
+            ents: vec![RawEnt { name_off: 0, name_len: 5, kind: 0, size: 0, mtime: 0, child: NONE }],
+        }];
         let idx = Index::build(ls, 0, 0, b"/");
         let path = std::env::temp_dir().join(format!("fsearch-corrupt-ext-{}.bin", std::process::id()));
         idx.save(&path).unwrap();
