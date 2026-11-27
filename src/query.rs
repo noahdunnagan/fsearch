@@ -462,10 +462,8 @@ impl Query {
                 continue;
             }
             for (i, piece) in word.split('/').filter(|p| !p.is_empty()).enumerate() {
-                let n = q.tokens.len();
-                q.push_token(piece);
-                let grew = q.tokens.len() > n;
-                if let Some(t) = q.tokens.last_mut().filter(|t| i > 0 && grew && !t.negate) {
+                let pushed = q.push_token_inner(piece);
+                if let Some(t) = q.tokens.last_mut().filter(|t| i > 0 && pushed && !t.negate) {
                     t.under = true;
                 }
             }
@@ -506,6 +504,10 @@ impl Query {
     }
 
     pub fn push_token(&mut self, w: &str) {
+        self.push_token_inner(w);
+    }
+
+    fn push_token_inner(&mut self, w: &str) -> bool {
         let (mut t, mut negate, mut mode) = (w, false, Mode::Fuzzy);
         if let Some(r) = t.strip_prefix('!') {
             (t, negate, mode) = (r, true, Mode::Exact);
@@ -518,7 +520,7 @@ impl Query {
             (t, mode) = (r, Mode::Suffix);
         }
         if t.is_empty() {
-            return;
+            return false;
         }
         // Positive tokens are tracked in a u8 bitset: past 8, the first goes
         // (a long path's top folders tell the least).
@@ -534,6 +536,7 @@ impl Query {
         let mut t = Token { text, mask, mode, negate, edits: 0, deep: false, start: 0, rest: 0, under: false };
         t.set_typos(false);
         self.tokens.push(t);
+        true
     }
 
     /// Path words ("a/b"), as bits of the positive tokens: those written
@@ -572,7 +575,9 @@ impl Query {
     /// Apply filter `k:v`; false if `k` is not a filter name.
     pub fn filter(&mut self, k: &str, v: &str, home: &str) -> Result<bool, String> {
         match k {
-            "ext" => self.exts.extend(v.split(',').map(|e| e.trim_start_matches('.').to_ascii_lowercase().into_bytes())),
+            "ext" => self
+                .exts
+                .extend(v.split(',').map(|e| e.trim_start_matches('.')).filter(|e| !e.is_empty()).map(|e| e.to_ascii_lowercase().into_bytes())),
             "type" => {
                 for t in v.split(',') {
                     if t == "app" {
@@ -958,7 +963,7 @@ fn glob_alt(a: &str) -> Result<Alt, String> {
         None => (if a.trim_end_matches('/').contains('/') && a.contains(['*', '?', '[']) { Anchor::Scope } else { Anchor::Anywhere }, a),
     };
     let mut parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-    let name = if rest.ends_with('/') { None } else { parts.pop().map(Part::of).transpose()? };
+    let name = if rest.ends_with('/') || parts.last() == Some(&"**") { None } else { parts.pop().map(Part::of).transpose()? };
     Ok(Alt { from, dirs: parts.into_iter().map(Part::of).collect::<Result<_, _>>()?, name })
 }
 
@@ -1189,6 +1194,9 @@ type Wide<'a> = Option<&'a [u8; 64]>;
 
 /// `fuzzy_score` with the whole-name/stem/prefix bonus capped at `cap`.
 fn fuzzy_score_capped(name: &[u8], wide: Wide, q: &[u8], cap: i32) -> Option<i32> {
+    if q.is_empty() {
+        return None;
+    }
     if let Some(s) = prefix_score(name, q, cap) {
         return Some(s);
     }
@@ -1372,7 +1380,7 @@ fn fuzzy_from(
     // as good as a whole one, its length the stem's: "powercap" means
     // powercap.rst as much as a folder powercap (files go first on ties,
     // see `entry_key`).
-    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    let off = (name.len() > 1 && name[0] == b'.' && q[0] != b'.') as usize;
     let at_stem = || end + 1 == name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
     let (placed, len) = if start != off || end + 1 - start != q.len() {
         (0, name.len())
@@ -1391,9 +1399,9 @@ fn fuzzy_from(
 /// so the score comes from one pass over it. None if the name does not.
 #[inline]
 fn prefix_score(name: &[u8], q: &[u8], cap: i32) -> Option<i32> {
-    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    let off = (name.len() > 1 && name[0] == b'.' && q[0] != b'.') as usize;
     let end = off + q.len();
-    if (off == 1 && q[0] == b'.') || name.len() < end || !name[off..end].iter().zip(q).all(|(&a, &b)| fold(a) == b) {
+    if name.len() < end || !name[off..end].iter().zip(q).all(|(&a, &b)| fold(a) == b) {
         return None;
     }
     // The first byte follows a delimiter (or nothing); each next one runs on
@@ -1435,7 +1443,7 @@ fn rfind_folded(s: &[u8], c: u8) -> Option<usize> {
 fn single_score(name: &[u8], i: usize, cap: i32) -> i32 {
     let prev = if i == 0 { Class::Delim } else { class(name[i - 1]) };
     let mut score = SCORE_MATCH + bonus(prev, class(name[i])) * 2;
-    let off = (name.len() > 1 && name[0] == b'.') as usize;
+    let off = (name.len() > 1 && name[0] == b'.' && name[i] != b'.') as usize;
     let mut len = name.len();
     if i == off {
         let stem = name.iter().rposition(|&b| b == b'.').filter(|&p| p > off).unwrap_or(name.len());
@@ -1461,7 +1469,7 @@ fn single_score(name: &[u8], i: usize, cap: i32) -> i32 {
 /// `spaced` is false if the name has no space. Other word starts (`_`, `-`,
 /// camelCase) would cost a scan of every name per query, ~10x the price.
 fn typo_score(name: &[u8], wide: Wide, spaced: bool, q: &[u8]) -> Option<i32> {
-    let mut best = typo_at(name, wide, (name.len() > 1 && name[0] == b'.') as usize, q);
+    let mut best = typo_at(name, wide, (name.len() > 1 && name[0] == b'.' && q[0] != b'.') as usize, q);
     if spaced {
         for sp in memchr::memchr_iter(b' ', name) {
             best = best.max(typo_at(name, wide, sp + 1, q));
@@ -3386,16 +3394,16 @@ impl Searcher<'_> {
                 let dir = &path[..cut];
                 if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
                     let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
-                    out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
+                    out.push((Hit { score, idx: u32::MAX, over: Some(path.clone()) }, o.kind & 3 == KIND_FILE));
                 }
             }
             out
         };
         let mut hits = if cands.len() <= OVERLAY_CHUNK { score(&cands) } else { cands.par_chunks(OVERLAY_CHUNK).flat_map_iter(score).collect() };
-        // Best first, equal scores by path (the overlay map's order).
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
+        // Best first, equal scores with files before non-files, then by path.
+        hits.sort_by(|a, b| b.0.score.cmp(&a.0.score).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.over.cmp(&b.0.over)));
         hits.truncate(q.limit);
-        hits
+        hits.into_iter().map(|(h, _)| h).collect()
     }
 
     /// For each dir: which tokens its name or an ancestor's matches, with the
@@ -3630,12 +3638,13 @@ static MEMO_POOL: std::sync::Mutex<Vec<Vec<DirMemo>>> = std::sync::Mutex::new(Ve
 /// every name the same.
 #[derive(PartialEq)]
 struct NameKey {
-    tokens: Vec<(Vec<u8>, Mode, bool, bool)>,
+    tokens: Vec<(Vec<u8>, Mode, bool, bool, bool)>,
     exts: Vec<Vec<u8>>,
     /// `Query::not_exts` and the globs (as typed), which test names too.
     not_exts: Vec<Vec<u8>>,
     globs: Vec<(String, bool)>,
     name_re: Option<String>,
+    path_re: Option<String>,
     /// The entry range whose names alone were scored, if not all.
     scope: Option<(usize, usize)>,
 }
@@ -3643,11 +3652,12 @@ struct NameKey {
 impl NameKey {
     fn of(q: &Query, scope: Option<(usize, usize)>) -> NameKey {
         NameKey {
-            tokens: q.tokens.iter().map(|t| (t.text.clone(), t.mode, t.negate, t.deep)).collect(),
+            tokens: q.tokens.iter().map(|t| (t.text.clone(), t.mode, t.negate, t.deep, t.under)).collect(),
             exts: q.exts.clone(),
             not_exts: q.not_exts.clone(),
             globs: q.globs.iter().map(|g| (g.text.clone(), g.negate)).collect(),
             name_re: q.name_re.as_ref().map(|r| r.as_str().to_string()),
+            path_re: q.path_re.as_ref().map(|r| r.as_str().to_string()),
             scope,
         }
     }
@@ -3659,6 +3669,7 @@ impl NameKey {
             && self.not_exts == prev.not_exts
             && self.globs == prev.globs
             && self.name_re == prev.name_re
+            && self.path_re == prev.path_re
             && self.scope == prev.scope
             && self.tokens.len() == prev.tokens.len()
             && self.tokens.iter().any(|t| !t.2)
@@ -3666,13 +3677,14 @@ impl NameKey {
                 a.1 == b.1
                     && a.2 == b.2
                     && a.3 == b.3
+                    && a.4 == b.4
                     && if a.2 {
                         a.0 == b.0
                     } else if a.1 == Mode::Suffix {
                         a.0.ends_with(&b.0)
                     } else {
                         // Gaining a typo widens the match: score afresh.
-                        let typos = |t: &(Vec<u8>, Mode, bool, bool)| typo_edits(&t.0, t.1).min(1 + t.3 as u32);
+                        let typos = |t: &(Vec<u8>, Mode, bool, bool, bool)| typo_edits(&t.0, t.1).min(1 + t.3 as u32);
                         a.0.starts_with(&b.0) && typos(a) == typos(b)
                     }
             })
@@ -4087,5 +4099,205 @@ mod tests {
     fn app_links_only_as_folders() {
         assert!(Query::parse("type:app", "/h").unwrap().kind_ok(KIND_LINK));
         assert!(!Query::parse("type:app kind:file", "/h").unwrap().kind_ok(KIND_LINK));
+    }
+
+    #[test]
+    fn name_cache_separates_path_re() {
+        let ent = |off, len| RawEnt { name_off: off, name_len: len, kind: KIND_FILE, size: 1, mtime: 1, child: NONE };
+        let l = Live::new(Index::build(vec![Listing { id: 0, names: b"main.rsmain.py".to_vec(), ents: vec![ent(0, 7), ent(7, 7)] }], 0, 0, b"/h"));
+        let s = Searcher { live: &l };
+        let q_rs = Query::parse("path:rs$ main", "/h").unwrap();
+        assert_eq!(s.search(&q_rs).len(), 1);
+
+        let q_all = Query::parse("main", "/h").unwrap();
+        assert_eq!(s.search(&q_all).len(), 2);
+
+        let q_py = Query::parse("path:py$ main", "/h").unwrap();
+        let hits = s.search(&q_py);
+        assert_eq!(hits.len(), 1);
+        let mut p = Vec::new();
+        l.base.path(hits[0].idx as usize, &mut p);
+        assert_eq!(p, b"/main.py");
+    }
+
+    #[test]
+    fn name_cache_separates_under_token() {
+        let l = Live::new(Index::build(
+            vec![Listing {
+                id: 0,
+                names: b"foobar".to_vec(),
+                ents: vec![RawEnt { name_off: 0, name_len: 6, kind: KIND_FILE, size: 1, mtime: 1, child: NONE }],
+            }],
+            0,
+            0,
+            b"/h",
+        ));
+        let id = l.base.ent_names().get(1);
+        let s = Searcher { live: &l };
+
+        let q1 = Query::parse("foo bar", "/h").unwrap();
+        let pos1: Vec<&Token> = q1.tokens.iter().filter(|t| !t.negate).collect();
+        let s1 = s.names(&q1, &pos1, &[], 1, l.base.n).names.get(id).unwrap().score;
+
+        let q2 = Query::parse("foo/bar", "/h").unwrap();
+        let pos2: Vec<&Token> = q2.tokens.iter().filter(|t| !t.negate).collect();
+        let s2 = s.names(&q2, &pos2, &[], 1, l.base.n).names.get(id).unwrap().score;
+
+        assert_ne!(s1, s2);
+        assert_eq!(s1 - s2, 100);
+    }
+
+    #[test]
+    fn under_flag_preserved_past_token_cap() {
+        let q1 = Query::parse("a/b/c/d/e/f/g/h/i", "/h").unwrap();
+        assert_eq!(q1.tokens.len(), 8);
+        assert!(q1.tokens.last().unwrap().under);
+        assert!(!q1.tokens.first().unwrap().under);
+
+        let q2 = Query::parse("t1 t2 t3 t4 t5 t6 t7 t8 dir/file", "/h").unwrap();
+        assert_eq!(q2.tokens.len(), 8);
+        assert!(q2.tokens.last().unwrap().under);
+    }
+
+    #[test]
+    fn empty_ext_ignored() {
+        assert_eq!(Query::parse("ext:rs,", "/h").unwrap().exts, vec![b"rs".to_vec()]);
+        assert!(Query::parse("ext:", "/h").unwrap().exts.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_score_empty_query() {
+        assert_eq!(fuzzy_score(b".a", b""), None);
+        assert_eq!(fuzzy_score(b"", b""), None);
+    }
+
+    #[test]
+    fn overlay_tie_prefers_file_over_dir() {
+        let mut l = Live::new(Index::build(vec![Listing::default()], 0, 0, b"/h"));
+        for (path, kind) in [(&b"/aa_item"[..], KIND_DIR), (&b"/bb_item"[..], KIND_FILE)] {
+            let e = crate::live::OEnt::new(path, kind, 0, 1);
+            l.flat.masks.push(e.mask);
+            l.flat.items.push((path.to_vec(), e));
+            l.over.insert(path.to_vec(), e);
+        }
+        let q = Query::parse("limit:1 item", "/h").unwrap();
+        let hits = Searcher { live: &l }.search(&q);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].over.as_deref(), Some(&b"/bb_item"[..]));
+    }
+
+    #[test]
+    fn glob_trailing_double_star_matches_descendants() {
+        let ent = |off, len, kind, child| RawEnt { name_off: off, name_len: len, kind, size: 1, mtime: 1, child };
+        let mut l = Live::new(Index::build(
+            vec![
+                Listing { id: 0, names: b"p".to_vec(), ents: vec![ent(0, 1, KIND_DIR, 1)] },
+                Listing {
+                    id: 1,
+                    names: b"a.rssrcother".to_vec(),
+                    ents: vec![ent(0, 4, KIND_FILE, NONE), ent(4, 3, KIND_DIR, 2), ent(7, 5, KIND_DIR, 4)],
+                },
+                Listing { id: 2, names: b"a.rssub".to_vec(), ents: vec![ent(0, 4, KIND_FILE, NONE), ent(4, 3, KIND_DIR, 3)] },
+                Listing { id: 3, names: b"b.rs".to_vec(), ents: vec![ent(0, 4, KIND_FILE, NONE)] },
+                Listing { id: 4, names: b"a.rs".to_vec(), ents: vec![ent(0, 4, KIND_FILE, NONE)] },
+            ],
+            0,
+            0,
+            b"/h",
+        ));
+        for (path, name) in [
+            (&b"/p/src/over_direct.rs"[..], &b"over_direct.rs"[..]),
+            (&b"/p/src/sub/over_nested.rs"[..], &b"over_nested.rs"[..]),
+            (&b"/p/other/over_other.rs"[..], &b"over_other.rs"[..]),
+        ] {
+            let e = crate::live::OEnt::new(name, KIND_FILE, 1, 1);
+            l.flat.masks.push(e.mask);
+            l.flat.items.push((path.to_vec(), e));
+            l.over.insert(path.to_vec(), e);
+        }
+        let search = |raw: &str| -> Vec<Vec<u8>> {
+            let q = Query::parse(raw, "/h").unwrap();
+            let mut out: Vec<Vec<u8>> = Searcher { live: &l }
+                .search(&q)
+                .into_iter()
+                .map(|h| {
+                    if let Some(p) = h.over {
+                        p
+                    } else {
+                        let mut p = Vec::new();
+                        l.base.path(h.idx as usize, &mut p);
+                        p
+                    }
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        let q_inc = Query::parse("in:/p src/**", "/h").unwrap();
+        assert!(q_inc.match_path(b"/p/src/a.rs", KIND_FILE, 1, 1).is_some());
+        assert!(q_inc.match_path(b"/p/src/sub/b.rs", KIND_FILE, 1, 1).is_some());
+        assert!(q_inc.match_path(b"/p/other/a.rs", KIND_FILE, 1, 1).is_none());
+        assert!(q_inc.match_path(b"/p/src", KIND_DIR, 0, 1).is_none());
+        assert_eq!(
+            search("in:/p src/**"),
+            vec![
+                b"/p/src/a.rs".to_vec(),
+                b"/p/src/over_direct.rs".to_vec(),
+                b"/p/src/sub".to_vec(),
+                b"/p/src/sub/b.rs".to_vec(),
+                b"/p/src/sub/over_nested.rs".to_vec(),
+            ]
+        );
+
+        let q_exc = Query::parse("in:/p !src/**", "/h").unwrap();
+        assert!(q_exc.match_path(b"/p/src/a.rs", KIND_FILE, 1, 1).is_none());
+        assert!(q_exc.match_path(b"/p/src/sub/b.rs", KIND_FILE, 1, 1).is_none());
+        assert!(q_exc.match_path(b"/p/other/a.rs", KIND_FILE, 1, 1).is_some());
+        assert_eq!(
+            search("in:/p !src/**"),
+            vec![b"/p/a.rs".to_vec(), b"/p/other".to_vec(), b"/p/other/a.rs".to_vec(), b"/p/other/over_other.rs".to_vec(), b"/p/src".to_vec(),]
+        );
+
+        let q_all = Query::parse("in:/p **", "/h").unwrap();
+        assert!(q_all.match_path(b"/p/a.rs", KIND_FILE, 1, 1).is_some());
+        assert!(q_all.match_path(b"/p/src/sub/b.rs", KIND_FILE, 1, 1).is_some());
+        let all = search("in:/p **");
+        assert!(all.contains(&b"/p/a.rs".to_vec()));
+        assert!(all.contains(&b"/p/src/sub/b.rs".to_vec()));
+        assert!(all.contains(&b"/p/src/sub/over_nested.rs".to_vec()));
+
+        let q_ext = Query::parse("in:/p src/**.rs", "/h").unwrap();
+        assert!(q_ext.match_path(b"/p/src/a.rs", KIND_FILE, 1, 1).is_some());
+        assert!(q_ext.match_path(b"/p/src/sub/b.rs", KIND_FILE, 1, 1).is_none());
+        assert_eq!(search("in:/p src/**.rs"), vec![b"/p/src/a.rs".to_vec(), b"/p/src/over_direct.rs".to_vec()]);
+    }
+
+    #[test]
+    fn dotfile_explicit_query_gets_placement_bonus() {
+        let general = fuzzy_from(
+            b".zshrc",
+            b".zshrc",
+            100,
+            5,
+            |k, from, to| Some(from + find_folded(&b".zshrc"[from..=to], b".zshrc"[k])?),
+            |k, to| rfind_folded(&b".zshrc"[..to], b".zshrc"[k]),
+        );
+        assert_eq!(prefix_score(b".zshrc", b".zshrc", 100), general);
+        assert!(prefix_score(b".zshrc", b".zshrc", 100).is_some());
+
+        let exact = fuzzy_score(b".zshrc", b".zshrc").unwrap();
+        let unplaced = fuzzy_score(b"a.zshrc", b".zshrc").unwrap();
+        assert_eq!(exact - unplaced, 100);
+        assert_eq!(fuzzy_score(b".zshrc.bak", b".zshrc"), Some(exact));
+        assert!(exact > fuzzy_score(b".zshrc_bak", b".zshrc").unwrap());
+        assert_eq!(fuzzy_score(b".zshrc", b"zshrc"), Some(128 + 100 + DOT_WHOLE - 2));
+
+        assert_eq!(prefix_score(b".a", b".", FULL), fuzzy_score(b".a", b"."));
+        assert_eq!(fuzzy_score(b".a", b"."), Some(SCORE_MATCH + 30));
+        assert_eq!(fuzzy_score(b".", b"."), Some(SCORE_MATCH + 100));
+
+        assert!(typo_score(b".zshrc", None, false, b".zsrhc").is_some());
+        assert!(typo_score(b".zshrc", None, false, b"zsrhc").is_some());
     }
 }
