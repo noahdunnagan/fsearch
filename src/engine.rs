@@ -1055,8 +1055,10 @@ impl Pace {
     /// Hold back the folders of `dirs` that ran too far ahead; add the held
     /// ones now free.
     fn sort(&mut self, dirs: &mut HashMap<Vec<u8>, (bool, u64)>, now: Instant) {
-        // (A restoration's id 0 is never held: its record goes with the save it asks for.)
-        let early: Vec<Vec<u8>> = dirs.iter().filter(|&(d, &(_, id))| id != 0 && !self.free(d, now)).map(|(d, _)| d.clone()).collect();
+        // (A restoration's id 0 and root rebuilds are never held: their
+        // record/recovery cannot wait on pace.)
+        let early: Vec<Vec<u8>> =
+            dirs.iter().filter(|&(d, &(rec, id))| id != 0 && !(rec && d == b"/") && !self.free(d, now)).map(|(d, _)| d.clone()).collect();
         for d in early {
             let (r, id) = dirs.remove(&d).unwrap();
             let h = self.held.entry(d).or_insert((r, id));
@@ -1180,7 +1182,10 @@ impl Lazy {
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
-    let mut last_save = Instant::now();
+    apply_loop_from(shared, rx, Instant::now(), Instant::now());
+}
+
+fn apply_loop_from(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>, mut last_events: Instant, mut last_save: Instant) {
     let mut last_follow = Instant::now();
     let ours = shared.ours.as_slice();
     // Events fseventsd dropped before we read them: (replay from, last drop).
@@ -1192,8 +1197,6 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
     let mut last_relist: Option<Instant> = None;
     // The last batch's pending count and base size, for the wait below.
     let (mut pending, mut n_base) = (0usize, 0usize);
-    // When the apply loop last received a non-empty event batch.
-    let mut last_events = Instant::now();
     // The highest event id ever seen: the watermark may rise to it once
     // nothing is pending, even on wakes that applied nothing new.
     let mut seen_max = 0u64;
@@ -1227,35 +1230,39 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         events.extend(rx.try_iter().flatten());
         // A stream replaced from outside (a follower reloading its owner's
         // save) replays from its own start into a snapshot that holds none
-        // of what was seen before: seen_max and a gap restart from there.
+        // of what was seen before: seen_max and any old-stream gap restart
+        // from there (unless a deferred relist is still waiting out cooldown).
         let current = shared.streams.load(Ordering::Relaxed);
         if current != stream {
             let since = shared.since.load(Ordering::Relaxed);
-            (stream, seen_max, gap) = (current, since, gap.map(|(_, at)| (since, at)));
+            (stream, seen_max) = (current, since);
+            if relist_due.is_some() {
+                gap = gap.map(|(_, at)| (since, at));
+            } else {
+                (gap, replays) = (None, 0);
+            }
         }
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| under(&e.path, ours));
-        let (mut rebuild, mut root_flags, had_events) = (false, 0, !events.is_empty());
-        if had_events {
-            last_events = Instant::now();
-        }
+        let (mut rebuild, mut root_flags, had_events, mut had_prompt) = (false, 0, !events.is_empty(), false);
         let mut dirs: HashMap<Vec<u8>, (bool, u64)> = HashMap::new();
         if had_events {
             let (evt, wall) = (Instant::now(), crate::query::now_secs());
             let (mut last_good, synced) = shared.live.read().unwrap().as_ref().map_or((0, 0), |l| (l.event_id, l.synced_at));
             for e in events {
                 if e.path == b"/" && e.flags & MUST_SCAN_SUBDIRS != 0 {
+                    // A replaced stream's drop is covered by the stream that replaced it.
+                    if e.stream != current {
+                        continue;
+                    }
                     // fseventsd still logged what it dropped for us (a kernel
                     // drop never reached it): replay from the last event we
                     // did get, once the drops stop; a drop during a replay
-                    // starts that replay over. A replaced stream's drop is
-                    // covered by the stream that replaced it.
+                    // starts that replay over.
                     if e.flags & (USER_DROPPED | KERNEL_DROPPED) == USER_DROPPED {
-                        if e.stream == current {
-                            let from = if shared.replaying.load(Ordering::Relaxed) { shared.since.load(Ordering::Relaxed) } else { last_good };
-                            gap = Some((gap.map_or(from, |(g, _)| g.min(from)), Instant::now()));
-                        }
+                        let from = if shared.replaying.load(Ordering::Relaxed) { shared.since.load(Ordering::Relaxed) } else { last_good };
+                        gap = Some((gap.map_or(from, |(g, _)| g.min(from)), Instant::now()));
                         continue;
                     }
                     root_flags |= e.flags;
@@ -1296,9 +1303,13 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     lazy.add(&unit, d, e.flags & MUST_SCAN_SUBDIRS != 0, e.id, evt, wall);
                     continue;
                 }
+                had_prompt = true;
                 let d = dirs.entry(d).or_insert((false, e.id));
                 *d = (d.0 | (e.flags & MUST_SCAN_SUBDIRS != 0), d.1.min(e.id));
             }
+        }
+        if had_prompt {
+            last_events = Instant::now();
         }
         let now = Instant::now();
         pace.sort(&mut dirs, now);
@@ -1348,7 +1359,8 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         // through the same fetch-under-read-lock, apply-under-write-lock
         // path prompt ones do — minus Pace.
         let due = lazy.due(now);
-        if !due.is_empty() {
+        let had_due = !due.is_empty();
+        if had_due {
             let hooks = shared.on_change.read().unwrap();
             if !hooks.is_empty() {
                 let changed: Vec<(&[u8], bool)> = due.iter().map(|(p, r)| (p.as_slice(), *r)).collect();
@@ -1383,7 +1395,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
         }
         let replay = gap.filter(|(_, at)| at.elapsed() >= replay_delay(replays)).map(|(from, _)| from);
-        if rebuild || (replay.is_some() && replays >= 3) && relist_due.is_none() {
+        if (rebuild || (replay.is_some() && replays >= 3)) && relist_due.is_none() {
             let why = match root_flags {
                 f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
                 0 => "events dropped again while replaying",
@@ -1402,11 +1414,12 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         } else if let Some(from) = replay {
             log(format!("FSEvents dropped events before we read them: replaying from {from}"));
             shared.watch(from);
+            stream = shared.streams.load(Ordering::Relaxed);
             // Ids past `from` arrive again from the replay: the watermark
             // mustn't run ahead of them on what was seen before the drop.
             seen_max = from;
             (gap, replays) = (None, replays + 1);
-        } else if had_events && gap.is_none() && pace.held.is_empty() && !shared.replaying.load(Ordering::Relaxed) {
+        } else if (had_events || had_dirs || had_due) && gap.is_none() && pace.held.is_empty() && !shared.replaying.load(Ordering::Relaxed) {
             // Everything up to this batch is applied (a change's event can
             // trail it by the stream latency; relisting keeps a margin) —
             // except pending lazy changes, so cap at the oldest one's
@@ -1442,6 +1455,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         let asked = shared.save_requested.swap(false, Ordering::Relaxed);
         if should_compact(pending, n_base, last_events.elapsed(), stale.then(|| last_save.elapsed()), asked) {
             compact(shared);
+            pending = 0;
             last_save = Instant::now();
         }
     }
@@ -1461,14 +1475,14 @@ fn compact_soft(n_base: usize) -> usize {
 
 /// Whether to fold the overlay into the base now: always when asked; past
 /// the hard bound even mid-churn; past the soft one once the disk has been
-/// quiet for COMPACT_QUIET; or with unsaved changes twice a day, again once
-/// quiet. (`stale_for`: how long the last save is, when changes are
-/// unsaved.)
+/// quiet for COMPACT_QUIET; or with unsaved changes twice a day once quiet
+/// (and once a day even without quiet). (`stale_for`: how long the last
+/// save is, when changes are unsaved.)
 fn should_compact(pending: usize, n_base: usize, quiet_for: Duration, stale_for: Option<Duration>, asked: bool) -> bool {
     asked
         || pending > COMPACT_HARD
         || (pending > compact_soft(n_base) && quiet_for >= COMPACT_QUIET)
-        || (stale_for.is_some_and(|s| s >= COMPACT_EVERY) && quiet_for >= COMPACT_QUIET)
+        || stale_for.is_some_and(|s| s >= 2 * COMPACT_EVERY || (s >= COMPACT_EVERY && quiet_for >= COMPACT_QUIET))
 }
 
 /// How long a replay after `replays` failed ones waits for quiet first,
@@ -1906,5 +1920,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(s.owner.load(Ordering::Relaxed));
         assert!(saved.lookup(folder.join("f.txt").as_os_str().as_bytes()).is_some(), "saved before the restoration was applied");
+    }
+
+    /// Replacing the stream externally (`follow()`) clears any pending
+    /// `USER_DROPPED` gap from the old stream so the new stream's watermark
+    /// advances normally.
+    #[test]
+    fn replaced_stream_clears_stale_user_drop_gap() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-user-drop-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let (seen, loop_has_it) = std::sync::mpsc::channel();
+        s.on_change.write().unwrap().push(Box::new(move |_| {
+            let _ = seen.send(());
+        }));
+        let event = |path: &[u8], flags, id, stream| fsevents::Event { path: path.to_vec(), flags, id, stream };
+        // Old stream (0) drops events (setting `gap`), plus a prompt event so we
+        // can synchronize on its iteration completing.
+        s.wake.send(vec![event(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED, 105, 0), event(b"/nonexistent-fsearch-gap/a", 0, 106, 0)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+        // External stream replacement (simulating `follow()`).
+        *s.live.write().unwrap() = Some(Live::new(Index::build(above(&d), 500, 0, b"/h")));
+        s.since.store(500, Ordering::Relaxed);
+        s.streams.fetch_add(1, Ordering::Relaxed);
+        s.wake.send(vec![event(b"/nonexistent-fsearch-gap/b", 0, 505, 1)]).unwrap();
+        loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
+        s.save_requested.store(true, Ordering::Relaxed);
+        s.wake.send(Vec::new()).unwrap();
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::saved_event_id(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(saved, 505, "stale USER_DROPPED gap from old stream held back new stream's watermark");
+    }
+
+    /// A `KERNEL_DROPPED` (or history-unavailable) root event from a replaced
+    /// stream must be ignored so it does not trigger a rebuild/relist or pin
+    /// the new stream's watermark.
+    #[test]
+    fn stale_stream_kernel_drop_is_ignored() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-stale-kdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (s, rx) = owner(&d, Index::build(vec![Listing::default()], 500, u32::MAX, b"/h"));
+        s.streams.store(1, Ordering::Relaxed);
+        s.since.store(500, Ordering::Relaxed);
+        s.replaying.store(true, Ordering::Relaxed);
+        s.save_requested.store(true, Ordering::Relaxed);
+        let saw_root = Arc::new(AtomicBool::new(false));
+        let saw_root_hook = saw_root.clone();
+        s.on_change.write().unwrap().push(Box::new(move |dirs| {
+            if dirs.iter().any(|(p, _)| *p == b"/") {
+                saw_root_hook.store(true, Ordering::Relaxed);
+            }
+        }));
+        let event = |path: &[u8], flags, id, stream| fsevents::Event { path: path.to_vec(), flags, id, stream };
+        s.wake.send(vec![event(b"/", MUST_SCAN_SUBDIRS | KERNEL_DROPPED, 900, 0), event(b"/nonexistent-fsearch-kdrop/a", 0, 501, 1)]).unwrap();
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop(&looping, rx));
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_secs(10);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::load(&path).expect("saved");
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!saw_root.load(Ordering::Relaxed), "stale KERNEL_DROPPED triggered a root rebuild");
+        assert_eq!(saved.synced_at, u32::MAX, "stale KERNEL_DROPPED triggered a bogus relist");
+        assert_eq!(saved.event_id, 501, "stale KERNEL_DROPPED held back the watermark");
+    }
+
+    /// A recursive root event (`b"/"`, `MUST_SCAN_SUBDIRS`) must never be held
+    /// back by `Pace::sort`.
+    #[test]
+    fn root_rebuild_is_never_paced() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        pace.listed(b"/", Duration::from_secs(1), now);
+        let mut dirs = HashMap::from([(b"/".to_vec(), (true, 7))]);
+        pace.sort(&mut dirs, now);
+        assert!(dirs.contains_key(b"/".as_slice()) && pace.held.is_empty(), "a root rebuild must never be paced");
+        let mut flat_root = HashMap::from([(b"/".to_vec(), (false, 8))]);
+        pace.sort(&mut flat_root, now);
+        assert!(flat_root.is_empty() && pace.held.len() == 1, "non-recursive root event is still paced");
+    }
+
+    /// Periodic compaction still fires at `2 * COMPACT_EVERY` without quiet,
+    /// and lazy-only events in `apply_loop` do not reset the prompt-quiet
+    /// clock.
+    #[test]
+    fn compact_hard_age_bound_and_lazy_does_not_starve() {
+        assert!(!should_compact(1, 0, Duration::ZERO, Some(2 * COMPACT_EVERY - Duration::from_secs(1)), false));
+        assert!(should_compact(1, 0, Duration::ZERO, Some(2 * COMPACT_EVERY), false));
+
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-lazy-starve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let _ = walk::LAZY.set(walk::LazyDirs::build(b"/h", false));
+        let lazy_event = d.join("node_modules/pkg");
+        assert!(walk::LAZY.get().is_some_and(|l| l.unit(lazy_event.as_os_str().as_bytes()).is_some()));
+        let (s, rx) = owner(&d, Index::build(above(&d), 100, 0, b"/h"));
+        // Exceed the soft compaction bound so quiet_for >= COMPACT_QUIET
+        // triggers compaction without needing a 12-hour Instant subtraction.
+        s.live.write().unwrap().as_mut().unwrap().dead_count = COMPACT_PENDING + 1;
+        let old_events = Instant::now().checked_sub(COMPACT_QUIET + Duration::from_secs(1)).unwrap();
+        let looping = s.clone();
+        std::thread::spawn(move || apply_loop_from(&looping, rx, old_events, Instant::now()));
+        s.wake.send(vec![fsevents::Event { path: lazy_event.as_os_str().as_bytes().to_vec(), flags: 0, id: 102, stream: 0 }]).unwrap();
+        let path = d.join("index.bin");
+        let until = Instant::now() + Duration::from_millis(500);
+        while Index::saved_event_id(&path).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = Index::saved_event_id(&path);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(saved.is_some(), "lazy-only event batch starved periodic compaction");
     }
 }
