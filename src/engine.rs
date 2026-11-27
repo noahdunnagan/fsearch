@@ -1940,12 +1940,7 @@ mod tests {
         let event = |path: &[u8], flags, id, stream| fsevents::Event { path: path.to_vec(), flags, id, stream };
         // Old stream (0) drops events (setting `gap`), plus a prompt event so we
         // can synchronize on its iteration completing.
-        s.wake
-            .send(vec![
-                event(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED, 105, 0),
-                event(b"/nonexistent-fsearch-gap/a", 0, 106, 0),
-            ])
-            .unwrap();
+        s.wake.send(vec![event(b"/", MUST_SCAN_SUBDIRS | USER_DROPPED, 105, 0), event(b"/nonexistent-fsearch-gap/a", 0, 106, 0)]).unwrap();
         loop_has_it.recv_timeout(Duration::from_secs(10)).unwrap();
         // External stream replacement (simulating `follow()`).
         *s.live.write().unwrap() = Some(Live::new(Index::build(above(&d), 500, 0, b"/h")));
@@ -1986,12 +1981,7 @@ mod tests {
             }
         }));
         let event = |path: &[u8], flags, id, stream| fsevents::Event { path: path.to_vec(), flags, id, stream };
-        s.wake
-            .send(vec![
-                event(b"/", MUST_SCAN_SUBDIRS | KERNEL_DROPPED, 900, 0),
-                event(b"/nonexistent-fsearch-kdrop/a", 0, 501, 1),
-            ])
-            .unwrap();
+        s.wake.send(vec![event(b"/", MUST_SCAN_SUBDIRS | KERNEL_DROPPED, 900, 0), event(b"/nonexistent-fsearch-kdrop/a", 0, 501, 1)]).unwrap();
         let looping = s.clone();
         std::thread::spawn(move || apply_loop(&looping, rx));
         let path = d.join("index.bin");
@@ -2042,9 +2032,7 @@ mod tests {
         let old_events = Instant::now().checked_sub(COMPACT_QUIET + Duration::from_secs(1)).unwrap();
         let looping = s.clone();
         std::thread::spawn(move || apply_loop_from(&looping, rx, old_events, Instant::now()));
-        s.wake
-            .send(vec![fsevents::Event { path: lazy_event.as_os_str().as_bytes().to_vec(), flags: 0, id: 102, stream: 0 }])
-            .unwrap();
+        s.wake.send(vec![fsevents::Event { path: lazy_event.as_os_str().as_bytes().to_vec(), flags: 0, id: 102, stream: 0 }]).unwrap();
         let path = d.join("index.bin");
         let until = Instant::now() + Duration::from_millis(500);
         while Index::saved_event_id(&path).is_none() && Instant::now() < until {
