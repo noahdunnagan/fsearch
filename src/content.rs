@@ -1430,7 +1430,9 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
         }
         if skipped(&rel[..at + c.len()], c, |m| on_disk(&join(&path[..home.len() + 1 + at + c.len()], m)).is_some()) {
             let mut above = (0..at).filter(|&i| rel[i] == b'/');
-            return above.any(|i| on_disk(&join(&path[..home.len() + 1 + i], b".git")).is_some());
+            if !above.any(|i| on_disk(&join(&path[..home.len() + 1 + i], b".git")).is_some()) {
+                return false;
+            }
         }
         at += c.len() + 1;
     }
@@ -1461,6 +1463,11 @@ pub const SKIP_LIST: &str = "content-skip.txt";
 static USER_SKIPS: Mutex<UserSkips> = Mutex::new((None, None));
 type UserSkips = (Option<PathBuf>, Option<Vec<Vec<u8>>>);
 
+/// Expand `~` only when equal to `~` or starting with `~/`.
+fn expand_tilde(p: &[u8], home: &[u8]) -> Option<Vec<u8>> {
+    if p == b"~" { Some(home.to_vec()) } else { p.strip_prefix(b"~/").map(|r| join(home, r)) }
+}
+
 /// The skip list's folders, as absolute paths.
 fn skip_list(home: &[u8]) -> Vec<Vec<u8>> {
     let path = USER_SKIPS.lock().unwrap().0.clone();
@@ -1469,11 +1476,7 @@ fn skip_list(home: &[u8]) -> Vec<Vec<u8>> {
         .filter(|l| !l.is_empty() && !l.starts_with(b"#"))
         .map(|l| {
             let l = l.strip_suffix(b"/").unwrap_or(l);
-            match l.strip_prefix(b"~") {
-                Some(rest) => [home, rest].concat(),
-                None if l.starts_with(b"/") => l.to_vec(),
-                None => join(home, l),
-            }
+            expand_tilde(l, home).unwrap_or_else(|| if l.starts_with(b"/") { l.to_vec() } else { join(home, l) })
         })
         .collect()
 }
@@ -1523,28 +1526,34 @@ struct Rules {
     up: Option<Arc<Rules>>,
 }
 
+/// An ignore file's globs, parsed once per version of it.
+fn globs_entry(path: &[u8], entry: Option<(u8, u64, u32)>) -> Option<Arc<Globs>> {
+    let (kind, size, mtime) = entry?;
+    if kind & 3 != KIND_FILE {
+        return None;
+    }
+    let mut parsed = PARSED.lock().unwrap();
+    if let Some((s, m, g)) = parsed.get(path)
+        && (*s, *m) == (size, mtime)
+    {
+        return g.clone();
+    }
+    let g = std::fs::read(OsStr::from_bytes(path)).ok().and_then(|t| Globs::parse(&t)).map(Arc::new);
+    parsed.insert(path.to_vec(), (size, mtime, g.clone()));
+    g
+}
+
 impl<'a> Scope<'a> {
     fn new(home: &'a [u8], look: Look<'a>) -> Scope<'a> {
         let mut s = Scope { home, look, global: None, skips: skip_list(home), dirs: HashMap::new(), last: None };
-        s.global = s.globs(&excludes_file(home));
+        let ef = excludes_file(home);
+        s.global = globs_entry(&ef, on_disk(&ef));
         s
     }
 
     /// An ignore file's globs, parsed once per version of it.
     fn globs(&self, path: &[u8]) -> Option<Arc<Globs>> {
-        let (kind, size, mtime) = (self.look)(path)?;
-        if kind & 3 != KIND_FILE {
-            return None;
-        }
-        let mut parsed = PARSED.lock().unwrap();
-        if let Some((s, m, g)) = parsed.get(path)
-            && (*s, *m) == (size, mtime)
-        {
-            return g.clone();
-        }
-        let g = std::fs::read(OsStr::from_bytes(path)).ok().and_then(|t| Globs::parse(&t)).map(Arc::new);
-        parsed.insert(path.to_vec(), (size, mtime, g.clone()));
-        g
+        globs_entry(path, (self.look)(path))
     }
 
     /// Did this folder's ignore files or repo root change since a sync last
@@ -1691,7 +1700,7 @@ fn excludes_file(home: &[u8]) -> Vec<u8> {
             {
                 let v = l[eq + 1..].trim_ascii();
                 let v = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v);
-                found = Some(v.strip_prefix(b"~").map_or(v.to_vec(), |r| [home, r].concat()));
+                found = Some(expand_tilde(v, home).unwrap_or_else(|| v.to_vec()));
             }
         }
         if let Some(f) = found {
@@ -1699,6 +1708,32 @@ fn excludes_file(home: &[u8]) -> Vec<u8> {
         }
     }
     [home, b"/.config/git/ignore"].concat()
+}
+
+/// Collapse `.` and `..` components on an absolute path.
+fn normalize_rel_path(path: &[u8]) -> Vec<u8> {
+    if !path.starts_with(b"/") {
+        return path.to_vec();
+    }
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for c in path.split(|&b| b == b'/') {
+        match c {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(c),
+        }
+    }
+    if parts.is_empty() {
+        return b"/".to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len());
+    for p in parts {
+        out.push(b'/');
+        out.extend_from_slice(p);
+    }
+    out
 }
 
 /// The git dir of the repo rooted at `dir`: its `.git`, or for a worktree
@@ -1710,10 +1745,12 @@ fn git_dir(dir: &[u8], kind: u8) -> Option<Vec<u8>> {
     }
     let text = std::fs::read(OsStr::from_bytes(&dot)).ok()?;
     let to = text.strip_prefix(b"gitdir:")?.trim_ascii();
-    let git = if to.starts_with(b"/") { to.to_vec() } else { join(dir, to) };
+    let git = normalize_rel_path(&if to.starts_with(b"/") { to.to_vec() } else { join(dir, to) });
     Some(match std::fs::read(OsStr::from_bytes(&join(&git, b"commondir"))) {
-        Ok(c) if c.trim_ascii().starts_with(b"/") => c.trim_ascii().to_vec(),
-        Ok(c) => join(&git, c.trim_ascii()),
+        Ok(c) => {
+            let c = c.trim_ascii();
+            normalize_rel_path(&if c.starts_with(b"/") { c.to_vec() } else { join(&git, c) })
+        }
         Err(_) => git,
     })
 }
@@ -1786,6 +1823,7 @@ fn ignore_line(line: &[u8]) -> Option<(String, bool, bool)> {
     if line.starts_with(b"#") {
         return None;
     }
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     let mut l = if line.ends_with(b"\\ ") { line } else { line.trim_ascii_end() };
     let (mut white, mut anchored, mut dir) = (false, false, false);
     if l.starts_with(b"\\!") || l.starts_with(b"\\#") {
@@ -1861,26 +1899,61 @@ fn glob_regex(g: &[u8]) -> Option<String> {
                 // A class; unclosed, a literal '['.
                 let neg = matches!(g.get(i + 1), Some(b'!' | b'^'));
                 let start = i + 1 + neg as usize;
-                match (start + 1..g.len()).find(|&j| g[j] == b']') {
+                let mut end = None;
+                let mut k = start;
+                while k < g.len() {
+                    if g[k] == b'\\' {
+                        k += 2;
+                    } else if g[k] == b']' && k > start {
+                        end = Some(k);
+                        break;
+                    } else {
+                        k += 1;
+                    }
+                }
+                match end {
                     Some(end) => {
+                        let next_byte =
+                            |j: usize| -> Option<(u8, usize)> { if g[j] == b'\\' { Some((*g.get(j + 1)?, j + 2)) } else { Some((g[j], j + 1)) } };
                         let mut ranges: Vec<(u8, u8)> = Vec::new();
-                        let mut j = start;
+                        let (mut j, mut can_range) = (start, false);
                         while j < end {
-                            if g[j] == b'-' && j > start && j + 1 < end {
+                            if g[j] == b'-' && can_range && j + 1 < end {
+                                let (hi, next_j) = next_byte(j + 1)?;
                                 let last = ranges.last_mut()?;
-                                last.1 = g[j + 1];
-                                if last.1 < last.0 {
+                                if hi < last.0 {
                                     return None;
                                 }
-                                j += 2;
+                                last.1 = hi;
+                                j = next_j;
+                                can_range = false;
                             } else {
-                                ranges.push((g[j], g[j]));
-                                j += 1;
+                                let (b, next_j) = next_byte(j)?;
+                                ranges.push((b, b));
+                                j = next_j;
+                                can_range = true;
                             }
                         }
-                        let mut re = String::from(if neg { "[^" } else { "[" });
+                        let mut re = String::from(if neg { "[^/" } else { "[" });
+                        let mut empty = true;
                         for (a, b) in ranges {
-                            let _ = if a == b { write!(re, "\\x{a:02x}") } else { write!(re, "\\x{a:02x}-\\x{b:02x}") };
+                            if !neg && a <= b'/' && b'/' <= b {
+                                if a < b'/' {
+                                    let _ = if a == b'/' - 1 { write!(re, "\\x{a:02x}") } else { write!(re, "\\x{a:02x}-\\x{:02x}", b'/' - 1) };
+                                    empty = false;
+                                }
+                                if b > b'/' {
+                                    let lo = b'/' + 1;
+                                    let _ = if lo == b { write!(re, "\\x{b:02x}") } else { write!(re, "\\x{lo:02x}-\\x{b:02x}") };
+                                    empty = false;
+                                }
+                            } else {
+                                let _ = if a == b { write!(re, "\\x{a:02x}") } else { write!(re, "\\x{a:02x}-\\x{b:02x}") };
+                                empty = false;
+                            }
+                        }
+                        if !neg && empty {
+                            return None;
                         }
                         re.push(']');
                         top.push(T::Class(re));
@@ -1892,6 +1965,7 @@ fn glob_regex(g: &[u8]) -> Option<String> {
             b'{' if depth > 1 => return None,
             b'{' => stack.push(Vec::new()),
             // (A stray '}' matches nothing.)
+            b'}' if depth == 1 => return None,
             b'}' => {
                 let alts = stack.split_off(1);
                 stack[0].push(T::Alt(alts));
@@ -1926,7 +2000,6 @@ fn glob_regex(g: &[u8]) -> Option<String> {
                             render(p, &mut s);
                             s
                         })
-                        .filter(|s| !s.is_empty())
                         .collect();
                     if parts.is_empty() { Ok(()) } else { write!(re, "(?:{})", parts.join("|")) }
                 }
@@ -4881,5 +4954,147 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// A skipped folder inside a git repo doesn't mask a nested `.git` below it.
+    #[test]
+    fn in_scope_nested_git_inside_skipped_dir() {
+        let home = std::env::temp_dir().join(format!("fsearch-in-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(home.join("repo/node_modules/.git")).unwrap();
+        let h = home.as_os_str().as_bytes();
+        let ok = in_scope(&join(h, b"repo/node_modules/a.js"), h);
+        let nested_git = in_scope(&join(h, b"repo/node_modules/.git/config"), h);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(ok);
+        assert!(!nested_git);
+    }
+
+    /// `git_dir` normalizes `.` and `..` in `gitdir:` and `commondir` so
+    /// submodules' `info/exclude` resolves in the name index.
+    #[test]
+    fn git_dir_normalizes_relative_paths_for_submodule() {
+        let d = std::env::temp_dir().join(format!("fsearch-gitdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("repo/.git/modules/sub/info")).unwrap();
+        std::fs::create_dir_all(d.join("repo/sub")).unwrap();
+        std::fs::write(d.join("repo/.git/modules/sub/info/exclude"), b"ignored.txt\n").unwrap();
+        std::fs::write(d.join("repo/sub/.git"), b"gitdir: ../.git/modules/sub\n").unwrap();
+        std::fs::write(d.join("repo/.git/modules/sub/commondir"), b"../..\n").unwrap();
+        let got_common = git_dir(&join(d.as_os_str().as_bytes(), b"repo/sub"), KIND_FILE);
+        let want_common = d.join("repo/.git").as_os_str().as_bytes().to_vec();
+        std::fs::remove_file(d.join("repo/.git/modules/sub/commondir")).unwrap();
+        let got_sub_only = git_dir(&join(d.as_os_str().as_bytes(), b"repo/sub"), KIND_FILE);
+        let want_sub = d.join("repo/.git/modules/sub").as_os_str().as_bytes().to_vec();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got_common, Some(want_common));
+        assert_eq!(got_sub_only, Some(want_sub));
+    }
+
+    /// `~` expands only for `~` or `~/...`, never `~user`.
+    #[test]
+    fn tilde_expansion_ignores_tilde_user() {
+        let home = std::env::temp_dir().join(format!("fsearch-tilde-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.as_os_str().as_bytes();
+        std::fs::write(home.join(".gitconfig"), b"[core]\n\texcludesFile = ~alice/ignore\n").unwrap();
+        assert_eq!(excludes_file(h), b"~alice/ignore");
+        std::fs::write(home.join(".gitconfig"), b"[core]\n\texcludesFile = ~/my-ignore\n").unwrap();
+        assert_eq!(excludes_file(h), join(h, b"my-ignore"));
+        let skip_path = home.join(SKIP_LIST);
+        std::fs::write(&skip_path, b"~alice/dir\n~/real\n~\n").unwrap();
+        let prev = USER_SKIPS.lock().unwrap().0.replace(skip_path);
+        let skips = skip_list(h);
+        USER_SKIPS.lock().unwrap().0 = prev;
+        let _ = std::fs::remove_dir_all(&home);
+        let bad = [h, b"alice/dir"].concat();
+        assert!(!skips.contains(&bad), "expanded ~alice into {bad:?}");
+        assert!(skips.contains(&join(h, b"real")));
+        assert!(skips.contains(&h.to_vec()));
+    }
+
+    /// A `core.excludesFile` located outside `$HOME` is honored by `wants()`
+    /// and `wanted()` just as `eligible()` honors it on disk.
+    #[test]
+    fn excludes_file_outside_home_honored_by_wants_and_wanted() {
+        let d = std::env::temp_dir().join(format!("fsearch-excl-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join("repo/.git")).unwrap();
+        let d = d.canonicalize().unwrap();
+        let home = d.join("home");
+        let global_ignore = d.join("global_ignore");
+        std::fs::write(&global_ignore, b"skip.txt\n").unwrap();
+        std::fs::write(home.join(".gitconfig"), format!("[core]\n\texcludesFile = {}\n", global_ignore.display())).unwrap();
+        std::fs::write(home.join("repo/keep.txt"), b"hello").unwrap();
+        std::fs::write(home.join("repo/skip.txt"), b"hello").unwrap();
+
+        let h = home.as_os_str().as_bytes();
+        let comps: Vec<&[u8]> = h.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let mut ls: Vec<Listing> = comps
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Listing {
+                id: i as u32,
+                names: c.to_vec(),
+                ents: vec![RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: (i + 1) as u32 }],
+            })
+            .collect();
+        let repo_id = comps.len() as u32;
+        let leaf_id = repo_id + 1;
+        let git_id = repo_id + 2;
+        ls.push(Listing {
+            id: repo_id,
+            names: b"repo".to_vec(),
+            ents: vec![RawEnt { name_off: 0, name_len: 4, kind: KIND_DIR, size: 0, mtime: 0, child: leaf_id }],
+        });
+        ls.push(Listing {
+            id: leaf_id,
+            names: b".gitkeep.txtskip.txt".to_vec(),
+            ents: vec![
+                RawEnt { name_off: 0, name_len: 4, kind: KIND_DIR, size: 0, mtime: 0, child: git_id },
+                RawEnt { name_off: 4, name_len: 8, kind: KIND_FILE, size: 5, mtime: 1, child: crate::walk::NONE },
+                RawEnt { name_off: 12, name_len: 8, kind: KIND_FILE, size: 5, mtime: 1, child: crate::walk::NONE },
+            ],
+        });
+        ls.push(Listing { id: git_id, ..Default::default() });
+        let live = Live::new(crate::index::Index::build(ls, 0, 0, h));
+
+        let w_wanted = wanted(&live, h, h, true);
+        let got_wanted: Vec<Vec<u8>> = (0..w_wanted.len()).map(|i| w_wanted.path(i).to_vec()).collect();
+        let w_wants = wants(&live, h, &[join(h, b"repo")], &[]);
+        let got_wants: Vec<Vec<u8>> = (0..w_wants[0].2.len()).map(|i| w_wants[0].2.path(i).to_vec()).collect();
+        let ok_keep = eligible(&join(h, b"repo/keep.txt"), 5, h);
+        let ok_skip = eligible(&join(h, b"repo/skip.txt"), 5, h);
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(ok_keep);
+        assert!(!ok_skip);
+        assert_eq!(got_wanted, vec![join(h, b"repo/keep.txt")]);
+        assert_eq!(got_wants, vec![join(h, b"repo/keep.txt")]);
+    }
+
+    /// Ignore-file parsing and glob-to-regex edge cases: CRLF `\ `, negated
+    /// and spanning classes excluding `/`, escaped `]`, stray `}`, `{,.bak}`.
+    #[test]
+    fn gitignore_glob_edge_cases() {
+        let parse = |pat: &[u8]| Globs::parse(pat).unwrap();
+        assert_eq!(parse(b"foo\\ \r\n").decide(b"foo ", false), Some(true));
+        let neg = parse(b"[!a]b\n");
+        assert_eq!(neg.decide(b"/b", false), None);
+        assert_eq!(neg.decide(b"cb", false), Some(true));
+        let span = parse(b"[.-0]b\n");
+        assert_eq!(span.decide(b"/b", false), None);
+        assert_eq!(span.decide(b".b", false), Some(true));
+        assert_eq!(span.decide(b"0b", false), Some(true));
+        let esc = parse(b"[\\]]\n");
+        assert_eq!(esc.decide(b"]", false), Some(true));
+        assert_eq!(esc.decide(b"a", false), None);
+        assert!(glob_regex(b"foo}bar").is_none());
+        let alt = parse(b"foo{,.bak}\n");
+        assert_eq!(alt.decide(b"foo", false), Some(true));
+        assert_eq!(alt.decide(b"foo.bak", false), Some(true));
     }
 }
