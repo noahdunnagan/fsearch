@@ -194,12 +194,52 @@ struct Hit<'a> {
     size: u64,
 }
 
+/// Split `s` on ASCII whitespace outside `"..."` quotes, keeping raw slices.
+fn split_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted) = (None, false);
+    for (i, c) in s.char_indices() {
+        if c == '"' {
+            quoted = !quoted;
+            start.get_or_insert(i);
+        } else if c.is_ascii_whitespace() && !quoted {
+            if let Some(a) = start.take() {
+                out.push(&s[a..i]);
+            }
+        } else {
+            start.get_or_insert(i);
+        }
+    }
+    if let Some(a) = start {
+        out.push(&s[a..]);
+    }
+    out
+}
+
+fn is_grep_req(v: &Value) -> bool {
+    let op = v.get("op").and_then(Value::as_str).unwrap_or("search");
+    if op == "grep" {
+        return true;
+    }
+    if op != "search" {
+        return false;
+    }
+    let keys = ["grep", "regex", "sym", "content", "symbol"];
+    if keys.iter().any(|k| v.get(*k).is_some_and(Value::is_string)) {
+        return true;
+    }
+    v.get("q").and_then(Value::as_str).is_some_and(|q| {
+        split_tokens(q).into_iter().any(|w| {
+            let u: String = w.chars().filter(|&c| c != '"').collect();
+            keys.iter().any(|k| u.strip_prefix(k).is_some_and(|r| r.starts_with(':')))
+        })
+    })
+}
+
 fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
     let engine = &cx.engine;
     let op = v.get("op").and_then(Value::as_str).unwrap_or("search");
-    let is_grep = op == "grep"
-        || (op == "search"
-            && v.get("q").and_then(Value::as_str).is_some_and(|q| ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| q.contains(k))));
+    let is_grep = is_grep_req(v);
     match op {
         "ping" => Ok(Reply::Value(json!({"ok": true}))),
         "save" => {
@@ -215,13 +255,16 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
                 _ => return Err("open needs a path (or paths)".into()),
             };
             let now = fsearch::query::now_secs();
-            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p), now)).collect();
+            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p, engine.home()), now)).collect();
             Ok(Reply::Value(json!({"ok": true, "scores": scores})))
         }
         "recent" => {
             // What you worked on lately (under `in:`, passing the query),
             // best first: opens and your commits (see `frecent`).
             let (q, _) = parse_request(v, engine.home())?;
+            if let Some(d) = q.scope.as_deref() {
+                cx.git.load(&[d, b"/."].concat());
+            }
             let top = frecent(cx, q.scope.as_deref(), fsearch::query::now_secs());
             let hits = top.into_iter().filter_map(|(p, s)| Some(Found { score: (s * 100.0) as i32, ..found(&q, &p)? }));
             Ok(Reply::Hits(hits.take(q.limit).collect(), 0, None, v.get("git") == Some(&Value::Bool(true))))
@@ -230,7 +273,7 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
             // The repo holding a folder, its status read in the background
             // (`fsearch mcp` asks at start, so the first search has it).
             let p = v.get("path").and_then(Value::as_str).ok_or("git needs a path")?;
-            let r = cx.git.load(&[&real(p)[..], b"/."].concat());
+            let r = cx.git.load(&[&real(p, engine.home())[..], b"/."].concat());
             let snap = r.as_ref().and_then(|r| r.snap(Duration::ZERO));
             Ok(Reply::Value(json!({
                 "ok": true,
@@ -250,7 +293,7 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
         }
         "search" | "glob" => {
             let (mut q, sels) = parse_request(v, engine.home())?;
-            let x = Extras::parse(v, &mut q, sels, op == "glob", false)?;
+            let x = Extras::parse(v, &mut q, sels, op == "glob", false, engine.home())?;
             let t = Instant::now();
             if x.plain() {
                 let found = engine.search(&q)?;
@@ -327,8 +370,8 @@ const MAX_REPOS: usize = 16;
 const MAX_DIRS: usize = 64;
 
 impl Extras {
-    fn parse(v: &Value, q: &mut Query, sels: Vec<(git::Sel, bool)>, glob_op: bool, grep: bool) -> Result<Extras, String> {
-        let cwd = v.get("cwd").and_then(Value::as_str).map(real);
+    fn parse(v: &Value, q: &mut Query, sels: Vec<(git::Sel, bool)>, glob_op: bool, grep: bool, home: &str) -> Result<Extras, String> {
+        let cwd = v.get("cwd").and_then(Value::as_str).map(|p| real(p, home));
         // `cursor` too, except in a grep: there it is where the content
         // index's ranking resumes (see `grep`), not a count of files shown.
         let at = v.get("offset").or(v.get("cursor").filter(|_| !grep));
@@ -341,7 +384,7 @@ impl Extras {
             sels,
             cwd,
             boost: v.get("boost") == Some(&Value::Bool(true)),
-            near: v.get("near").and_then(Value::as_str).map(real),
+            near: v.get("near").and_then(Value::as_str).map(|p| real(p, home)),
         };
         if let Some(o) = at {
             // Past what a page can be fetched from, every page is empty.
@@ -536,12 +579,21 @@ fn git_root(dir: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A path as the index has it: `~` expanded, symlinks resolved.
-fn real(p: &str) -> Vec<u8> {
-    let p = match p.strip_prefix('~') {
-        Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
-        None => p.to_string(),
+fn real(p: &str, home: &str) -> Vec<u8> {
+    let p = if p == "~" {
+        home.to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        format!("{}/{rest}", home.trim_end_matches('/'))
+    } else {
+        p.to_string()
     };
-    std::fs::canonicalize(&p).map_or_else(|_| p.into_bytes(), |c| c.as_os_str().as_bytes().to_vec())
+    std::fs::canonicalize(&p).map_or_else(
+        |_| {
+            let t = p.trim_end_matches('/');
+            if t.is_empty() && p.starts_with('/') { b"/".to_vec() } else { t.as_bytes().to_vec() }
+        },
+        |c| c.as_os_str().as_bytes().to_vec(),
+    )
 }
 
 /// The most hits a search looks through for a page that passes its globs.
@@ -633,7 +685,7 @@ fn nearness(near: &[u8], path: &[u8]) -> i32 {
 /// that's in it (`tests/`). `**` spans folders, `*` and `?` stay within one,
 /// `[...]` and `{a,b}` as in a shell.
 fn glob_regex(glob: &str, base: &[u8]) -> Result<Regex, String> {
-    let g = glob.strip_prefix("./").unwrap_or(glob);
+    let (anchored, g) = glob.strip_prefix("./").map_or((false, glob), |g| (true, g));
     let (body, dir) = g.strip_suffix('/').map_or((g, false), |b| (b, true));
     let mut re = String::from("(?is)^");
     match body.strip_prefix('/') {
@@ -643,8 +695,10 @@ fn glob_regex(glob: &str, base: &[u8]) -> Result<Regex, String> {
         }
         None => {
             re += &regex::escape(&String::from_utf8_lossy(base));
-            re.push('/');
-            if dir || !body.contains('/') {
+            if !base.ends_with(b"/") {
+                re.push('/');
+            }
+            if !anchored && !body.contains('/') {
                 re += "(?:.*/)?";
             }
             translate(body, &mut re)?;
@@ -671,17 +725,28 @@ fn translate(g: &str, re: &mut String) -> Result<(), String> {
             '*' => *re += "[^/]*",
             '?' => *re += "[^/]",
             '[' => {
-                re.push('[');
-                if cs.peek().is_some_and(|&c| c == '!' || c == '^') {
+                let neg = cs.peek().is_some_and(|&c| c == '!' || c == '^');
+                if neg {
                     cs.next();
-                    re.push('^');
+                    re.push_str("[^/");
+                } else {
+                    re.push_str("[[");
                 }
                 let mut first = true;
                 loop {
                     match cs.next() {
                         None => return Err(format!("unclosed [ in glob {g}")),
                         Some(']') if !first => break,
-                        Some(c @ ('[' | ']' | '\\' | '&' | '~' | '-')) if c != '-' || first => {
+                        Some('\\') => {
+                            let Some(esc) = cs.next() else {
+                                return Err(format!("unclosed [ in glob {g}"));
+                            };
+                            if matches!(esc, '[' | ']' | '\\' | '&' | '~' | '-' | '^') {
+                                re.push('\\');
+                            }
+                            re.push(esc);
+                        }
+                        Some(c @ ('[' | ']' | '&' | '~' | '-')) if c != '-' || first || cs.peek() == Some(&']') => {
                             re.push('\\');
                             re.push(c);
                         }
@@ -689,7 +754,11 @@ fn translate(g: &str, re: &mut String) -> Result<(), String> {
                     }
                     first = false;
                 }
-                re.push(']');
+                if neg {
+                    re.push(']');
+                } else {
+                    re.push_str("]&&[^/]]");
+                }
             }
             '{' => {
                 braces += 1;
@@ -719,7 +788,12 @@ fn glob_dir(g: &str, base: &[u8]) -> Option<Vec<u8>> {
     let lit: Vec<&str> = parts[..parts.len() - 1].iter().take_while(|p| !p.contains(['*', '?', '[', '{', '\\'])).copied().collect();
     let mut dir = if abs { Vec::new() } else { base.to_vec() };
     for p in lit {
-        dir.push(b'/');
+        if p.is_empty() {
+            continue;
+        }
+        if !dir.ends_with(b"/") {
+            dir.push(b'/');
+        }
         dir.extend_from_slice(p.as_bytes());
     }
     if dir.is_empty() {
@@ -740,17 +814,45 @@ fn glob_exts(g: &str) -> Vec<Vec<u8>> {
     if plain { exts } else { Vec::new() }
 }
 
+/// Parse a non-negative integer request field (numeric JSON or decimal string).
+fn req_num(v: &Value, k: &str) -> Option<usize> {
+    v.get(k).and_then(|val| val.as_u64().or_else(|| val.as_str()?.parse().ok())).map(|n| n as usize)
+}
+
+/// Resolve grep pagination: plain queries paginate in candidate space via
+/// `cursor` (`g.skip`); non-plain queries (`offset`, extra/negative globs,
+/// `git:`, `"ignored": false`, ...) paginate in matched-file space via
+/// `x.offset` (accepting `cursor` when `offset` is omitted) and keep `skip = 0`.
+fn grep_paging(v: &Value, x: &mut Extras) -> usize {
+    let cursor = req_num(v, "cursor").unwrap_or(0);
+    if x.plain() {
+        return cursor;
+    }
+    if v.get("offset").is_none() {
+        x.offset = cursor.min(MAX_FETCH);
+    }
+    0
+}
+
+/// Compute the `next` file offset after slicing `files` to `x.offset..`.
+/// Only emits a continuation offset for incomplete scans when at least one
+/// file past `x.offset` is returned, avoiding a `next == offset` loop.
+fn offset_next<T>(x: &Extras, files: &mut Vec<T>, limit: usize, incomplete: bool) -> Option<usize> {
+    x.cut(files, limit).or((incomplete && !files.is_empty()).then_some(x.offset + files.len()))
+}
+
 /// Content search. The pattern comes from `pattern` (+ `mode`), `patterns`
 /// (any of these literals) or from a `grep:`/`regex:`/`sym:` filter in `q`;
 /// the rest of the query narrows which files are read, or `file` names the
 /// one to read. Also: `case`, `context` / `before` / `after` (lines around
 /// matches), `defs` (mark definitions),
-/// `cursor` (the `next` of the page before; with `offset`, globs or `git:`
-/// the `next` is an offset instead).
+/// `cursor` (the `next` of the page before: candidate cursor for plain
+/// queries, or file offset when `offset`, extra/negative globs, `git:`, or
+/// `"ignored": false` are used, unless `offset` is given explicitly).
 fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
     let engine = &cx.engine;
     let (mut q, sels) = parse_request(v, engine.home())?;
-    let x = Extras::parse(v, &mut q, sels, false, true)?;
+    let mut x = Extras::parse(v, &mut q, sels, false, true, engine.home())?;
     let mode = match v.get("mode").and_then(Value::as_str) {
         Some("regex") => GrepMode::Regex,
         Some("symbol") => GrepMode::Symbol,
@@ -770,20 +872,28 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         (None, Some(p)) => fsearch::Grep::with_case(&p, mode, case)?,
         (None, None) => return Err("grep needs a pattern".into()),
     };
-    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~') {
-        Some(r) => format!("{}{r}", engine.home()),
-        None if !f.starts_with('/') => format!("{}/{f}", engine.home()),
-        None => f.to_string(),
+    let file = v.get("file").and_then(Value::as_str).map(|f| {
+        if f == "~" {
+            engine.home().to_string()
+        } else if let Some(r) = f.strip_prefix("~/") {
+            format!("{}/{r}", engine.home().trim_end_matches('/'))
+        } else if f.starts_with('/') {
+            f.to_string()
+        } else {
+            let base = x.cwd.as_deref().or(q.scope.as_deref()).map(|b| String::from_utf8_lossy(b).into_owned());
+            let base = base.as_deref().unwrap_or(engine.home()).trim_end_matches('/');
+            format!("{base}/{f}")
+        }
     });
-    let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
+    let num = |k: &str| req_num(v, k);
     // One file: its matching lines, up to 200 unless told.
     g.max_per_file = num("per_file").unwrap_or(if file.is_some() { 200 } else { g.max_per_file });
-    if let Some(ms) = v.get("budget_ms").and_then(Value::as_u64) {
-        g.budget = (ms > 0).then(|| Duration::from_millis(ms));
+    if let Some(ms) = num("budget_ms") {
+        g.budget = (ms > 0).then(|| Duration::from_millis(ms as u64));
     }
     (g.before, g.after) = (num("before").or(num("context")).unwrap_or(0), num("after").or(num("context")).unwrap_or(0));
     g.defs = v.get("defs").and_then(Value::as_bool).unwrap_or(false);
-    g.skip = num("cursor").unwrap_or(0);
+    g.skip = grep_paging(v, &mut x);
     let t = Instant::now();
     let source = |indexed| if indexed { "index" } else { "scan" };
     let (r, source, next) = if let Some(f) = &file {
@@ -798,11 +908,11 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         // Only the files git lists (modified...), newest first: read them.
         x.ready(cx, &q)?;
         let mut paths = from_git(cx, &q.clone_for_scan(), &x, MAX_GREP);
-        paths.retain(|f| f.kind & 3 == KIND_FILE && f.size <= fsearch::content::MAX_FILE && x.keep(&cx.git, f.path.as_os_str().as_bytes()));
+        paths.retain(|f| f.kind & 3 == KIND_FILE && f.size <= fsearch::content::MAX_REPO_FILE && x.keep(&cx.git, f.path.as_os_str().as_bytes()));
         paths.sort_by_key(|f| std::cmp::Reverse(f.mtime));
         let paths: Vec<Vec<u8>> = paths.into_iter().map(|f| f.path.as_os_str().as_bytes().to_vec()).collect();
         let mut r = fsearch::content::verify(&g, &paths, x.offset.saturating_add(q.limit).saturating_add(1));
-        let next = x.cut(&mut r.files, q.limit).or((!r.complete).then_some(x.offset + r.files.len()));
+        let next = offset_next(&x, &mut r.files, q.limit, !r.complete);
         (r, "scan", next)
     } else {
         x.ready(cx, &q)?;
@@ -821,7 +931,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
                 Ok((files, cut))
             },
         )?;
-        let next = x.cut(&mut files, limit).or(cut.then_some(x.offset + files.len()));
+        let next = offset_next(&x, &mut files, limit, cut);
         let (mut r, indexed) = last.expect("page searched");
         r.files = files;
         (r, source(indexed), next)
@@ -874,7 +984,7 @@ fn parse_request(v: &Value, home: &str) -> Result<(Query, Vec<(git::Sel, bool)>)
     let mut q = Query::parse(&rest, home)?;
     if let Some(obj) = v.as_object() {
         for (k, val) in obj {
-            if EXTRAS.contains(&k.as_str()) {
+            if EXTRAS.contains(&k.as_str()) || (k == "regex" && !val.is_string()) {
                 continue;
             }
             if k == "limit" {
@@ -898,8 +1008,9 @@ fn take_git(q: &str) -> Result<(std::borrow::Cow<'_, str>, Vec<(git::Sel, bool)>
         return Ok((q.into(), Vec::new()));
     }
     let (mut rest, mut sels) = (Vec::new(), Vec::new());
-    for w in q.split(' ') {
-        let (neg, b) = w.strip_prefix('!').map_or((false, w), |b| (true, b));
+    for w in split_tokens(q) {
+        let u: String = w.chars().filter(|&c| c != '"').collect();
+        let (neg, b) = u.strip_prefix('!').map_or((false, u.as_str()), |b| (true, b));
         match b.strip_prefix("git:") {
             Some(v) => {
                 let sel =
@@ -962,5 +1073,126 @@ mod tests {
         let n = |a: &str, b: &str| nearness(a.as_bytes(), b.as_bytes());
         assert_eq!((n("/p/src/a.rs", "/p/src/b.rs"), n("/p/src/a.rs", "/p/src/a.rs")), (12, -20));
         assert_eq!((n("/p/src/a.rs", "/p/src/ui/c.rs"), n("/p/src/a.rs", "/p/docs/x.md"), n("/p/a/b/c/d.rs", "/q/e.rs")), (9, 6, 0));
+    }
+
+    #[test]
+    fn detects_grep_requests() {
+        assert!(is_grep_req(&json!({"op": "grep", "pattern": "foo"})));
+        for k in ["grep", "regex", "sym", "content", "symbol"] {
+            assert!(is_grep_req(&json!({"op": "search", k: "foo"})), "{k}");
+        }
+        assert!(!is_grep_req(&json!({"op": "search", "q": "foo", "regex": false})));
+        assert!(!is_grep_req(&json!({"op": "search", "q": "mygrep:bar"})));
+        assert!(!is_grep_req(&json!({"op": "search", "q": "\"foo grep:bar\""})));
+        assert!(is_grep_req(&json!({"op": "search", "q": "foo grep:bar"})));
+        assert!(is_grep_req(&json!({"op": "search", "q": "\"grep:fn main\""})));
+    }
+
+    #[test]
+    fn parse_request_skips_non_filter_keys() {
+        let (q, _) = parse_request(&json!({"op": "search", "q": "main", "regex": false, "defs": true, "id": 1}), "/home").unwrap();
+        assert!(q.grep.is_none(), "boolean regex must not set q.grep: {:?}", q.grep);
+    }
+
+    #[test]
+    fn take_git_respects_quotes_and_whitespace() {
+        let (rest, sels) = take_git(r#"grep:"foo git:bar""#).unwrap();
+        assert_eq!(rest, r#"grep:"foo git:bar""#);
+        assert!(sels.is_empty());
+        let (rest, sels) = take_git("git:modified\tmain").unwrap();
+        assert_eq!(rest, "main");
+        assert_eq!(sels, vec![(git::Sel::Modified, false)]);
+    }
+
+    #[test]
+    fn globs_handle_root_base_and_dot_slash() {
+        let re = glob_regex("*.rs", b"/").unwrap();
+        assert!(re.is_match(b"/a.rs") && re.is_match(b"/dir/a.rs"));
+        let re = glob_regex("./*.rs", b"/p").unwrap();
+        assert!(re.is_match(b"/p/a.rs"));
+        assert!(!re.is_match(b"/p/sub/a.rs"));
+        assert_eq!(glob_dir("zzz_nonexistent/*.conf", b"/"), Some(b"/zzz_nonexistent".to_vec()));
+    }
+
+    #[test]
+    fn translate_char_classes_and_slashes() {
+        let re = glob_regex("[a\\]b].rs", b"/p").unwrap();
+        assert!(re.is_match(b"/p/].rs") && re.is_match(b"/p/a.rs") && re.is_match(b"/p/b.rs"));
+        let re = glob_regex("src/[!a]*.rs", b"/p").unwrap();
+        assert!(re.is_match(b"/p/src/b.rs"));
+        assert!(!re.is_match(b"/p/src/x/y.rs"));
+        let re = glob_regex("[.-0].rs", b"/p").unwrap();
+        assert!(re.is_match(b"/p/..rs") && re.is_match(b"/p/0.rs"));
+        assert!(!re.is_match(b"/p//.rs"));
+    }
+
+    #[test]
+    fn real_expands_tilde_safely_and_strips_trailing_slash() {
+        assert_eq!(real("~user/foo", "/Users/me"), b"~user/foo");
+        assert_eq!(real("~/foo/", "/Users/me"), b"/Users/me/foo");
+        assert_eq!(real("~", "/Users/me"), b"/Users/me");
+        assert_eq!(real("/zzz_nonexistent/dir/", "/Users/me"), b"/zzz_nonexistent/dir");
+    }
+
+    #[test]
+    fn grep_paging_distinguishes_plain_cursor_from_non_plain_offset() {
+        let parse = |v: &Value| {
+            let (mut q, sels) = parse_request(v, "/home").unwrap();
+            let mut x = Extras::parse(v, &mut q, sels, false, true, "/home").unwrap();
+            let skip = grep_paging(v, &mut x);
+            (x.offset, skip)
+        };
+
+        // Plain grep: `cursor` is candidate skip; offset remains 0.
+        assert_eq!(parse(&json!({"op": "grep", "pattern": "foo", "cursor": 40})), (0, 40));
+
+        // Non-plain (`ignored: false`, extra/negative globs, `git:`): `cursor` maps to file offset and `skip` is 0.
+        assert_eq!(parse(&json!({"op": "grep", "pattern": "foo", "ignored": false, "cursor": 10})), (10, 0));
+        assert_eq!(parse(&json!({"op": "grep", "pattern": "foo", "glob": ["*.rs", "!tests/"], "cursor": 12})), (12, 0));
+        assert_eq!(parse(&json!({"op": "grep", "pattern": "foo", "git": true, "cursor": 99_999})), (MAX_FETCH, 0));
+
+        // Explicit `offset` + `cursor` on non-plain: `offset` wins and `cursor` does not double-skip.
+        assert_eq!(parse(&json!({"op": "grep", "pattern": "foo", "ignored": false, "offset": 20, "cursor": 10})), (20, 0));
+    }
+
+    #[test]
+    fn offset_next_avoids_empty_loop_and_emits_partial_progress() {
+        let x = Extras { offset: 5, ..Extras::default() };
+
+        // Budget ran out before producing more than `offset` files: no forward progress -> `None` (not `Some(5)`).
+        let mut empty_page = vec![0, 1, 2, 3, 4];
+        assert_eq!(offset_next(&x, &mut empty_page, 10, true), None);
+        assert!(empty_page.is_empty());
+
+        // Budget ran out after returning partial files beyond `offset`: emit `Some(offset + returned)`.
+        let mut partial_page = vec![0, 1, 2, 3, 4, 5, 6];
+        assert_eq!(offset_next(&x, &mut partial_page, 10, true), Some(7));
+        assert_eq!(partial_page, vec![5, 6]);
+
+        // More than `offset + limit` results: full page advances by `limit`.
+        let mut full_page: Vec<usize> = (0..20).collect();
+        assert_eq!(offset_next(&x, &mut full_page, 10, false), Some(15));
+        assert_eq!(full_page.len(), 10);
+
+        // Complete with no extra results -> `None`.
+        let mut done_page = vec![0, 1, 2, 3, 4, 5, 6];
+        assert_eq!(offset_next(&x, &mut done_page, 10, false), None);
+    }
+
+    #[test]
+    fn glob_regex_anchors_nested_dir_globs() {
+        let nested = glob_regex("src/tests/", b"/p").unwrap();
+        assert!(nested.is_match(b"/p/src/tests/a.rs"));
+        assert!(nested.is_match(b"/p/src/tests"));
+        assert!(!nested.is_match(b"/p/other/src/tests/a.rs"));
+
+        // Bare directory glob still matches at any depth; `./` stays anchored.
+        let bare = glob_regex("tests/", b"/p").unwrap();
+        assert!(bare.is_match(b"/p/tests/a.rs"));
+        assert!(bare.is_match(b"/p/sub/tests/a.rs"));
+
+        let dotted = glob_regex("./tests/", b"/p").unwrap();
+        assert!(dotted.is_match(b"/p/tests/a.rs"));
+        assert!(!dotted.is_match(b"/p/sub/tests/a.rs"));
     }
 }
