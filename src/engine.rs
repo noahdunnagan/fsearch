@@ -451,16 +451,23 @@ impl Engine {
         if indexed && !built {
             // The content index's first build is running: read the files it
             // will hold instead, so the answer is complete (and the same).
-            // None there: read the folder directly, below, as once built.
-            let (docs, early) = self.s.with_names(scope, |live| content::wanted(live, home, scope.unwrap_or(home), true))?;
-            if !docs.is_empty() {
-                let hold = walk::Hold::new();
-                let r = content::grep_unindexed(g, docs, q);
-                drop(hold);
-                self.s.index_first(early);
-                return Ok((r, false));
+            // None there: read the folder directly, as once built.
+            enum Work {
+                Docs(content::Docs),
+                Paths(Vec<Vec<u8>>),
             }
+            let (work, early) = self.s.with_names(scope, |live| {
+                let docs = content::wanted(live, home, scope.unwrap_or(home), true);
+                if !docs.is_empty() { Work::Docs(docs) } else { Work::Paths(search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))) }
+            })?;
+            let hold = walk::Hold::new();
+            let r = match work {
+                Work::Docs(docs) => content::grep_unindexed(g, docs, q),
+                Work::Paths(paths) => content::verify(g, &paths, q.limit),
+            };
+            drop(hold);
             self.s.index_first(early);
+            return Ok((r, false));
         }
         let (paths, _) = self.s.with_names(scope, |live| search_pool().install(|| content::scan_paths(live, q.clone_for_scan())))?;
         let _hold = walk::Hold::new();
@@ -783,16 +790,18 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // the user's way (lower CPU priority and IO tier).
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
     let pool = content_pool(4, libc::qos_class_t::QOS_CLASS_UTILITY);
+    // Lazily created once for the initial build and dropped when steady-state begins.
+    let mut fast: Option<rayon::ThreadPool> = None;
     let home = shared.home.as_bytes().to_vec();
     // First run, while the whole disk is listed: index the folders searches
-    // ask about from their early indexes. (A request that comes as the
-    // whole index lands is dropped: the sync of all of home covers it.)
+    // ask about from their early indexes (any request still queued when the
+    // whole index lands is handled after the initial sync of all of home).
     while shared.live.read().unwrap().is_none() {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok((_, dirs)) => {
                 for dir in dirs {
                     let Some(e) = shared.early.lock().unwrap().iter().find(|e| e.dir == dir).cloned() else { continue };
-                    sync_wants(shared, &pool, content::wants(&e.live, &home, &[], std::slice::from_ref(&dir)));
+                    sync_wants(shared, &pool, Some(&mut fast), content::wants(&e.live, &home, &[], std::slice::from_ref(&dir)));
                     shared.content_early.lock().unwrap().push(dir);
                 }
             }
@@ -802,15 +811,29 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     }
     // Reconcile all of home once, right away (cheap when nothing changed),
     // then follow along with the name index's changes.
-    sync(shared, &pool, &home, &[], std::slice::from_ref(&home));
+    sync(shared, &pool, Some(&mut fast), &home, &[], std::slice::from_ref(&home));
     shared.content_ready.store(true, Ordering::Release);
+    drop(fast);
     // Per-folder debounce: a folder is processed 2s after its last change,
     // or 5 min after its first pending one if it never goes quiet. A file you
     // save lands in ~2s; files apps rewrite every second (state, logs) cost
     // one reindex per 5 min instead of one per event batch.
     let mut pending: HashMap<(Vec<u8>, bool), (Instant, Instant)> = HashMap::new();
     loop {
-        let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };
+        let wait = if pending.is_empty() {
+            Duration::from_secs(3600)
+        } else {
+            let now = Instant::now();
+            pending
+                .values()
+                .map(|&(first, last)| {
+                    CONTENT_QUIET
+                        .saturating_sub(now.saturating_duration_since(last))
+                        .min(CONTENT_MAX_WAIT.saturating_sub(now.saturating_duration_since(first)))
+                })
+                .min()
+                .unwrap_or(Duration::ZERO)
+        };
         match rx.recv_timeout(wait) {
             Ok(first) => {
                 let now = Instant::now();
@@ -850,24 +873,36 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
             pending.remove(k);
             if k.1 { trees.push(k.0.clone()) } else { dirs.push(k.0.clone()) }
         }
-        sync(shared, &pool, &home, &dirs, &trees);
+        sync(shared, &pool, None, &home, &dirs, &trees);
         shared.dirty.clear(&ripe);
     }
 }
 
 /// Bring the content index in line with the name index for these folders
 /// (direct children) and trees.
-fn sync(shared: &Shared, pool: &rayon::ThreadPool, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) {
+fn sync(
+    shared: &Shared,
+    pool: &rayon::ThreadPool,
+    fast_pool: Option<&mut Option<rayon::ThreadPool>>,
+    home: &[u8],
+    dirs: &[Vec<u8>],
+    trees: &[Vec<u8>],
+) {
     let wants = {
         let g = shared.live.read().unwrap();
         let Some(live) = g.as_ref() else { return };
         content::wants(live, home, dirs, trees)
     };
-    sync_wants(shared, pool, wants);
+    sync_wants(shared, pool, fast_pool, wants);
 }
 
 /// `sync`, given what the name index wants.
-fn sync_wants(shared: &Shared, pool: &rayon::ThreadPool, wants: Vec<(Vec<u8>, bool, content::Docs)>) {
+fn sync_wants(
+    shared: &Shared,
+    pool: &rayon::ThreadPool,
+    fast_pool: Option<&mut Option<rayon::ThreadPool>>,
+    wants: Vec<(Vec<u8>, bool, content::Docs)>,
+) {
     let t = Instant::now();
     // (A folder built early leaves segments behind; the build is still the first.)
     let first = !shared.content_ready.load(Ordering::Acquire);
@@ -884,13 +919,12 @@ fn sync_wants(shared: &Shared, pool: &rayon::ThreadPool, wants: Vec<(Vec<u8>, bo
     // speed-content's open-ahead build): 99-155 s on the 4 utility threads;
     // 8 threads 17.2-17.5 s (61 s system CPU), 12 threads 22.0-24.3 s, 16
     // threads 27.2-30.1 s (250-300 s system CPU).
-    let fast;
-    let pool = if first {
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
-        fast = content_pool(threads, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
-        &fast
-    } else {
-        pool
+    let pool = match fast_pool {
+        Some(slot) if first => slot.get_or_insert_with(|| {
+            let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
+            content_pool(threads, libc::qos_class_t::QOS_CLASS_USER_INITIATED)
+        }),
+        _ => pool,
     };
     build_batches(shared, pool, &todo);
     drop(todo);
@@ -1906,5 +1940,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(s.owner.load(Ordering::Relaxed));
         assert!(saved.lookup(folder.join("f.txt").as_os_str().as_bytes()).is_some(), "saved before the restoration was applied");
+    }
+
+    /// `Engine::grep` during the initial content build, when `content::wanted`
+    /// returns empty (e.g. only `.gitignore`d files exist in the scoped
+    /// folder), falls back to `scan_paths` cleanly and triggers `index_first`.
+    #[test]
+    fn grep_during_initial_build_with_empty_wanted_falls_back_and_triggers_index_first() {
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-grep-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let data = d.join("data");
+        let home = d.join("home");
+        let src = home.join("repo/src");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(home.join("repo/.git")).unwrap();
+        std::fs::write(home.join("repo/.gitignore"), "*.secret\n").unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("hidden.secret"), "needle_in_haystack\n").unwrap();
+
+        let home_str = home.to_string_lossy().into_owned();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (ctx, crx) = std::sync::mpsc::channel();
+        let s = Arc::new(Shared {
+            live: RwLock::new(None),
+            loading: (Mutex::new(false), Condvar::new()),
+            content: RwLock::new(Content::open_shared(data.join("content"))),
+            home: home_str.clone(),
+            dir: data.clone(),
+            wake: tx,
+            save_requested: AtomicBool::new(false),
+            content_tx: ctx,
+            content_rx: Mutex::new(None),
+            content_pending: AtomicUsize::new(0),
+            dirty: Default::default(),
+            owner: AtomicBool::new(true),
+            lock: std::fs::File::create(data.join("daemon.lock")).unwrap(),
+            stream: Mutex::new(None),
+            streams: Default::default(),
+            since: AtomicU64::new(0),
+            ours: data.as_os_str().as_bytes().to_vec(),
+            replaying: AtomicBool::new(false),
+            content_seen: Mutex::new(None),
+            early: Mutex::new(Vec::new()),
+            content_ready: AtomicBool::new(false),
+            content_early: Mutex::new(Vec::new()),
+            on_change: RwLock::new(Vec::new()),
+        });
+        let engine = Engine { s };
+        let q = Query::parse(&format!("in:{}", src.display()), &home_str).unwrap();
+        let g = Grep::new("needle_in_haystack", crate::query::GrepMode::Literal).unwrap();
+
+        let (res, from_index) = engine.grep(&q, &g).unwrap();
+        let queued = crx.try_recv().expect("expected index_first to queue early folder");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(!from_index);
+        assert_eq!(res.files.len(), 1);
+        assert!(res.files[0].path.ends_with(b"hidden.secret"));
+        assert!(queued.0.is_empty());
+        assert_eq!(queued.1, vec![src.as_os_str().as_bytes().to_vec()]);
     }
 }
