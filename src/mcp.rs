@@ -79,10 +79,10 @@ fn result(id: &Value, r: Value) -> Value {
 
 impl Session {
     fn new(dir: PathBuf) -> Session {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| home.clone());
         // Real paths, as the index holds them (/tmp is /private/tmp).
         let real = |p: String| std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
+        let home = real(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        let cwd = real(std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| home.clone()));
         let root = real(repo_root(&cwd, &home).unwrap_or(cwd));
         Session { dir, home, root, outbox: Vec::new(), asked_roots: 0, asks: Default::default() }
     }
@@ -193,12 +193,35 @@ impl Session {
     /// The folder a call searches (None: the whole disk), from its `path`.
     fn scope(&self, a: &Value) -> Option<String> {
         let p = a["path"].as_str().map(str::trim).filter(|p| !p.is_empty() && *p != ".").unwrap_or(&self.root);
-        Some(match p {
-            "/" => return None,
-            p if p.starts_with('/') => p.trim_end_matches('/').to_string(),
-            p if p == "~" || p.starts_with("~/") => format!("{}{}", self.home, &p[1..]).trim_end_matches('/').to_string(),
-            p => format!("{}/{}", self.root, p.trim_start_matches("./").trim_end_matches('/')),
-        })
+        if p.starts_with('/') && p.bytes().all(|b| b == b'/') {
+            return None;
+        }
+        let raw = if p.starts_with('/') {
+            p.to_string()
+        } else if p == "~" || p.starts_with("~/") {
+            format!("{}{}", self.home.trim_end_matches('/'), &p[1..])
+        } else {
+            format!("{}/{}", self.root.trim_end_matches('/'), p)
+        };
+        let norm = std::fs::canonicalize(&raw).map_or_else(
+            |_| {
+                let mut out = PathBuf::new();
+                for c in Path::new(&raw).components() {
+                    match c {
+                        std::path::Component::RootDir => out.push("/"),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            out.pop();
+                        }
+                        std::path::Component::Normal(s) => out.push(s),
+                        std::path::Component::Prefix(_) => {}
+                    }
+                }
+                out.to_string_lossy().into_owned()
+            },
+            |c| c.to_string_lossy().into_owned(),
+        );
+        (norm != "/" && !norm.is_empty()).then_some(norm)
     }
 
     /// How this call shows paths: relative to the project, or to the
@@ -219,12 +242,7 @@ impl Session {
             return self.worked_on(&scope, max);
         }
         let mut p = split(&query, false);
-        // A lone `name/`: the folders called that.
-        let dirs = p.words.is_empty() && p.globs.len() == 1 && p.globs[0].ends_with('/') && !p.globs[0].starts_with('!');
-        if dirs {
-            let d = p.globs.pop().unwrap();
-            p.words.push(d.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string());
-        }
+        let dirs = rewrite_lone_dir(&mut p);
         let req = |words: &[String], hide: bool| {
             let mut r = json!({
                 "q": words.iter().chain(&p.filters).cloned().collect::<Vec<_>>().join(" "),
@@ -243,7 +261,8 @@ impl Session {
             // A repo's own files aren't the project's (unless asked for):
             // git status leaves them out of a repo, this out of a folder of repos.
             let mut globs = p.globs.clone();
-            if !query.contains(".git") && (!hide || !Path::new(&self.root).join(".git").exists()) {
+            let in_repo = scope.as_deref().is_some_and(|s| Path::new(s).join(".git").exists());
+            if !query.contains(".git") && (!hide || !in_repo) {
                 globs.push("!.git/".into());
             }
             if !globs.is_empty() {
@@ -301,13 +320,24 @@ impl Session {
         let text = p.words.join(" ");
         if !text.is_empty() {
             let mut g = json!({"op": "grep", "pattern": text, "limit": 5, "per_file": 1, "budget_ms": 500});
+            if !p.filters.is_empty() {
+                g["q"] = p.filters.join(" ").into();
+            }
+            if !p.globs.is_empty() {
+                g["glob"] = json!(p.globs);
+            }
             if let Some(s) = &scope {
                 g["in"] = s.as_str().into();
             }
-            let mut d = g.clone();
-            (d["mode"], d["limit"]) = ("symbol".into(), 2.into());
-            let (r, d) = self.ask2(&g, &d);
             let name = def_name(&text);
+            let (r, d) = match name {
+                Some(n) => {
+                    let mut d = g.clone();
+                    (d["pattern"], d["mode"], d["limit"]) = (n.into(), "symbol".into(), 2.into());
+                    self.ask2(&g, &d)
+                }
+                None => (self.ask(&g), Err(String::new())),
+            };
             let defs = d.map(|d| files(&d).to_vec()).unwrap_or_default();
             let mut fs: Vec<Value> = defs.into_iter().filter(|f| is_def(f["matches"][0]["text"].as_str().unwrap_or(""), name)).collect();
             for f in r.map(|r| files(&r).to_vec()).unwrap_or_default() {
@@ -364,13 +394,16 @@ impl Session {
             let alt = pats.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
             (p, if pats.len() == 1 { pats[0].clone() } else { alt }, pats.len() > 1)
         } else {
-            let query = arg_str(a, &["query", "pattern"]).ok_or("grep needs a query")?;
+            let query = arg_str(a, &["query", "pattern"]).filter(|q| !q.trim().is_empty()).ok_or("grep needs a query")?;
             let mut p = split(&query, true);
             // Constraints alone: they were the text after all ("src/", "main.rs").
             if p.words.is_empty() {
                 p = Parts { words: vec![query.trim().to_string()], ..Default::default() };
             }
             let text = p.words.join(" ");
+            if text.trim().is_empty() {
+                return Err("grep needs a query".into());
+            }
             let regex = a["regex"].as_bool().unwrap_or_else(|| looks_like_regex(&text));
             (p, text, regex)
         };
@@ -527,7 +560,7 @@ impl Session {
             // The page's own count too (the only one may be in tests/), but
             // not a C prototype spanning lines (`int f(int a,` ... `);`).
             defs.extend(only_defs(&Ok(r.clone())));
-            defs.retain(|f| !prototype(f["path"].as_str().unwrap_or(""), &f["matches"][0]));
+            filter_prototypes(&mut defs);
             let rank = |f: &Value| def_rank(v.show(f["path"].as_str().unwrap_or("")), f["matches"][0]["text"].as_str().unwrap_or(""), name);
             defs.sort_by_key(rank);
             let mut seen = std::collections::HashSet::new();
@@ -698,7 +731,8 @@ impl View {
                                 out.push(format!("{c}-{}", clip(body[c - 1], "", 160)));
                             }
                         }
-                        out.push(format!("{ln}:{}", clip(text, if regex { "" } else { pattern }, 160)));
+                        let col = regex.then(|| m["col"].as_u64().map(|c| c as usize)).flatten();
+                        out.push(format!("{ln}:{}", clip_at(text, if regex { "" } else { pattern }, col, 160)));
                         last = ln;
                         let after = if context > 0 {
                             context
@@ -1189,13 +1223,18 @@ fn is_import(line: &str) -> bool {
     ["import ", "use ", "from ", "#include", "require(", "@import"].iter().any(|p| s.starts_with(p))
 }
 
-/// A line for display: trimmed, and if long, a window around `pat`.
+/// A line for display: trimmed, and if long, a window around `pat` (or `col`).
 fn clip(line: &str, pat: &str, max: usize) -> String {
+    clip_at(line, pat, None, max)
+}
+
+fn clip_at(line: &str, pat: &str, col: Option<usize>, max: usize) -> String {
+    let lead = line.len() - line.trim_start().len();
     let t = line.trim();
     if t.chars().count() <= max {
         return t.to_string();
     }
-    let at = if pat.is_empty() { None } else { t.to_lowercase().find(&pat.to_lowercase()) };
+    let at = if !pat.is_empty() { t.to_lowercase().find(&pat.to_lowercase()) } else { col.map(|c| c.saturating_sub(lead).min(t.len())) };
     let start = at.map_or(0, |i| i.saturating_sub(max / 3));
     let start = (0..=start).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0);
     let end = t[start..].char_indices().nth(max).map_or(t.len(), |(i, _)| start + i);
@@ -1248,6 +1287,28 @@ fn file_uri(u: &str) -> Option<String> {
     }
     let s = String::from_utf8(out).ok()?;
     Some(s.trim_end_matches('/').to_string()).filter(|s| s.starts_with('/'))
+}
+
+fn rewrite_lone_dir(p: &mut Parts) -> bool {
+    let dirs = p.words.is_empty()
+        && p.globs.len() == 1
+        && !p.globs[0].starts_with('!')
+        && p.globs[0].strip_suffix('/').is_some_and(|b| !b.is_empty() && !b.contains('/') && !is_glob(b) && !b.contains(['*', '?', '[', '{']));
+    if dirs {
+        let d = p.globs.pop().unwrap();
+        p.words.push(d.trim_end_matches('/').to_string());
+    }
+    dirs
+}
+
+fn filter_prototypes(defs: &mut Vec<Value>) {
+    for f in defs.iter_mut() {
+        let path = f["path"].as_str().unwrap_or("").to_string();
+        if let Some(ms) = f["matches"].as_array_mut() {
+            ms.retain(|m| !prototype(&path, m));
+        }
+    }
+    defs.retain(|f| f["matches"].as_array().is_some_and(|m| !m.is_empty()));
 }
 
 #[cfg(test)]
@@ -1334,5 +1395,91 @@ mod tests {
         assert!(re.is_match("prepare_upload") && re.is_match("PrepareUpload") && re.is_match("PREPARE-UPLOAD"));
         assert!(looks_like_regex("foo|bar") && looks_like_regex("\\bfoo") && !looks_like_regex("|x| x + 1") && !looks_like_regex("a || b"));
         assert!(!looks_like_regex("arr[0]") && looks_like_regex("[a-z]+"));
+    }
+
+    #[test]
+    fn scope_normalizes_slashes_parents_and_symlinks() {
+        let s = Session {
+            dir: PathBuf::new(),
+            home: "/Users/me".into(),
+            root: "/p".into(),
+            outbox: Vec::new(),
+            asked_roots: 0,
+            asks: Default::default(),
+        };
+        assert_eq!(s.scope(&json!({"path": "///"})), None);
+        let other = s.scope(&json!({"path": "../other"})).unwrap();
+        assert_eq!(other, "/other");
+        assert!(!within(&other, &s.root));
+
+        let root_sess =
+            Session { dir: PathBuf::new(), home: "/Users/me".into(), root: "/".into(), outbox: Vec::new(), asked_roots: 0, asks: Default::default() };
+        assert_eq!(root_sess.scope(&json!({"path": "src"})), Some("/src".into()));
+
+        let base = std::env::temp_dir().join(format!("fsearch-scope-{}", std::process::id()));
+        let target = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let got = s.scope(&json!({"path": link.to_str().unwrap()})).unwrap();
+        let want = std::fs::canonicalize(&target).unwrap().to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn find_files_keeps_nested_and_wildcard_dir_globs() {
+        let mut p = split("src/ui/", false);
+        assert!(!rewrite_lone_dir(&mut p));
+        assert_eq!(p.globs, ["src/ui/"]);
+
+        let mut p = split("*/", false);
+        assert!(!rewrite_lone_dir(&mut p));
+        assert_eq!(p.globs, ["*/"]);
+
+        let mut p = split("tests/", false);
+        assert!(rewrite_lone_dir(&mut p));
+        assert_eq!(p.words, ["tests"]);
+        assert!(p.globs.is_empty());
+    }
+
+    #[test]
+    fn defs_prototype_filter_keeps_later_matches() {
+        let path = std::env::temp_dir().join(format!("fsearch-proto-{}.c", std::process::id()));
+        std::fs::write(&path, "int foo(int a,\n  int b);\nint foo(int a,\n  int b) { return a; }\n").unwrap();
+        let mut defs = vec![json!({
+            "path": path.to_str().unwrap(),
+            "matches": [
+                {"line": 1, "text": "int foo(int a,"},
+                {"line": 3, "text": "int foo(int a,"},
+            ]
+        })];
+        filter_prototypes(&mut defs);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(defs.len(), 1);
+        let ms = defs[0]["matches"].as_array().unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0]["line"], 3);
+    }
+
+    #[test]
+    fn clip_centers_regex_match_on_col() {
+        let line = format!("    {}TARGET_MATCH{}", "a".repeat(200), "b".repeat(20));
+        let r = json!({"files": [{"path": "/p/a.rs", "matches": [{"line": 1, "text": line, "col": 204}]}]});
+        let out = View { base: "/p".into(), head: None }.list_matches(&r, "TARGET_\\w+", true, None, Out::Content, 20, 0, 0, None);
+        assert!(out.contains("TARGET_MATCH"), "clipped output missed match: {out}");
+    }
+
+    #[test]
+    fn grep_rejects_blank_query() {
+        let s = Session {
+            dir: PathBuf::new(),
+            home: "/Users/me".into(),
+            root: "/p".into(),
+            outbox: Vec::new(),
+            asked_roots: 0,
+            asks: Default::default(),
+        };
+        assert_eq!(s.grep(&json!({"query": "   "}), false).unwrap_err(), "grep needs a query");
     }
 }
