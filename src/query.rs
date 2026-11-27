@@ -379,6 +379,7 @@ pub struct Query {
     pub kind: Option<u8>,
     /// `type:app`: a folder kind also takes symlinks, since the system apps
     /// in /Applications link into the cryptex (/Applications/Safari.app).
+    /// Among other types, no kind: only .app names need be folders or links.
     pub apps: bool,
     pub exts: Vec<Vec<u8>>,
     /// Extensions a match may not have (`!*.md`).
@@ -493,7 +494,7 @@ impl Query {
     /// Add a glob or folder word (see `Glob`); `*.rs` and `*.{c,h}` are
     /// extensions.
     pub fn push_glob(&mut self, w: &str, negate: bool) -> Result<(), String> {
-        let alts = expand_braces(w);
+        let alts = expand_braces(w)?;
         let ext = |a: &String| {
             a.strip_prefix("*.").filter(|e| !e.is_empty() && !e.contains(['*', '?', '[', '/', '.'])).map(|e| e.to_ascii_lowercase().into_bytes())
         };
@@ -586,6 +587,8 @@ impl Query {
                 }
             }
             "kind" => {
+                // The last kind-setting filter wins: no app widening after it.
+                self.apps = false;
                 self.kind = Some(match v {
                     "file" | "f" => KIND_FILE,
                     "dir" | "folder" | "d" => KIND_DIR,
@@ -594,14 +597,19 @@ impl Query {
                 })
             }
             "in" => {
-                let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
+                let p = expand_home(v, home);
                 self.scope = Some(real_path(p).trim_end_matches('/').as_bytes().to_vec());
             }
             "size" => self.size = range(v, parse_size)?,
             "mtime" | "modified" => {
                 // mtime:<7d means "modified within the last 7 days".
                 let now = now_secs();
-                let (lo, hi) = range(v, parse_age)?;
+                let (lo, mut hi) = range(v, parse_age)?;
+                // A bare age is that whole unit, like `find -mtime`:
+                // mtime:3d is 3 to 4 days ago, mtime:2h 2 to 3 hours.
+                if !v.starts_with(['<', '>']) && !v.contains("..") {
+                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).map_or(0, |u| u - 1));
+                }
                 self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo.min(now as u64) as u32));
                 if hi == u64::MAX {
                     self.mtime.0 = 0;
@@ -614,6 +622,11 @@ impl Query {
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
             _ => return Ok(false),
+        }
+        // `type:app` among other extensions (type:app,image) is a union:
+        // no kind, but .app names must still be folders or links.
+        if self.apps && self.exts.iter().any(|e| e != b"app") {
+            self.kind = None;
         }
         Ok(true)
     }
@@ -630,6 +643,16 @@ impl Query {
             // (Links stand in for app folders only, not under a later kind:file.)
             Some(want) => kind & 3 == want || (self.apps && want == KIND_DIR && kind & 3 == KIND_LINK),
         }
+    }
+
+    /// `type:app` with other types and no kind: is `name` no app, or a
+    /// folder or link?
+    #[inline(always)]
+    fn app_kind_ok(&self, name: &[u8], kind: u8) -> bool {
+        !self.apps
+            || self.kind.is_some()
+            || matches!(kind & 3, KIND_DIR | KIND_LINK)
+            || !(name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".app"))
     }
 
     /// Does a full path pass every filter and token? Returns the match score.
@@ -659,6 +682,7 @@ impl Query {
         let name = &path[cut + 1..];
         if name.is_empty()
             || !self.kind_ok(kind)
+            || !self.app_kind_ok(name, kind)
             || (!self.exts.is_empty() && !ext_ok(name, &self.exts))
             || size < self.size.0
             || size > self.size.1
@@ -941,13 +965,83 @@ fn parts_match(parts: &[Part], names: &[&[u8]]) -> bool {
     }
 }
 
+/// `~` and `~/...` expand against `home`. `~user` is left as written.
+pub fn expand_home(p: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let home = if home.is_empty() { "/" } else { home };
+    if p == "~" {
+        home.to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        if home == "/" { format!("/{rest}") } else { format!("{home}/{rest}") }
+    } else {
+        p.to_string()
+    }
+}
+
 /// `w` with its brace groups expanded: `*.{c,h}` is `*.c` and `*.h`.
-fn expand_braces(w: &str) -> Vec<String> {
-    let Some(open) = w.find('{') else { return vec![w.to_string()] };
-    let Some(len) = w[open..].find('}') else { return vec![w.to_string()] };
-    let (head, body, tail) = (&w[..open], &w[open + 1..open + len], &w[open + len + 1..]);
-    let tails = expand_braces(tail);
-    body.split(',').flat_map(|b| tails.iter().map(move |t| format!("{head}{b}{t}"))).take(64).collect()
+/// Groups nest. More than 64 alternatives is an error. An unclosed `{` is left as written.
+fn expand_braces(w: &str) -> Result<Vec<String>, String> {
+    fn matching(w: &str, open: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for (i, b) in w.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn parts(body: &str) -> Vec<&str> {
+        let (mut out, mut start, mut depth) = (Vec::new(), 0, 0i32);
+        for (i, b) in body.as_bytes().iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(&body[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&body[start..]);
+        out
+    }
+    fn walk(w: &str, out: &mut Vec<String>) -> Result<(), String> {
+        let Some(open) = w.find('{') else {
+            out.push(w.to_string());
+            return Ok(());
+        };
+        let Some(close) = matching(w, open) else {
+            out.push(w.to_string());
+            return Ok(());
+        };
+        let (head, body, tail) = (&w[..open], &w[open + 1..close], &w[close + 1..]);
+        let mut tails = Vec::new();
+        walk(tail, &mut tails)?;
+        for alt in parts(body) {
+            let mut expanded = Vec::new();
+            walk(alt, &mut expanded)?;
+            for e in expanded {
+                for t in &tails {
+                    if out.len() >= 64 {
+                        return Err("too many alternatives".into());
+                    }
+                    out.push(format!("{head}{e}{t}"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(w, &mut out)?;
+    Ok(out)
 }
 
 /// An `Alt` from one brace-free alternative.
@@ -1058,11 +1152,18 @@ fn split_words(s: &str) -> Vec<String> {
 
 fn range(v: &str, p: fn(&str) -> Option<u64>) -> Result<(u64, u64), String> {
     let bad = || format!("bad range {v}");
-    if let Some(r) = v.strip_prefix(">=").or(v.strip_prefix('>')) {
+    if let Some(r) = v.strip_prefix(">=") {
         return Ok((p(r).ok_or_else(bad)?, u64::MAX));
     }
-    if let Some(r) = v.strip_prefix("<=").or(v.strip_prefix('<')) {
+    // Strict bounds past the ends are empty, (1, 0).
+    if let Some(r) = v.strip_prefix('>') {
+        return Ok(p(r).ok_or_else(bad)?.checked_add(1).map_or((1, 0), |lo| (lo, u64::MAX)));
+    }
+    if let Some(r) = v.strip_prefix("<=") {
         return Ok((0, p(r).ok_or_else(bad)?));
+    }
+    if let Some(r) = v.strip_prefix('<') {
+        return Ok(p(r).ok_or_else(bad)?.checked_sub(1).map_or((1, 0), |hi| (0, hi)));
     }
     if let Some((a, b)) = v.split_once("..") {
         return Ok((p(a).ok_or_else(bad)?, p(b).ok_or_else(bad)?));
@@ -3478,14 +3579,11 @@ impl<'a> Scan<'a> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind(i);
-        if !q.kind_ok(k) || self.ranges.is_some_and(|r| !in_ranges(r, i as u32)) {
+        if !q.kind_ok(k) || (q.apps && !q.app_kind_ok(&idx.name(i), k)) || self.ranges.is_some_and(|r| !in_ranges(r, i as u32)) {
             return None;
         }
-        if q.size != (0, u64::MAX) {
-            let sz = crate::index::dec_size(idx.size_raw(i));
-            if sz < q.size.0 || sz > q.size.1 {
-                return None;
-            }
+        if q.size != (0, u64::MAX) && !crate::index::bucket_holds(idx.size_raw(i), q.size.0, q.size.1) {
+            return None;
         }
         let mtime = idx.mtime(i);
         if q.mtime != (0, u32::MAX) && (mtime < q.mtime.0 || mtime > q.mtime.1) {
@@ -3541,7 +3639,7 @@ impl<'a> Scan<'a> {
         // are skipped whole.
         let filtered = q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX);
         let zone_ok = |z: &Zone| {
-            crate::index::dec_size(z.max_size) >= q.size.0
+            crate::index::bucket_reaches(z.max_size, q.size.0)
                 && z.max_mtime >= q.mtime.0
                 && z.min_mtime <= q.mtime.1
                 && q.kind.is_none_or(|k| z.kinds & (1 << k) != 0 || (q.apps && z.kinds & (1 << KIND_LINK) != 0))
@@ -4074,12 +4172,91 @@ mod tests {
         assert_eq!(Searcher { live: &l }.search(&q).len(), 2);
     }
 
+    /// Strict bounds leave the bound out: size:>5 and size:<5 don't take 5.
+    #[test]
+    fn strict_bounds() {
+        let size = |s| Query::parse(s, "/h").unwrap().size;
+        assert_eq!((size("size:>5"), size("size:<5")), ((6, u64::MAX), (0, 4)));
+        assert_eq!((size("size:>=5"), size("size:<=5")), ((5, u64::MAX), (0, 5)));
+        assert_eq!((range(">1h", parse_age), range("<1h", parse_age)), (Ok((3601, u64::MAX)), Ok((0, 3599))));
+        assert!(Query::parse("size:<0", "/h").unwrap().match_path(b"/f", KIND_FILE, 0, 1).is_none());
+    }
+
+    /// A bare age is that whole unit, like `find -mtime`: 3d is 3 to 4 days ago.
+    #[test]
+    fn bare_mtime_is_whole_unit() {
+        let now = now_secs();
+        let (lo, hi) = Query::parse("mtime:3d", "/h").unwrap().mtime;
+        assert!(hi.abs_diff(now - 3 * 86400) <= 1 && hi - lo == 86400 - 1, "{lo} {hi}");
+        let (lo, hi) = Query::parse("mtime:2h", "/h").unwrap().mtime;
+        assert_eq!(hi - lo, 3600 - 1);
+    }
+
+    /// The last kind-setting filter wins: kind:dir after type:app means
+    /// folders, not the links that stand in for apps.
+    #[test]
+    fn kind_after_app_drops_links() {
+        assert!(!Query::parse("type:app kind:dir", "/h").unwrap().kind_ok(KIND_LINK));
+        assert!(Query::parse("kind:dir type:app", "/h").unwrap().kind_ok(KIND_LINK));
+    }
+
+    /// type:app,image is apps or images: .app folders and links, image files.
+    #[test]
+    fn app_among_types() {
+        let ent = |off, kind| RawEnt { name_off: off, name_len: 5, kind, size: 1, mtime: 1, child: NONE };
+        let ents = vec![ent(0, KIND_DIR), ent(5, KIND_LINK), ent(10, KIND_FILE), ent(15, KIND_FILE)];
+        let l = Live::new(Index::build(vec![Listing { id: 0, names: b"a.appb.appc.pngd.app".to_vec(), ents }], 0, 0, b"/h"));
+        for s in ["type:app,image", "type:image type:app"] {
+            let q = Query::parse(s, "/h").unwrap();
+            let mut got: Vec<Vec<u8>> = Searcher { live: &l }.search(&q).iter().map(|h| l.base.name(h.idx as usize).to_vec()).collect();
+            got.sort();
+            assert_eq!(got, [&b"a.app"[..], b"b.app", b"c.png"], "{s}");
+            assert!(q.match_path(b"/c.png", KIND_FILE, 1, 1).is_some() && q.match_path(b"/d.app", KIND_FILE, 1, 1).is_none(), "{s}");
+        }
+    }
+
     /// An age past what a u32 of seconds holds (136 years) is older than
     /// anything, not an age wrapped around to a few years.
     #[test]
     fn mtime_older_than_u32() {
         let q = Query::parse("mtime:>140y", "/h").unwrap();
         assert_eq!(q.mtime, (0, 0));
+    }
+
+    /// `{a,{b,c}}` is a, b and c. A flat group still expands, and 65 alternatives is an error.
+    #[test]
+    fn nested_braces_expand() {
+        assert_eq!(expand_braces("{a,{b,c}}").unwrap(), ["a", "b", "c"]);
+        assert_eq!(expand_braces("*.{c,h}").unwrap(), ["*.c", "*.h"]);
+        assert_eq!(expand_braces("{src,include/{foo,bar}}").unwrap(), ["src", "include/foo", "include/bar"]);
+        let wide = format!("{{{}}}", (0..65).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        assert!(expand_braces(&wide).is_err());
+    }
+
+    /// `in:~` and `in:~/x` are under home. `in:~alice/x` is not home with `alice/x` glued on.
+    #[test]
+    fn in_tilde_expands_home_only() {
+        let scope = |q: &str, home: &str| String::from_utf8(Query::parse(q, home).unwrap().scope.unwrap()).unwrap();
+        assert_eq!(scope("in:~alice/x", "/h"), "~alice/x");
+        assert_eq!(scope("in:~/x", "/h"), "/h/x");
+        assert_eq!(scope("in:~/x", "/h/"), "/h/x");
+        assert_eq!(scope("in:~", "/h"), "/h");
+        assert_eq!(expand_home("~/x", "/"), "/x");
+    }
+
+    /// Above 2 GiB the stored size is a 2 MiB bucket. A file in the bucket that
+    /// contains 3 GB matches `size:>3gb`, and a bucket that ends below the bound does not.
+    #[test]
+    fn size_bucket_above_2gib() {
+        let ent = |size| RawEnt { name_off: 0, name_len: 3, kind: KIND_FILE, size, mtime: 1, child: NONE };
+        let live = Live::new(Index::build(vec![Listing { id: 0, names: b"big".to_vec(), ents: vec![ent(3_001_000_000)] }], 0, 0, b"/h"));
+        let n = |q: &str| Searcher { live: &live }.search(&Query::parse(q, "/h").unwrap()).len();
+        assert_eq!(n("size:>3gb big"), 1);
+        assert_eq!(n("size:>3011mb big"), 0);
+        let small = Live::new(Index::build(vec![Listing { id: 0, names: b"big".to_vec(), ents: vec![ent(1000)] }], 0, 0, b"/h"));
+        let n = |q: &str| Searcher { live: &small }.search(&Query::parse(q, "/h").unwrap()).len();
+        assert_eq!(n("size:>500b big"), 1);
+        assert_eq!(n("size:>2000b big"), 0);
     }
 
     /// type:app takes symlinks as folders; kind:file after it means files.

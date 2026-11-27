@@ -1958,6 +1958,7 @@ fn only_exts(q: &Query) -> bool {
 fn nothing_else(q: &Query) -> bool {
     q.tokens.is_empty()
         && q.kind_ok(KIND_FILE)
+        && !q.apps
         && q.size == (0, u64::MAX)
         && q.mtime == (0, u32::MAX)
         && q.name_re.is_none()
