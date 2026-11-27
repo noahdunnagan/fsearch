@@ -211,9 +211,12 @@ fn ms() -> u64 {
 
 impl Git {
     pub fn new(home: &str) -> Arc<Git> {
+        let mut home = home.as_bytes();
+        while home.len() > 1 && home.ends_with(b"/") {
+            home = &home[..home.len() - 1];
+        }
         let (tx, rx) = std::sync::mpsc::channel();
-        let g =
-            Arc::new(Git { home: home.as_bytes().to_vec(), bin: git_bin(), repos: Mutex::default(), dirs: Mutex::default(), work: Mutex::new(tx) });
+        let g = Arc::new(Git { home: home.to_vec(), bin: git_bin(), repos: Mutex::default(), dirs: Mutex::default(), work: Mutex::new(tx) });
         let w = g.clone();
         std::thread::Builder::new().name("fsearch-git".into()).spawn(move || w.worker(rx)).expect("spawn");
         g
@@ -308,7 +311,13 @@ impl Git {
 
     /// Repos already known at or under `dir`.
     pub fn known_under(&self, dir: &[u8]) -> Vec<Arc<Repo>> {
-        self.repos.lock().unwrap().iter().filter(|r| r.root.starts_with(dir) && r.root.get(dir.len()).is_none_or(|&b| b == b'/')).cloned().collect()
+        self.repos
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.root.starts_with(dir) && (dir.ends_with(b"/") || r.root.get(dir.len()).is_none_or(|&b| b == b'/')))
+            .cloned()
+            .collect()
     }
 
     /// FSEvents saw these folders change (`Engine::on_change`; true: and
@@ -320,10 +329,12 @@ impl Git {
         {
             let mut memo = self.dirs.lock().unwrap();
             let stale = dirs.iter().any(|(d, _)| {
-                memo.get(*d).is_some_and(|r| {
-                    let root = r.as_ref().is_some_and(|r| r.root == *d);
-                    root != std::fs::symlink_metadata(OsStr::from_bytes(&[d, &b"/.git"[..]].concat())).is_ok()
-                })
+                d.len() > 1
+                    && *d != self.home.as_slice()
+                    && memo.get(*d).is_some_and(|r| {
+                        let root = r.as_ref().is_some_and(|r| r.root == *d);
+                        root != std::fs::symlink_metadata(OsStr::from_bytes(&[d, &b"/.git"[..]].concat())).is_ok()
+                    })
             });
             if stale {
                 memo.clear();
@@ -487,15 +498,31 @@ impl Git {
                 // The root's own entries, one by one (a folder as itself, not
                 // all below): a `*` there makes git look through every folder
                 // for untracked files (1.5 s on Chromium).
+                let mut present = HashSet::new();
                 for e in std::fs::read_dir(OsStr::from_bytes(&r.root)).into_iter().flatten().flatten() {
                     let name = e.file_name();
                     if name.as_bytes() == b".git" {
                         continue;
                     }
+                    present.insert(name.as_bytes().to_vec());
                     specs.push(match e.file_type().is_ok_and(|t| t.is_dir()) {
                         true => [b":(glob)", &glob_escape(name.as_bytes())[..]].concat(),
                         false => [b":(literal)", name.as_bytes()].concat(),
                     });
+                }
+                // Deleted root-level entries are absent from `read_dir`; check
+                // previously known root entries and HEAD's root tree.
+                for p in s.files.keys().chain(s.dirs.keys()) {
+                    if !p.contains(&b'/') && present.insert(p.to_vec()) {
+                        specs.push([b":(literal)", &p[..]].concat());
+                    }
+                }
+                if let Some(tree) = self.run(&r.root, &["ls-tree", "--name-only", "-z", "HEAD"], &[]) {
+                    for name in tree.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+                        if present.insert(name.to_vec()) {
+                            specs.push([b":(literal)", name].concat());
+                        }
+                    }
                 }
             } else {
                 specs.push([b":(glob)", &glob_escape(d)[..], b"/*"].concat());
@@ -596,6 +623,7 @@ impl Git {
         // Before it's waited for: a signal must never find a reaped pid here.
         RUNNING.store(0, Ordering::Relaxed);
         if out.is_none() {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
         }
         let ok = child.wait().is_ok_and(|s| s.success());
@@ -650,6 +678,7 @@ fn xy(rec: &[u8]) -> u8 {
     };
     let work = match y {
         b'M' | b'T' => MODIFIED,
+        b'A' => ADDED,
         b'D' => DELETED,
         _ => 0,
     };
@@ -725,5 +754,154 @@ mod tests {
         assert_eq!(pending(), (vec![(Vec::new(), true)], false), "FSEvents lost track of /");
         g.changed(&[(&b"/p/repo/.git"[..], false)]);
         assert_eq!(pending(), (Vec::new(), true));
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!("fsearch-git-test-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), name));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new(git_bin().expect("git binary")).arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn known_under_matches_root_and_boundaries() {
+        let g = Git::new("/nonexistent");
+        g.add(b"/Users/a/repo");
+        g.add(b"/Users/ab/repo");
+
+        let mut under_root: Vec<Vec<u8>> = g.known_under(b"/").into_iter().map(|r| r.root.clone()).collect();
+        under_root.sort();
+        assert_eq!(under_root, vec![b"/Users/a/repo".to_vec(), b"/Users/ab/repo".to_vec()]);
+
+        let under_a: Vec<Vec<u8>> = g.known_under(b"/Users/a").into_iter().map(|r| r.root.clone()).collect();
+        assert_eq!(under_a, vec![b"/Users/a/repo".to_vec()]);
+
+        let under_a_slash: Vec<Vec<u8>> = g.known_under(b"/Users/a/").into_iter().map(|r| r.root.clone()).collect();
+        assert_eq!(under_a_slash, vec![b"/Users/a/repo".to_vec()]);
+    }
+
+    #[test]
+    fn home_trailing_slash_and_dotfiles_memo() {
+        let tmp = TempDir::new("home");
+        let home = tmp.0.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let file = home.join("sub/file.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let home_with_slash = format!("{}/", home.display());
+        let g = Git::new(&home_with_slash);
+
+        // `$HOME` with `.git` must never be treated as a repo even if `home` had a trailing `/`.
+        assert!(g.repo(file.as_os_str().as_bytes()).is_none());
+
+        // `changed` on `$HOME` must not invalidate the memo when `$HOME/.git` exists.
+        let home_bytes = home.as_os_str().as_bytes();
+        assert!(g.dirs.lock().unwrap().contains_key(home_bytes));
+        g.changed(&[(home_bytes, false)]);
+        assert!(g.dirs.lock().unwrap().contains_key(home_bytes));
+    }
+
+    #[test]
+    fn changed_does_not_clear_memo_for_home_dotfiles() {
+        let tmp = TempDir::new("home-memo");
+        let home = tmp.0.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let file = home.join("sub/file.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let g = Git::new(home.to_str().unwrap());
+        assert!(g.repo(file.as_os_str().as_bytes()).is_none());
+
+        let home_bytes = home.as_os_str().as_bytes();
+        assert!(g.dirs.lock().unwrap().contains_key(home_bytes));
+        g.changed(&[(home_bytes, false)]);
+        assert!(g.dirs.lock().unwrap().contains_key(home_bytes));
+    }
+
+    #[test]
+    fn parses_intent_to_add() {
+        let out = b"1 .A N... 000000 000000 100644 0000000 0000000 intent.txt\x00";
+        let v = parse(out);
+        assert_eq!(v, vec![(b"intent.txt".to_vec(), ADDED)]);
+        assert_eq!(word(ADDED), Some("added"));
+        assert!(Sel::Modified.test(Some(ADDED)));
+    }
+
+    #[test]
+    fn update_detects_deleted_root_files() {
+        // 1. Tracked + untracked files at repo root alongside a subdirectory.
+        let tmp = TempDir::new("root-del");
+        let root = &tmp.0;
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("init.txt"), b"init").unwrap();
+        std::fs::write(root.join("sub/keep.txt"), b"keep").unwrap();
+        run_git(root, &["add", "init.txt", "sub/keep.txt"]);
+        run_git(root, &["commit", "-m", "init"]);
+        std::fs::write(root.join("scratch.txt"), b"u").unwrap();
+
+        let g = Git::new("/nonexistent");
+        let r = g.add(root.as_os_str().as_bytes());
+        let old = g.read_all(&r).unwrap();
+        assert_eq!(old.status(b"init.txt"), 0);
+        assert_eq!(old.status(b"scratch.txt"), UNTRACKED);
+
+        std::fs::remove_file(root.join("init.txt")).unwrap();
+        std::fs::remove_file(root.join("scratch.txt")).unwrap();
+        let snap = g.update(&r, &old, HashMap::from([(Vec::new(), false)]), false).unwrap();
+        assert_eq!(snap.status(b"init.txt"), DELETED);
+        assert_eq!(snap.files.get(b"scratch.txt".as_slice()), None);
+
+        // 2. Deleting the sole tracked file at root leaves only `.git` on disk.
+        let tmp2 = TempDir::new("sole-root-del");
+        let root2 = &tmp2.0;
+        run_git(root2, &["init"]);
+        run_git(root2, &["config", "user.email", "test@example.com"]);
+        run_git(root2, &["config", "user.name", "Test"]);
+        std::fs::write(root2.join("only.txt"), b"only").unwrap();
+        run_git(root2, &["add", "only.txt"]);
+        run_git(root2, &["commit", "-m", "only"]);
+
+        let r2 = g.add(root2.as_os_str().as_bytes());
+        let old2 = g.read_all(&r2).unwrap();
+        assert_eq!(old2.status(b"only.txt"), 0);
+
+        std::fs::remove_file(root2.join("only.txt")).unwrap();
+        let snap2 = g.update(&r2, &old2, HashMap::from([(Vec::new(), false)]), false).unwrap();
+        assert_eq!(snap2.status(b"only.txt"), DELETED);
+
+        // 3. Unborn repo (no HEAD) with an untracked root file deleted: clears `s.files` without failing.
+        let tmp3 = TempDir::new("unborn-root-del");
+        let root3 = &tmp3.0;
+        run_git(root3, &["init"]);
+        std::fs::write(root3.join("temp.txt"), b"temp").unwrap();
+
+        let r3 = g.add(root3.as_os_str().as_bytes());
+        let old3 = g.read_all(&r3).unwrap();
+        assert_eq!(old3.status(b"temp.txt"), UNTRACKED);
+
+        std::fs::remove_file(root3.join("temp.txt")).unwrap();
+        let snap3 = g.update(&r3, &old3, HashMap::from([(Vec::new(), false)]), false).unwrap();
+        assert_eq!(snap3.files.get(b"temp.txt".as_slice()), None);
     }
 }
