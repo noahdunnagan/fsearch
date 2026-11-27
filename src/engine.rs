@@ -458,11 +458,7 @@ impl Engine {
             }
             let (work, early) = self.s.with_names(scope, |live| {
                 let docs = content::wanted(live, home, scope.unwrap_or(home), true);
-                if !docs.is_empty() {
-                    Work::Docs(docs)
-                } else {
-                    Work::Paths(search_pool().install(|| content::scan_paths(live, q.clone_for_scan())))
-                }
+                if !docs.is_empty() { Work::Docs(docs) } else { Work::Paths(search_pool().install(|| content::scan_paths(live, q.clone_for_scan()))) }
             })?;
             let hold = walk::Hold::new();
             let r = match work {
