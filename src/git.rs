@@ -104,6 +104,9 @@ pub struct Snap {
     /// Its config names programs git would run (see `Git::trusted`): no
     /// status is read.
     untrusted: bool,
+    /// Folders ("" the root) holding a `.gitignore` above an ignored entry:
+    /// only deleting one of those can un-ignore anything.
+    ignores: HashSet<Box<[u8]>>,
 }
 
 impl Snap {
@@ -435,7 +438,9 @@ impl Git {
             s.untrusted = true;
             return Some(s);
         }
-        for (path, bits) in parse(&self.run(&r.root, &status_args(), &[])?) {
+        let found = parse(&self.run(&r.root, &status_args(), &[])?);
+        note_ignores(&mut s, &r.root, &found);
+        for (path, bits) in found {
             insert(&mut s, path, bits);
         }
         s.head = self.head(&r.root);
@@ -467,14 +472,20 @@ impl Git {
             return if head { self.read_all(r) } else { None };
         }
         let mut s = old.clone();
-        // A changed .gitignore re-decides everything below it.
+        // A changed .gitignore re-decides everything below it, and an event on
+        // a previously collapsed untracked/ignored dir re-checks its subtree.
         let mut dirs = dirs;
         for (d, rec) in dirs.iter_mut() {
+            if s.dirs.contains_key(d.as_slice()) {
+                *rec = true;
+            }
             let gi = [&r.root[..], b"/", d, if d.is_empty() { b"" } else { b"/" }, b".gitignore"].concat();
-            let fresh = std::fs::metadata(OsStr::from_bytes(&gi))
-                .and_then(|m| m.modified())
-                .is_ok_and(|m| m.elapsed().is_ok_and(|e| e < Duration::from_secs(5)));
-            *rec |= fresh;
+            // A deleted one re-decides only if it ignored something.
+            let recheck = match std::fs::metadata(OsStr::from_bytes(&gi)) {
+                Ok(m) => m.modified().is_ok_and(|m| m.elapsed().is_ok_and(|e| e < Duration::from_secs(5))),
+                Err(_) => s.ignores.remove(d.as_slice()),
+            };
+            *rec |= recheck;
         }
         if dirs.iter().any(|(d, rec)| *rec && d.is_empty()) || dirs.len() > MAX_PATHSPECS {
             return self.read_all(r);
@@ -512,12 +523,22 @@ impl Git {
             let cached = self.run(&r.root, &["diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv"], &[])?;
             let now: HashSet<&[u8]> = cached.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
             let was: HashSet<&[u8]> = s.files.iter().filter(|(_, b)| **b & STAGED != 0).map(|(p, _)| &p[..]).collect();
+            // Staging a file inside a collapsed untracked/ignored dir splits it:
+            // ask git for that dir recursively so remaining siblings stay listed.
+            for p in s.dirs.keys() {
+                if now.union(&was).any(|r| *r == p.as_ref() || (r.starts_with(p.as_ref()) && r.get(p.len()) == Some(&b'/'))) {
+                    specs.push([b":(literal)", p.as_ref()].concat());
+                }
+            }
             specs.extend(now.union(&was).map(|p| [b":(literal)", *p].concat()));
             let h = self.head(&r.root);
             if h != s.head {
                 (s.history, s.at) = self.history_of(&r.root);
                 s.head = h;
             }
+        }
+        if specs.len() > MAX_PATHSPECS {
+            return self.read_all(r);
         }
         if specs.is_empty() {
             return Some(s);
@@ -530,7 +551,12 @@ impl Git {
         };
         let restaged: HashSet<Vec<u8>> = specs.iter().filter_map(|s| s.strip_prefix(b":(literal)")).map(<[u8]>::to_vec).collect();
         s.files.retain(|p, _| !covered(p) && !restaged.contains(&p[..]));
-        s.dirs.retain(|p, _| !covered(p));
+        s.dirs.retain(|p, _| {
+            !covered(p)
+                && !dirs.contains_key(p.as_ref())
+                && !restaged.iter().any(|r| r == p.as_ref() || (r.starts_with(p.as_ref()) && r.get(p.len()) == Some(&b'/')))
+        });
+        note_ignores(&mut s, &r.root, &found);
         for (path, bits) in found {
             insert(&mut s, path, bits);
         }
@@ -605,6 +631,26 @@ impl Git {
 
 fn status_args() -> [&'static str; 6] {
     ["status", "--porcelain=v2", "-z", "--ignored=traditional", "--untracked-files=normal", "--ignore-submodules=all"]
+}
+
+/// Record the folders above `found`'s ignored entries that hold a `.gitignore`
+/// (see `Snap::ignores`). One stat per folder not yet seen.
+fn note_ignores(s: &mut Snap, root: &[u8], found: &[(Vec<u8>, u8)]) {
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    for (path, _) in found.iter().filter(|(_, b)| b & IGNORED != 0) {
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        let ends = std::iter::once(0).chain(path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(i, _)| i));
+        for end in ends {
+            let d = &path[..end];
+            if !seen.insert(d) || s.ignores.contains(d) {
+                continue;
+            }
+            let gi = [root, b"/", d, if d.is_empty() { b"" } else { b"/" }, b".gitignore"].concat();
+            if std::fs::metadata(OsStr::from_bytes(&gi)).is_ok_and(|m| m.is_file()) {
+                s.ignores.insert(d.into());
+            }
+        }
+    }
 }
 
 fn insert(s: &mut Snap, path: Vec<u8>, bits: u8) {
@@ -725,5 +771,164 @@ mod tests {
         assert_eq!(pending(), (vec![(Vec::new(), true)], false), "FSEvents lost track of /");
         g.changed(&[(&b"/p/repo/.git"[..], false)]);
         assert_eq!(pending(), (Vec::new(), true));
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!("fsearch-git-test-{}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), name));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new(git_bin().expect("git binary")).arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn update_clears_dirs_on_commit_and_gitignore_delete() {
+        let tmp = TempDir::new("repo");
+        let root = &tmp.0;
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("init.txt"), b"init").unwrap();
+        std::fs::write(root.join("a/tracked.txt"), b"t").unwrap();
+        std::fs::write(root.join("sub/deep/tracked.txt"), b"t").unwrap();
+        run_git(root, &["add", "init.txt", "a/tracked.txt", "sub/deep/tracked.txt"]);
+        run_git(root, &["commit", "-m", "init"]);
+
+        // Untracked dir `newdir/{a,b}.txt`, untracked `a/b/c.txt`, and `sub/.gitignore` ignoring `deep/ign/` & `deep/*.log`.
+        std::fs::create_dir_all(root.join("newdir")).unwrap();
+        std::fs::write(root.join("newdir/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("newdir/b.txt"), b"b").unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/c.txt"), b"c").unwrap();
+        std::fs::create_dir_all(root.join("sub/deep/ign")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), b"ign/\n*.log\n").unwrap();
+        std::fs::write(root.join("sub/deep/ign/f.txt"), b"ign").unwrap();
+        std::fs::write(root.join("sub/deep/x.log"), b"log").unwrap();
+
+        let g = Git::new("/nonexistent");
+        let r = g.add(root.as_os_str().as_bytes());
+        let old = g.read_all(&r).unwrap();
+        assert_eq!(old.dirs.get(b"newdir".as_slice()), Some(&UNTRACKED));
+        assert_eq!(old.dirs.get(b"a/b".as_slice()), Some(&UNTRACKED));
+        assert_eq!(old.status(b"sub/deep/ign/f.txt"), IGNORED);
+        assert_eq!(old.status(b"sub/deep/x.log"), IGNORED);
+
+        // 1. `git add newdir/a.txt` with only `.git` events (`dirs` empty, `head = true`)
+        //    clears collapsed `s.dirs["newdir"]` while keeping sibling `newdir/b.txt` untracked.
+        run_git(root, &["add", "newdir/a.txt"]);
+        let snap1a = g.update(&r, &old, HashMap::new(), true).unwrap();
+        assert_eq!(snap1a.dirs.get(b"newdir".as_slice()), None);
+        assert_eq!(snap1a.status(b"newdir/a.txt"), STAGED | ADDED);
+        assert_eq!(snap1a.status(b"newdir/b.txt"), UNTRACKED);
+        run_git(root, &["commit", "-m", "add newdir"]);
+        let snap1 = g.update(&r, &snap1a, HashMap::new(), true).unwrap();
+        assert_eq!(snap1.dirs.get(b"newdir".as_slice()), None);
+        assert_eq!(snap1.status(b"newdir/a.txt"), 0);
+        assert_eq!(snap1.status(b"newdir/b.txt"), UNTRACKED);
+
+        // 2. Direct event on `d = b"a/b"` after `a/b/c.txt` is committed clears `s.dirs["a/b"]`.
+        run_git(root, &["add", "a/b/c.txt"]);
+        run_git(root, &["commit", "-m", "add a/b"]);
+        let snap2 = g.update(&r, &snap1, HashMap::from([(b"a/b".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap2.dirs.get(b"a/b".as_slice()), None);
+        assert_eq!(snap2.status(b"a/b/c.txt"), 0);
+
+        // 3. Deleting `sub/.gitignore` re-evaluates ignored entries under `sub`.
+        std::fs::remove_file(root.join("sub/.gitignore")).unwrap();
+        let snap3 = g.update(&r, &snap2, HashMap::from([(b"sub".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap3.status(b"sub/deep/ign/f.txt"), UNTRACKED);
+        assert_eq!(snap3.status(b"sub/deep/x.log"), UNTRACKED);
+    }
+
+    /// Only folders whose `.gitignore` ignores something are tracked (so an
+    /// event at a root without one is not a full re-read); one added later is
+    /// tracked once it ignores something, and deleting it re-evaluates its folder.
+    #[test]
+    fn gitignore_folders_are_tracked() {
+        let tmp = TempDir::new("gitignore-track");
+        let root = &tmp.0;
+        run_git(root, &["init"]);
+        std::fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
+        std::fs::create_dir_all(root.join("a/deep")).unwrap();
+        std::fs::create_dir_all(root.join("sub/ign")).unwrap();
+        std::fs::write(root.join("a/deep/x.log"), b"log").unwrap();
+        std::fs::write(root.join("a/deep/t.txt"), b"t").unwrap();
+        std::fs::write(root.join("sub/.gitignore"), b"ign/\n").unwrap();
+        std::fs::write(root.join("sub/ign/f.txt"), b"f").unwrap();
+
+        let g = Git::new("/nonexistent");
+        let r = g.add(root.as_os_str().as_bytes());
+        let old = g.read_all(&r).unwrap();
+        let set = |s: &Snap| {
+            let mut v: Vec<Vec<u8>> = s.ignores.iter().map(|d| d.to_vec()).collect();
+            v.sort();
+            v
+        };
+        // `a` and `a/deep` hold ignored entries but no `.gitignore`.
+        assert_eq!(set(&old), vec![b"".to_vec(), b"sub".to_vec()]);
+
+        // A `.gitignore` added in `a` is tracked once it ignores something...
+        std::fs::write(root.join("a/.gitignore"), b"*.tmp\n").unwrap();
+        std::fs::write(root.join("a/deep/z.tmp"), b"z").unwrap();
+        let snap = g.update(&r, &old, HashMap::from([(b"a".to_vec(), false), (b"a/deep".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap.status(b"a/deep/z.tmp"), IGNORED);
+        assert_eq!(set(&snap), vec![b"".to_vec(), b"a".to_vec(), b"sub".to_vec()]);
+
+        // ...and deleting it re-evaluates `a` recursively.
+        std::fs::remove_file(root.join("a/.gitignore")).unwrap();
+        let snap = g.update(&r, &snap, HashMap::from([(b"a".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap.status(b"a/deep/z.tmp"), UNTRACKED);
+        assert_eq!(snap.status(b"a/deep/x.log"), IGNORED);
+        assert_eq!(set(&snap), vec![b"".to_vec(), b"sub".to_vec()]);
+    }
+
+    #[test]
+    fn update_reevaluates_on_gitignore_delete() {
+        let tmp = TempDir::new("gitignore-del");
+        let root = &tmp.0;
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("init.txt"), b"init").unwrap();
+        run_git(root, &["add", "init.txt"]);
+        run_git(root, &["commit", "-m", "init"]);
+
+        std::fs::create_dir_all(root.join("sub/deep/ign")).unwrap();
+        std::fs::write(root.join("sub/deep/tracked.txt"), b"t").unwrap();
+        run_git(root, &["add", "sub/deep/tracked.txt"]);
+        run_git(root, &["commit", "-m", "track sub/deep"]);
+        std::fs::write(root.join("sub/.gitignore"), b"ign/\n*.log\n").unwrap();
+        std::fs::write(root.join("sub/deep/ign/f.txt"), b"ign").unwrap();
+        std::fs::write(root.join("sub/deep/x.log"), b"log").unwrap();
+
+        let g = Git::new("/nonexistent");
+        let r = g.add(root.as_os_str().as_bytes());
+        let old = g.read_all(&r).unwrap();
+        assert_eq!(old.dirs.get(b"sub/deep/ign".as_slice()), Some(&IGNORED));
+        assert_eq!(old.status(b"sub/deep/ign/f.txt"), IGNORED);
+        assert_eq!(old.status(b"sub/deep/x.log"), IGNORED);
+
+        std::fs::remove_file(root.join("sub/.gitignore")).unwrap();
+        let snap = g.update(&r, &old, HashMap::from([(b"sub".to_vec(), false)]), false).unwrap();
+        assert_eq!(snap.dirs.get(b"sub/deep/ign".as_slice()), Some(&UNTRACKED));
+        assert_eq!(snap.status(b"sub/deep/ign/f.txt"), UNTRACKED);
+        assert_eq!(snap.status(b"sub/deep/x.log"), UNTRACKED);
     }
 }
